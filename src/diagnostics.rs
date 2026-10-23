@@ -1,6 +1,6 @@
+use crate::Result;
 use crate::catalog;
 use crate::daemon::{self, Request};
-use crate::Result;
 use serde_json::{Value, json};
 use std::path::Path;
 

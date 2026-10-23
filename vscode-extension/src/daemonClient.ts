@@ -297,6 +297,9 @@ export class DaemonClient {
         this.disconnect(new Error(`Test Context daemon request timed out after ${timeoutMs} ms.`));
       }, timeoutMs);
       const cancellationListener = cancellation.onCancellationRequested(() => {
+        if (request.root) {
+          void this.fireRemoteCancellation(request.root);
+        }
         this.disconnect(new RequestCancelledError());
       });
       this.pending = {
@@ -311,6 +314,35 @@ export class DaemonClient {
         }
       });
     });
+  }
+
+  private async fireRemoteCancellation(root: string): Promise<void> {
+    const uncancelled: CancellationLike = {
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose: () => undefined }),
+    };
+    try {
+      const transport = await this.connector(this.settings(), uncancelled);
+      const request: DaemonRequest = {
+        root,
+        name: 'test_cancel',
+        arguments: {},
+        compact: true,
+      };
+      const payload = Buffer.from(JSON.stringify(request), 'utf8');
+      const frame = Buffer.allocUnsafe(FRAMED_JSON_MAGIC.length + 4 + payload.length);
+      FRAMED_JSON_MAGIC.copy(frame, 0);
+      frame.writeUInt32BE(payload.length, FRAMED_JSON_MAGIC.length);
+      payload.copy(frame, FRAMED_JSON_MAGIC.length + 4);
+      await new Promise<void>((resolveWrite) => {
+        transport.write(frame, () => {
+          transport.destroy();
+          resolveWrite();
+        });
+      });
+    } catch {
+      // Best-effort cancellation; the server-side timeout remains authoritative.
+    }
   }
 
   private onData(socket: Duplex, chunk: Buffer): void {

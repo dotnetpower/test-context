@@ -73,3 +73,89 @@
 
 ### Round 5: Final 12-Criteria Audit (Residual Risk Assessment)
 All 12 audit dimensions (Watcher safety, AST soundness, Monorepo isolation, Data-file tracking, Incremental hash complexity, JUnit XML resilience, Cache atomicity, Subprocess cleanup, Daemon identity/bounds, MCP JSON-RPC compliance, Native VSIX callability, and Live resource footprint) passed with **0 Critical, 0 High, and 0 Medium** issues remaining. Only documented Low/architectural trade-offs remain (e.g., arbitrary runtime reflection or external network state outside the workspace requires `--no-cache` or `test_invalidate`).
+
+---
+
+## Deep Hardening Rounds 6–11
+
+### Round 6 — Cache correctness and execution identity (12 criteria)
+
+1. Added before/after dependency snapshot verification; source changes during a test return `SOURCE_CHANGED_DURING_TEST`, discard the result, and requeue only eligible tests.
+2. Added environment fingerprinting for TCTX version, Python executable/version/platform, pytest version, plugin entry points, command line, selected environment variables, and lock files.
+3. Bumped cache schema to v4 and isolated WAL names by schema.
+4. Added provenance fields to every cache record: environment hash, TCTX version, runner mode, start/end timestamps.
+5. Stopped caching all-skipped files by default.
+6. Added same-`dep_hash` pass/fail conflict detection and cache quarantine.
+7. Added `ctime` to `FileStamp` to catch equal-size edits whose `mtime` is restored.
+8. Added configured `python_files` parsing from `pyproject.toml`, `pytest.ini`, `setup.cfg`, and `tox.ini`.
+9. Added integration coverage for source mutation during execution.
+10. Added WAL restart persistence coverage.
+11. Added node-level safe cache coverage.
+12. Added flaky/quarantine and skip-policy unit coverage.
+
+### Round 7 — Zygote safety and result transport (12 criteria)
+
+1. Restricted third-party preload to a bounded safe allowlist.
+2. Added active-thread count guard before `fork()`; unsafe parents fall back to subprocess.
+3. Closed inherited child file descriptors except bounded protocol/output descriptors.
+4. Added Zygote crash circuit breaker (three failures, 60-second fallback).
+5. Replaced newline JSON IPC with length-prefixed frames.
+6. Replaced temporary stdout/stderr files with Linux `memfd_create` where available.
+7. Added explicit pytest plugin manifest discovery using `pytest11` entry points.
+8. Disabled implicit plugin autoload inside Zygote and loaded the fingerprinted manifest explicitly.
+9. Added pytest parser/plugin warm-up before readiness.
+10. Added direct in-memory pytest report capture for dynamic dependency runs.
+11. Kept hardened JUnit fallback for low-overhead subsequent delta runs.
+12. Added plugin errors, active process group, failures, and circuit state to status diagnostics.
+
+### Round 8 — Background authority, scheduling, and cancellation (12 criteria)
+
+1. Changed speculative execution default to module-level `pytestmark = pytest.mark.background_safe`.
+2. Added explicit `--background-all` opt-in for controlled benchmarks/development.
+3. Denied background execution for live, integration, destructive, network, external, Azure, Docker, and serial markers.
+4. Added module-level marker parsing so one function decorator cannot authorize an entire file.
+5. Added resource-key locks for database, Docker, network, serial, port, and `resource_*` markers.
+6. Added shortest-first duration scheduling within the priority queue.
+7. Preserved recent-edit LIFO priority before duration selection.
+8. Added adaptive `/proc/loadavg` throttling and `TCTX_PAUSE_BACKGROUND`.
+9. Added background deferral counters to status.
+10. Added process-group cancellation through `test_cancel`.
+11. Propagated VS Code cancellation over a second native IPC connection.
+12. Prevented externally cancelled children from producing cached failures.
+
+### Round 9 — Persistent cache and graph scaling (10 criteria)
+
+1. Replaced whole-cache rewrites with append-only, lock-protected WAL events.
+2. Added atomic snapshot compaction at a 16 MiB WAL threshold.
+3. Added partial upsert, invalidate, reset, quarantine, eviction, and metrics events.
+4. Bounded WAL replay to 64 MiB.
+5. Enforced cache record limits again after replay.
+6. Preserved atomic snapshot rename and `sync_all` at compaction boundaries.
+7. Exposed persistence errors in status instead of silently ignoring them.
+8. Added incremental structural edge replacement for ordinary import changes.
+9. Recomputed transitive closure/hash only for tests affected before or after the edge change.
+10. Preserved full rebuild fallback for new/deleted files, config, `conftest.py`, and package `__init__.py`.
+
+### Round 10 — Dynamic dependencies and safe fine-grained reuse (10 criteria)
+
+1. Added Python audit-hook capture for workspace data files opened at runtime.
+2. Associated runtime data dependencies with the active pytest nodeid instead of the entire batch.
+3. Kept Python module dependencies in the AST graph to avoid batch-wide dynamic import false positives.
+4. Made learned runtime dependencies monotonic and persisted them in cache records.
+5. Rebuilt graph hashes when new runtime data dependencies are learned.
+6. Added per-node outcomes, durations, and failure snippets to cache records.
+7. Restricted node-level reuse to module-level `pytestmark = pytest.mark.node_cache_safe`.
+8. Prevented node selector requests from returning whole-file test counts.
+9. Added opt-in module-level `parallel_safe` multi-file parallel Zygote execution.
+10. Kept parallel execution disabled by default and gated behind `--parallel-delta`.
+
+### Round 11 — Final repeated audit (14 criteria)
+
+The final audit checked snapshot stability, environment identity, fork safety, inherited file descriptors, cancellation semantics, background authorization, resource conflicts, load throttling, cache WAL crash behavior, cache schema isolation, dynamic dependency ownership, node cache safety, strict Clippy, and end-to-end benchmark parity. During this audit, four additional defects were found and fixed:
+
+1. Module markers were initially parsed inside the `usefixtures` branch; moved to a correct top-level parser branch.
+2. Function-level markers could authorize file-level background/node/parallel behavior; changed to module-level markers only.
+3. Cancelled Zygote children could be interpreted as failures; added signal-aware cancellation response.
+4. Runtime audit dependencies were initially assigned batch-wide; changed to nodeid-specific attribution.
+
+After repair, all Rust tests, strict Clippy (`-D warnings`), TypeScript compilation, ESLint, Node tests, WAL restart, source-race rejection, process-group cancellation, and 320 paired AKS Store Demo observations pass. No known Critical, High, or Medium finding remains.

@@ -231,6 +231,9 @@ def daemon_session(executable: Path, pytest_bin: Path, root: Path, home: Path):
             str(root),
             "--pytest-cmd",
             str(pytest_bin),
+            "--background-all",
+            "--background-max-load-ratio",
+            "200",
             "register",
         ],
         env=env,
@@ -489,6 +492,12 @@ def render(report, output: Path):
         )
     plt.close(figure)
 
+    for name in ("latency-speedup.svg", "cold-start.svg"):
+        path = output / name
+        path.write_text(
+            "\n".join(line.rstrip() for line in path.read_text().splitlines()) + "\n"
+        )
+
     with (output / "summary.csv").open("w", newline="") as stream:
         writer = csv.writer(stream, lineterminator="\n")
         writer.writerow(
@@ -577,7 +586,9 @@ def main():
                     ms_off, out_off = timed(lambda: run_direct_pytest(pytest_bin, root))
                     ms_on, res_on = timed(lambda: rpc(home, root, "test_run", {}))
                     assert "16 passed" in out_off
-                    assert res_on["mode"] == "instant_cache_hit" and res_on["passed"] == 16
+                    assert (
+                        res_on["mode"] == "instant_cache_hit" and res_on["passed"] == 16
+                    ), f"Warm suite was not cached: {res_on}"
                     records.append(
                         {
                             "session": session,
@@ -627,7 +638,9 @@ def main():
                     ms_off, out_off = timed(lambda: run_direct_pytest(pytest_bin, root))
                     ms_on, res_on = timed(lambda: rpc(home, root, "test_run", {}))
                     assert "16 passed" in out_off
-                    assert res_on["mode"] == "instant_cache_hit" and res_on["passed"] == 16
+                    assert (
+                        res_on["mode"] == "instant_cache_hit" and res_on["passed"] == 16
+                    ), f"Background speculative run was not cached: {res_on}"
                     records.append(
                         {
                             "session": session,

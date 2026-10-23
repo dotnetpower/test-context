@@ -26,6 +26,18 @@ struct Args {
     pytest_cmd: Vec<String>,
     #[arg(long)]
     no_background: bool,
+    #[arg(
+        long,
+        help = "Allow speculative background execution for unmarked tests; default requires @pytest.mark.background_safe"
+    )]
+    background_all: bool,
+    #[arg(
+        long,
+        help = "Enable multi-file parallel delta execution for modules marked pytestmark=pytest.mark.parallel_safe"
+    )]
+    parallel_delta: bool,
+    #[arg(long, default_value_t = 75)]
+    background_max_load_ratio: usize,
     #[command(subcommand)]
     command: Action,
 }
@@ -173,6 +185,9 @@ fn run() -> Result<i32> {
             let planning = matches!(&args.command, Action::Plan);
             let policy = MemoryPolicy {
                 background_enabled: !args.no_background,
+                background_safe_only: !args.background_all,
+                parallel_delta_enabled: args.parallel_delta,
+                background_max_load_ratio_percent: args.background_max_load_ratio,
                 ..MemoryPolicy::default()
             };
             policy.validate().map_err(invalid)?;
@@ -373,7 +388,11 @@ fn run_pytest_dropin(root: PathBuf, raw_args: &[String]) -> Result<i32> {
 fn print_json(value: &Value) -> Result<()> {
     let mut out = io::stdout().lock();
     let bytes = serde_json::to_vec_pretty(value)?;
-    if let Err(err) = out.write_all(&bytes).and_then(|()| writeln!(out)).and_then(|()| out.flush()) {
+    if let Err(err) = out
+        .write_all(&bytes)
+        .and_then(|()| writeln!(out))
+        .and_then(|()| out.flush())
+    {
         if err.kind() == io::ErrorKind::BrokenPipe {
             return Ok(());
         }

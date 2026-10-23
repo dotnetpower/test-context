@@ -1,17 +1,17 @@
 use crate::ast_graph::{
     AffectedTest, DependencyGraph, FileGraphInfo, file_stamp, normalize_rel_str, sha256_hex,
 };
-use crate::cache::{CachedTestRecord, RootCache, TestOutcome, now_unix_ms};
+use crate::cache::{CachedNodeResult, CachedTestRecord, RootCache, TestOutcome, now_unix_ms};
 use crate::catalog::Spec;
 use crate::workspace::{Workspace, run_command_with_timeout};
-use crate::zygote::PytestZygote;
+use crate::zygote::{ZygoteManager, cancel_process_group};
 use crate::{Result, invalid};
 use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{Receiver, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -77,6 +77,83 @@ pub struct AffectedTestStatus {
     pub reason_chain: Vec<String>,
 }
 
+const BACKGROUND_DENY_MARKERS: &[&str] = &[
+    "live",
+    "integration",
+    "destructive",
+    "serial",
+    "network",
+    "external",
+    "azure",
+    "docker",
+];
+
+fn background_eligible(spec: &Spec, graph: &DependencyGraph, test_file: &str) -> bool {
+    let Some(node) = graph.files.get(test_file) else {
+        return false;
+    };
+    if node
+        .parsed
+        .markers
+        .iter()
+        .any(|marker| BACKGROUND_DENY_MARKERS.contains(&marker.as_str()))
+    {
+        return false;
+    }
+    !spec.policy.background_safe_only
+        || node
+            .parsed
+            .module_markers
+            .iter()
+            .any(|marker| marker == "background_safe")
+}
+
+fn test_resource_keys(graph: &DependencyGraph, test_file: &str) -> BTreeSet<String> {
+    let Some(node) = graph.files.get(test_file) else {
+        return BTreeSet::new();
+    };
+    node.parsed
+        .markers
+        .iter()
+        .filter_map(|marker| {
+            marker
+                .strip_prefix("resource_")
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    matches!(
+                        marker.as_str(),
+                        "database" | "docker" | "network" | "serial" | "port"
+                    )
+                    .then(|| marker.clone())
+                })
+        })
+        .collect()
+}
+
+fn background_capacity_available(max_ratio_percent: usize) -> bool {
+    if std::env::var_os("TCTX_PAUSE_BACKGROUND").is_some_and(|value| value == "1") {
+        return false;
+    }
+    if max_ratio_percent >= 200 {
+        return true;
+    }
+    let Ok(loadavg) = std::fs::read_to_string("/proc/loadavg") else {
+        return true;
+    };
+    let Some(load) = loadavg
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse::<f64>().ok())
+    else {
+        return true;
+    };
+    let cpus = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    let ceiling = cpus as f64 * max_ratio_percent as f64 / 100.0;
+    load <= ceiling.max(1.0)
+}
+
 struct RootState {
     spec: Spec,
     workspace: Workspace,
@@ -88,6 +165,9 @@ struct RootState {
     last_activity: Instant,
     background_running: bool,
     last_background_error: Option<String>,
+    background_resources: BTreeSet<String>,
+    background_runs_deferred_load: u64,
+    last_safety_scan: Instant,
 }
 
 pub struct ManagedRoot {
@@ -97,14 +177,28 @@ pub struct ManagedRoot {
     fs_events_rx: Mutex<Receiver<Event>>,
     fs_overflow: Arc<AtomicBool>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
-    zygote: Mutex<Option<PytestZygote>>,
+    zygote: Mutex<ZygoteManager>,
+    active_pgid: Arc<AtomicI32>,
 }
 
 impl ManagedRoot {
     pub fn load(spec: Spec) -> Result<Arc<Self>> {
         let workspace = spec.workspace()?;
-        let graph = DependencyGraph::build(&workspace, &spec.policy)?;
+        let mut graph = DependencyGraph::build(&workspace, &spec.policy)?;
         let cache = RootCache::load_or_new(&workspace.root);
+        let mut runtime_changed = false;
+        for record in cache.latest_by_file.values() {
+            runtime_changed |= graph.apply_runtime_dependencies(
+                &workspace,
+                &spec.policy,
+                &record.test_file,
+                &record.dynamic_dependencies,
+            );
+        }
+        if runtime_changed {
+            graph.recompute_edges();
+        }
+        graph.apply_environment_hash(environment_fingerprint(&spec));
 
         // Queue background execution for dirty git files (or all uncached tests when suite <= 32 files)
         let mut pending_queue = VecDeque::new();
@@ -112,7 +206,10 @@ impl ManagedRoot {
             let dirty = git_dirty_files(&workspace.root).unwrap_or_default();
             if !dirty.is_empty() {
                 for item in graph.affected_tests(&dirty) {
-                    if cache.get_matching(&item.test_file, &item.dep_hash).is_none()
+                    if cache
+                        .get_matching(&item.test_file, &item.dep_hash)
+                        .is_none()
+                        && background_eligible(&spec, &graph, &item.test_file)
                         && !pending_queue.contains(&item.test_file)
                     {
                         pending_queue.push_back(item.test_file);
@@ -121,16 +218,17 @@ impl ManagedRoot {
             } else if graph.dep_hash_for_test.len() <= 32 {
                 for (test_file, dep_hash) in &graph.dep_hash_for_test {
                     if cache.get_matching(test_file, dep_hash).is_none() {
+                        if !background_eligible(&spec, &graph, test_file) {
+                            continue;
+                        }
                         pending_queue.push_back(test_file.clone());
                     }
                 }
             }
         }
 
-        let watch_dirs = workspace.watch_directories_for(
-            graph.files.keys().map(Path::new),
-            &spec.policy,
-        )?;
+        let watch_dirs =
+            workspace.watch_directories_for(graph.files.keys().map(Path::new), &spec.policy)?;
         let watched_dirs_set: BTreeSet<PathBuf> = watch_dirs.iter().cloned().collect();
 
         let state = RootState {
@@ -144,6 +242,9 @@ impl ManagedRoot {
             last_activity: Instant::now(),
             background_running: false,
             last_background_error: None,
+            background_resources: BTreeSet::new(),
+            background_runs_deferred_load: 0,
+            last_safety_scan: Instant::now(),
         };
 
         let (fs_tx, fs_rx) = sync_channel(4096);
@@ -186,6 +287,8 @@ impl ManagedRoot {
                 w
             });
 
+            let zygote_manager = ZygoteManager::default();
+            let active_pgid = zygote_manager.active_handle();
             Self {
                 state: Mutex::new(state),
                 condvar: Condvar::new(),
@@ -193,7 +296,8 @@ impl ManagedRoot {
                 fs_events_rx: Mutex::new(fs_rx),
                 fs_overflow,
                 watcher: Mutex::new(watcher),
-                zygote: Mutex::new(None),
+                zygote: Mutex::new(zygote_manager),
+                active_pgid,
             }
         });
 
@@ -213,18 +317,14 @@ impl ManagedRoot {
                     let Ok(guard) = this.state.lock() else {
                         return;
                     };
-                    (
-                        guard.spec.clone(),
-                        guard.graph.external_preload_modules(),
-                    )
+                    (guard.spec.clone(), guard.graph.external_preload_modules())
                 };
                 let pythonpath = build_pythonpath(&spec.root, std::env::var_os("PYTHONPATH"));
-                if let Ok(mut z_guard) = this.zygote.lock()
-                    && z_guard.is_none()
+                let plugins = pytest_plugin_manifest(&spec);
+                if let Ok(mut manager) = this.zygote.lock()
                     && !this.stopped.load(Ordering::SeqCst)
-                    && let Ok(spawned) = PytestZygote::spawn(&spec, pythonpath, &preload)
                 {
-                    *z_guard = Some(spawned);
+                    let _ = manager.ensure(&spec, pythonpath, &preload, &plugins);
                 }
             });
     }
@@ -242,9 +342,13 @@ impl ManagedRoot {
             *w = None;
         }
         if let Ok(mut z) = self.zygote.lock() {
-            *z = None;
+            *z = ZygoteManager::default();
         }
         self.condvar.notify_all();
+    }
+
+    pub fn cancel_active(&self) -> bool {
+        cancel_process_group(&self.active_pgid)
     }
 
     fn spawn_background_worker(this: Arc<Self>) {
@@ -260,9 +364,24 @@ impl ManagedRoot {
             if self.stopped.load(Ordering::SeqCst) {
                 return;
             }
+            if !background_capacity_available(
+                self.state
+                    .lock()
+                    .map(|guard| guard.spec.policy.background_max_load_ratio_percent)
+                    .unwrap_or(75),
+            ) {
+                if let Ok(mut guard) = self.state.lock() {
+                    guard.background_runs_deferred_load =
+                        guard.background_runs_deferred_load.saturating_add(1);
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                continue;
+            }
             let batch: Vec<(String, String)>;
             let spec: Spec;
             let preload_modules: Vec<String>;
+            let environment_hash: String;
+            let capture_dynamic_dependencies: bool;
             {
                 let mut guard = self.state.lock().expect("state lock");
                 self.drain_fs_events_locked(&mut guard);
@@ -285,6 +404,16 @@ impl ManagedRoot {
                     return;
                 }
                 let max_batch = guard.spec.policy.background_batch_size.max(1);
+                let mut sorted: Vec<String> = guard.pending_queue.drain(..).collect();
+                sorted.sort_by_key(|test_file| {
+                    guard
+                        .cache
+                        .latest_by_file
+                        .get(test_file)
+                        .map(|record| record.duration_ms)
+                        .unwrap_or(0)
+                });
+                guard.pending_queue.extend(sorted);
                 let mut selected = Vec::new();
                 while selected.len() < max_batch {
                     let Some(test_file) = guard.pending_queue.pop_front() else {
@@ -308,9 +437,22 @@ impl ManagedRoot {
                     continue;
                 }
                 guard.background_running = true;
+                guard.background_resources = selected
+                    .iter()
+                    .flat_map(|(test_file, _)| {
+                        test_resource_keys(&guard.graph, test_file).into_iter()
+                    })
+                    .collect();
                 batch = selected;
                 spec = guard.spec.clone();
                 preload_modules = guard.graph.external_preload_modules();
+                environment_hash = guard.graph.environment_hash.clone();
+                capture_dynamic_dependencies = batch.iter().any(|(test_file, dep_hash)| {
+                    guard
+                        .cache
+                        .get_matching(test_file, dep_hash)
+                        .is_none_or(|record| !record.dynamic_dependencies_complete)
+                });
             }
 
             let files_only: Vec<String> = batch.iter().map(|(f, _)| f.clone()).collect();
@@ -325,30 +467,79 @@ impl ManagedRoot {
                 "background",
                 Some(&self.zygote),
                 &preload_modules,
+                &environment_hash,
+                &pytest_plugin_manifest(&spec),
+                capture_dynamic_dependencies,
             );
+            let exec_res = exec_res.map(|(mut records, raw)| {
+                records.shrink_to_fit();
+                (records, raw)
+            });
 
             {
                 let mut guard = self.state.lock().expect("state lock");
                 for (test_file, dep_hash) in &batch {
                     guard.in_flight.remove(&flight_key(test_file, dep_hash));
                 }
+                Self::reconcile_live_files_locked(&mut guard, Some(&files_only));
+                let unstable: BTreeSet<String> = batch
+                    .iter()
+                    .filter(|(test_file, expected_hash)| {
+                        guard.graph.dep_hash_for_test.get(test_file) != Some(expected_hash)
+                    })
+                    .map(|(test_file, _)| test_file.clone())
+                    .collect();
+                for test_file in unstable.iter().rev() {
+                    if background_eligible(&guard.spec, &guard.graph, test_file) {
+                        guard.pending_queue.retain(|queued| queued != test_file);
+                        guard.pending_queue.push_front(test_file.clone());
+                    }
+                }
                 match exec_res {
-                    Ok((records, _raw_out)) => {
+                    Ok((mut records, _raw_out)) => {
+                        let workspace = guard.workspace.clone();
+                        let policy_snapshot = guard.spec.policy.clone();
+                        let mut runtime_changed = false;
+                        for record in &records {
+                            runtime_changed |= guard.graph.apply_runtime_dependencies(
+                                &workspace,
+                                &policy_snapshot,
+                                &record.test_file,
+                                &record.dynamic_dependencies,
+                            );
+                        }
+                        if runtime_changed {
+                            guard.graph.recompute_edges();
+                            for record in &mut records {
+                                if let Some(dep_hash) =
+                                    guard.graph.dep_hash_for_test.get(&record.test_file)
+                                {
+                                    record.dep_hash.clone_from(dep_hash);
+                                }
+                            }
+                        }
                         let policy = guard.spec.policy.clone();
                         for rec in records {
-                            // Only record if the file's live dep_hash hasn't already moved on, or store in history_by_key
-                            guard.cache.insert(rec, &policy);
+                            if !unstable.contains(&rec.test_file) {
+                                guard.cache.insert(rec, &policy);
+                            }
                         }
                         guard.cache.total_background_runs =
                             guard.cache.total_background_runs.saturating_add(1);
                         guard.last_background_error = None;
-                        let _ = guard.cache.save();
+                        match guard.cache.save() {
+                            Ok(()) => guard.cache.persistence_error = None,
+                            Err(error) => {
+                                guard.cache.persistence_error = Some(error.to_string());
+                            }
+                        }
                     }
                     Err(err) => {
                         guard.last_background_error = Some(err.to_string());
                     }
                 }
                 guard.background_running = !guard.pending_queue.is_empty();
+                guard.background_resources.clear();
                 self.condvar.notify_all();
             }
         }
@@ -369,6 +560,7 @@ impl ManagedRoot {
         }
         if overflowed {
             Self::reconcile_live_files_locked(guard, None);
+            guard.last_safety_scan = Instant::now();
             return;
         }
         if raw_paths.is_empty() {
@@ -432,11 +624,10 @@ impl ManagedRoot {
                         .get(&rel_str)
                         .is_some_and(|node| node.sha256 == new_sha);
                     if !unchanged {
-                        if guard.graph.insert_file_bytes_with_stamp(
-                            &rel_str,
-                            &bytes,
-                            Some(stamp),
-                        ) {
+                        if guard
+                            .graph
+                            .insert_file_bytes_with_stamp(&rel_str, &bytes, Some(stamp))
+                        {
                             structure_changed = true;
                         }
                         changed_rels.push(rel_str);
@@ -464,7 +655,7 @@ impl ManagedRoot {
                 guard
                     .graph
                     .discover_referenced_data_files(&guard.workspace, &guard.spec.policy);
-                guard.graph.recompute_edges();
+                guard.graph.recompute_structure_incremental(&changed_rels);
             } else {
                 guard.graph.recompute_hashes_for_changed(&changed_rels);
             }
@@ -475,6 +666,7 @@ impl ManagedRoot {
                         .cache
                         .get_matching(&item.test_file, &item.dep_hash)
                         .is_none()
+                        && background_eligible(&guard.spec, &guard.graph, &item.test_file)
                     {
                         guard.pending_queue.retain(|p| p != &item.test_file);
                         guard.pending_queue.push_front(item.test_file);
@@ -497,6 +689,7 @@ impl ManagedRoot {
             if norm.is_empty() || norm == "." || guard.graph.files.contains_key(&norm) {
                 continue;
             }
+
             let rel_path = Path::new(&norm);
             if !guard.workspace.is_permitted_rel(rel_path)
                 && !guard.workspace.is_permitted_data_rel(rel_path)
@@ -520,6 +713,13 @@ impl ManagedRoot {
                 .graph
                 .discover_referenced_data_files(&guard.workspace, &guard.spec.policy);
             guard.graph.recompute_edges();
+        }
+    }
+
+    fn maybe_safety_reconcile_locked(guard: &mut RootState) {
+        if guard.last_safety_scan.elapsed() >= Duration::from_secs(60) {
+            Self::reconcile_live_files_locked(guard, None);
+            guard.last_safety_scan = Instant::now();
         }
     }
 
@@ -597,6 +797,7 @@ impl ManagedRoot {
                         .cache
                         .get_matching(&item.test_file, &item.dep_hash)
                         .is_none()
+                        && background_eligible(&guard.spec, &guard.graph, &item.test_file)
                     {
                         guard.pending_queue.retain(|p| p != &item.test_file);
                         guard.pending_queue.push_front(item.test_file);
@@ -611,6 +812,8 @@ impl ManagedRoot {
             let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
             guard.last_activity = Instant::now();
             guard.graph = DependencyGraph::build(&guard.workspace, &guard.spec.policy)?;
+            let environment_hash = environment_fingerprint(&guard.spec);
+            guard.graph.apply_environment_hash(environment_hash);
             if guard.spec.policy.background_enabled {
                 let candidates: Vec<(String, String)> = guard
                     .graph
@@ -620,6 +823,7 @@ impl ManagedRoot {
                     .collect();
                 for (test_file, dep_hash) in candidates {
                     if guard.cache.get_matching(&test_file, &dep_hash).is_none()
+                        && background_eligible(&guard.spec, &guard.graph, &test_file)
                         && !guard.pending_queue.contains(&test_file)
                     {
                         guard.pending_queue.push_back(test_file);
@@ -652,8 +856,12 @@ impl ManagedRoot {
         let removed = if files.is_empty() {
             let count = guard.cache.invalidate_all();
             if guard.spec.policy.background_enabled {
-                let all_tests: Vec<String> = guard.graph.dep_hash_for_test.keys().cloned().collect();
+                let all_tests: Vec<String> =
+                    guard.graph.dep_hash_for_test.keys().cloned().collect();
                 for test_file in all_tests {
+                    if !background_eligible(&guard.spec, &guard.graph, &test_file) {
+                        continue;
+                    }
                     if !guard.pending_queue.contains(&test_file) {
                         guard.pending_queue.push_back(test_file);
                     }
@@ -666,7 +874,9 @@ impl ManagedRoot {
             let mut count = 0usize;
             for test_file in resolved {
                 count += guard.cache.invalidate_file(&test_file);
-                if guard.spec.policy.background_enabled && !guard.pending_queue.contains(&test_file)
+                if guard.spec.policy.background_enabled
+                    && background_eligible(&guard.spec, &guard.graph, &test_file)
+                    && !guard.pending_queue.contains(&test_file)
                 {
                     guard.pending_queue.push_back(test_file);
                 }
@@ -674,7 +884,10 @@ impl ManagedRoot {
             self.condvar.notify_all();
             count
         };
-        let _ = guard.cache.save();
+        match guard.cache.save() {
+            Ok(()) => guard.cache.persistence_error = None,
+            Err(error) => guard.cache.persistence_error = Some(error.to_string()),
+        }
         Ok(serde_json::json!({
             "root": guard.workspace.root,
             "invalidated_entries": removed,
@@ -696,9 +909,14 @@ impl ManagedRoot {
                 None => uncached += 1,
             }
         }
-        serde_json::json!({
-            "root": guard.workspace.root,
-            "pytest_cmd": guard.spec.effective_pytest_cmd(),
+        let root = guard.workspace.root.clone();
+        let pytest_cmd = guard.spec.effective_pytest_cmd();
+        let background_safe_only = guard.spec.policy.background_safe_only;
+        let background_deferred = guard.background_runs_deferred_load;
+        let watcher_overflow = self.fs_overflow.load(Ordering::Acquire);
+        let payload = serde_json::json!({
+            "root": root,
+            "pytest_cmd": pytest_cmd,
             "indexed_python_files": guard.graph.files.len(),
             "total_test_files": total_tests,
             "cached_passed_files": cached_passed,
@@ -712,7 +930,21 @@ impl ManagedRoot {
             "total_cache_hits": guard.cache.total_cache_hits,
             "total_delta_runs": guard.cache.total_delta_runs,
             "total_background_runs": guard.cache.total_background_runs,
-        })
+            "background_safe_only": background_safe_only,
+            "background_runs_deferred_load": background_deferred,
+            "watcher_overflow_pending": watcher_overflow,
+            "cache_quarantined_keys": guard.cache.quarantined_keys.len(),
+            "cache_persistence_error": guard.cache.persistence_error,
+        });
+        drop(guard);
+        let zygote = self
+            .zygote
+            .lock()
+            .map(|manager| manager.status())
+            .unwrap_or_else(|_| serde_json::json!({"ready":false,"error":"mutex_poisoned"}));
+        let mut payload = payload;
+        payload["zygote"] = zygote;
+        payload
     }
 
     pub fn graph_info(&self, file: &str) -> Result<FileGraphInfo> {
@@ -720,7 +952,7 @@ impl ManagedRoot {
         guard.last_activity = Instant::now();
         self.drain_fs_events_locked(&mut guard);
         Self::ingest_explicit_paths_locked(&mut guard, &[file.to_string()]);
-        Self::reconcile_live_files_locked(&mut guard, None);
+        Self::maybe_safety_reconcile_locked(&mut guard);
         guard.graph.file_graph_info(file).ok_or_else(|| {
             invalid(format!(
                 "file is not indexed in the Python AST graph: {file}"
@@ -734,7 +966,7 @@ impl ManagedRoot {
         guard.last_activity = Instant::now();
         self.drain_fs_events_locked(&mut guard);
         Self::ingest_explicit_paths_locked(&mut guard, files);
-        Self::reconcile_live_files_locked(&mut guard, None);
+        Self::maybe_safety_reconcile_locked(&mut guard);
 
         let changed_files = if !files.is_empty() {
             files.to_vec()
@@ -782,9 +1014,8 @@ impl ManagedRoot {
 
     pub fn run_tests(&self, req: &TestRunRequest) -> Result<TestRunResponse> {
         let started = Instant::now();
-        let has_subfile_filter = req.k.is_some()
-            || req.mark.is_some()
-            || req.targets.iter().any(|t| t.contains("::"));
+        let has_subfile_filter =
+            req.k.is_some() || req.mark.is_some() || req.targets.iter().any(|t| t.contains("::"));
 
         let mut cached_summaries = Vec::new();
         let mut cached_failure_outputs = Vec::new();
@@ -794,6 +1025,9 @@ impl ManagedRoot {
         let mut saved_ms = 0u64;
         let spec: Spec;
         let preload_modules: Vec<String>;
+        let environment_hash: String;
+        let parallel_delta: bool;
+        let capture_dynamic_dependencies: bool;
         let target_test_files: Vec<String>;
 
         {
@@ -803,11 +1037,28 @@ impl ManagedRoot {
             Self::ingest_explicit_paths_locked(&mut guard, &req.targets);
 
             // 1. Resolve target test files (and reconcile live files on disk)
-            let initial_targets = guard.graph.resolve_target_test_files(&req.targets);
-            Self::reconcile_live_files_locked(&mut guard, Some(&initial_targets));
+            Self::maybe_safety_reconcile_locked(&mut guard);
             target_test_files = guard.graph.resolve_target_test_files(&req.targets);
             spec = guard.spec.clone();
-            preload_modules = guard.graph.external_preload_modules();
+            environment_hash = guard.graph.environment_hash.clone();
+            parallel_delta = guard.spec.policy.parallel_delta_enabled
+                && target_test_files.len() > 1
+                && target_test_files.iter().all(|test_file| {
+                    guard.graph.files.get(test_file).is_some_and(|node| {
+                        node.parsed
+                            .module_markers
+                            .iter()
+                            .any(|marker| marker == "parallel_safe")
+                    })
+                });
+            capture_dynamic_dependencies = target_test_files.iter().any(|test_file| {
+                guard
+                    .graph
+                    .dep_hash_for_test
+                    .get(test_file)
+                    .and_then(|dep_hash| guard.cache.get_matching(test_file, dep_hash))
+                    .is_none_or(|record| !record.dynamic_dependencies_complete)
+            });
 
             if target_test_files.is_empty() {
                 return Ok(TestRunResponse {
@@ -829,6 +1080,32 @@ impl ManagedRoot {
                     failed_nodeids: Vec::new(),
                     stdout_summary: "=== no tests matched in 0.00s ===".to_string(),
                 });
+            }
+
+            let requested_resources: BTreeSet<String> = target_test_files
+                .iter()
+                .flat_map(|test_file| test_resource_keys(&guard.graph, test_file).into_iter())
+                .collect();
+            let resource_deadline = Instant::now() + Duration::from_secs(30);
+            while !requested_resources.is_disjoint(&guard.background_resources)
+                && Instant::now() < resource_deadline
+            {
+                let (next_guard, _) = self
+                    .condvar
+                    .wait_timeout(guard, Duration::from_millis(50))
+                    .map_err(|_| invalid("mutex poisoned"))?;
+                guard = next_guard;
+            }
+            if !requested_resources.is_disjoint(&guard.background_resources) {
+                return Err(invalid(format!(
+                    "TEST_RESOURCE_BUSY resources={}",
+                    requested_resources
+                        .intersection(&guard.background_resources)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ))
+                .into());
             }
 
             // 2. If any targeted test file is currently in flight in the background worker for the exact current dep_hash,
@@ -860,30 +1137,83 @@ impl ManagedRoot {
                 let Some(dep_hash) = guard.graph.dep_hash_for_test.get(tf).cloned() else {
                     continue;
                 };
-                // Verify that any explicit `file.py::symbol` selector matches a known test symbol in `tf`
-                let nodeid_symbol_verified = req
+                let requested_nodeids: Vec<String> = req
                     .targets
                     .iter()
                     .filter_map(|t| {
-                        let (file_part, sym_part) = t.split_once("::")?;
+                        let (file_part, _) = t.split_once("::")?;
                         let norm = file_part.trim().trim_start_matches("./").replace('\\', "/");
                         if &norm == tf {
-                            Some(sym_part.split("::").next().unwrap_or(sym_part))
+                            Some(t.trim_start_matches("./").replace('\\', "/"))
                         } else {
                             None
                         }
                     })
-                    .all(|sym| {
-                        guard
-                            .graph
-                            .files
-                            .get(tf)
-                            .is_some_and(|n| n.parsed.test_symbols.iter().any(|s| s == sym))
-                    });
+                    .collect();
+                if !req.no_cache
+                    && !requested_nodeids.is_empty()
+                    && guard.graph.files.get(tf).is_some_and(|node| {
+                        node.parsed
+                            .module_markers
+                            .iter()
+                            .any(|marker| marker == "node_cache_safe")
+                    })
+                    && let Some(record) = guard.cache.get_matching(tf, &dep_hash)
+                {
+                    let nodes: Option<Vec<_>> = requested_nodeids
+                        .iter()
+                        .map(|nodeid| record.node_results.get(nodeid))
+                        .collect();
+                    if let Some(nodes) = nodes {
+                        let mut passed = 0;
+                        let mut failed = 0;
+                        let mut skipped = 0;
+                        let mut errors = 0;
+                        let mut duration_ms = 0;
+                        let mut failed_nodeids = Vec::new();
+                        for node in nodes {
+                            duration_ms += node.duration_ms;
+                            match node.outcome {
+                                TestOutcome::Passed => passed += 1,
+                                TestOutcome::Failed => {
+                                    failed += 1;
+                                    failed_nodeids.push(node.nodeid.clone());
+                                }
+                                TestOutcome::Skipped => skipped += 1,
+                                TestOutcome::Error => {
+                                    errors += 1;
+                                    failed_nodeids.push(node.nodeid.clone());
+                                }
+                            }
+                        }
+                        saved_ms = saved_ms.saturating_add(duration_ms);
+                        cached_summaries.push(FileRunSummary {
+                            test_file: tf.clone(),
+                            dep_hash: record.dep_hash.clone(),
+                            outcome: if failed > 0 {
+                                TestOutcome::Failed
+                            } else if errors > 0 {
+                                TestOutcome::Error
+                            } else if passed > 0 {
+                                TestOutcome::Passed
+                            } else {
+                                TestOutcome::Skipped
+                            },
+                            source: format!("cached_node({})", record.source),
+                            passed,
+                            failed,
+                            skipped,
+                            errors,
+                            duration_ms,
+                            failed_nodeids,
+                        });
+                        continue;
+                    }
+                }
                 let can_use_cache = !req.no_cache
                     && req.k.is_none()
                     && req.mark.is_none()
-                    && nodeid_symbol_verified;
+                    && requested_nodeids.is_empty();
 
                 if can_use_cache
                     && let Some(rec) = guard.cache.get_matching(tf, &dep_hash)
@@ -921,6 +1251,11 @@ impl ManagedRoot {
                     .saturating_add(cached_summaries.len() as u64);
                 guard.cache.total_saved_ms = guard.cache.total_saved_ms.saturating_add(saved_ms);
             }
+            preload_modules = if to_execute.is_empty() {
+                Vec::new()
+            } else {
+                guard.graph.external_preload_modules()
+            };
         }
 
         // 4. Execute delta tests if any remain uncached
@@ -941,24 +1276,86 @@ impl ManagedRoot {
                 to_execute.clone()
             };
 
-            let exec_res = execute_pytest_batch(
-                &spec,
-                &invocation_targets,
-                &dep_hashes_for_exec,
-                req.k.as_deref(),
-                req.mark.as_deref(),
-                &req.pytest_args,
-                "on_demand",
-                Some(&self.zygote),
-                &preload_modules,
-            );
+            let plugin_manifest = pytest_plugin_manifest(&spec);
+            let exec_res = if parallel_delta && invocation_targets.len() > 1 {
+                execute_pytest_parallel(
+                    &spec,
+                    &invocation_targets,
+                    &dep_hashes_for_exec,
+                    req.k.as_deref(),
+                    req.mark.as_deref(),
+                    &req.pytest_args,
+                    &preload_modules,
+                    &environment_hash,
+                    &plugin_manifest,
+                    capture_dynamic_dependencies,
+                )
+            } else {
+                execute_pytest_batch(
+                    &spec,
+                    &invocation_targets,
+                    &dep_hashes_for_exec,
+                    req.k.as_deref(),
+                    req.mark.as_deref(),
+                    &req.pytest_args,
+                    "on_demand",
+                    Some(&self.zygote),
+                    &preload_modules,
+                    &environment_hash,
+                    &plugin_manifest,
+                    capture_dynamic_dependencies,
+                )
+            };
+            let (mut records, raw_out) = exec_res?;
 
             let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
             for (tf, dh) in &dep_hashes_for_exec {
                 guard.in_flight.remove(&flight_key(tf, dh));
             }
-            let (records, raw_out) = exec_res?;
+            Self::reconcile_live_files_locked(&mut guard, Some(&to_execute));
+            let unstable: Vec<String> = dep_hashes_for_exec
+                .iter()
+                .filter(|(test_file, expected_hash)| {
+                    guard.graph.dep_hash_for_test.get(*test_file) != Some(*expected_hash)
+                })
+                .map(|(test_file, _)| test_file.clone())
+                .collect();
+            if !unstable.is_empty() {
+                for test_file in unstable.iter().rev() {
+                    if background_eligible(&guard.spec, &guard.graph, test_file) {
+                        guard.pending_queue.retain(|queued| queued != test_file);
+                        guard.pending_queue.push_front(test_file.clone());
+                    }
+                }
+                self.condvar.notify_all();
+                return Err(invalid(format!(
+                    "SOURCE_CHANGED_DURING_TEST files={}; result discarded and requeued",
+                    unstable.join(",")
+                ))
+                .into());
+            }
             delta_stdout = raw_out;
+            let mut runtime_changed = false;
+            let workspace_snapshot = guard.workspace.clone();
+            let policy_snapshot = guard.spec.policy.clone();
+            for record in &records {
+                runtime_changed |= guard.graph.apply_runtime_dependencies(
+                    &workspace_snapshot,
+                    &policy_snapshot,
+                    &record.test_file,
+                    &record.dynamic_dependencies,
+                );
+            }
+            if runtime_changed {
+                guard.graph.recompute_edges();
+                let environment_hash = guard.graph.environment_hash.clone();
+                guard.graph.apply_environment_hash(environment_hash);
+                for record in &mut records {
+                    if let Some(dep_hash) = guard.graph.dep_hash_for_test.get(&record.test_file) {
+                        record.dep_hash.clone_from(dep_hash);
+                    }
+                }
+            }
             let policy = guard.spec.policy.clone();
             for rec in records {
                 executed_summaries.push(FileRunSummary {
@@ -979,7 +1376,10 @@ impl ManagedRoot {
                 }
             }
             guard.cache.total_delta_runs = guard.cache.total_delta_runs.saturating_add(1);
-            let _ = guard.cache.save();
+            match guard.cache.save() {
+                Ok(()) => guard.cache.persistence_error = None,
+                Err(error) => guard.cache.persistence_error = Some(error.to_string()),
+            }
             self.condvar.notify_all();
         }
 
@@ -1069,6 +1469,104 @@ fn flight_key(test_file: &str, dep_hash: &str) -> String {
     format!("{test_file}@{dep_hash}")
 }
 
+fn environment_fingerprint(spec: &Spec) -> String {
+    let pytest_cmd = spec.effective_pytest_cmd();
+    let python = crate::zygote::resolve_python_bin(&pytest_cmd);
+    let mut evidence = Vec::new();
+    evidence.extend_from_slice(b"tctx-env-v2\n");
+    evidence.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
+    evidence.push(b'\n');
+    evidence.extend_from_slice(spec.root.to_string_lossy().as_bytes());
+    evidence.push(b'\n');
+    evidence.extend_from_slice(pytest_cmd.join("\0").as_bytes());
+    evidence.push(b'\n');
+
+    for (program, args) in [(
+        python.to_string_lossy().into_owned(),
+        vec![
+            "-c",
+            "import platform,sys,pytest;print(sys.version);print(sys.executable);print(platform.platform());print(pytest.__version__)",
+        ],
+    )] {
+        let mut command = Command::new(program);
+        command.args(args);
+        if let Ok(output) =
+            run_command_with_timeout(&mut command, Duration::from_secs(5), 64 * 1024)
+        {
+            evidence.extend_from_slice(&output.stdout);
+            evidence.extend_from_slice(&output.stderr);
+        }
+        for plugin in pytest_plugin_manifest(spec) {
+            evidence.extend_from_slice(b"plugin:");
+            evidence.extend_from_slice(plugin.as_bytes());
+            evidence.push(b'\n');
+        }
+        evidence.push(b'\n');
+    }
+
+    let mut env_keys = vec![
+        "PYTHONHASHSEED".to_string(),
+        "TZ".to_string(),
+        "LANG".to_string(),
+        "LC_ALL".to_string(),
+        "PYTEST_ADDOPTS".to_string(),
+    ];
+    if let Some(extra) = std::env::var_os("TCTX_ENV_KEYS") {
+        env_keys.extend(
+            extra
+                .to_string_lossy()
+                .split(',')
+                .map(str::trim)
+                .filter(|value| {
+                    !value.is_empty()
+                        && value
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                })
+                .map(ToOwned::to_owned),
+        );
+    }
+    env_keys.sort();
+    env_keys.dedup();
+    for key in env_keys {
+        evidence.extend_from_slice(key.as_bytes());
+        evidence.push(b'=');
+        if let Some(value) = std::env::var_os(&key) {
+            evidence.extend_from_slice(sha256_hex(value.to_string_lossy().as_bytes()).as_bytes());
+        }
+        evidence.push(b'\n');
+    }
+    sha256_hex(&evidence)
+}
+
+fn pytest_plugin_manifest(spec: &Spec) -> Vec<String> {
+    let python = crate::zygote::resolve_python_bin(&spec.effective_pytest_cmd());
+    let script = "import importlib.metadata as m\n\
+eps=m.entry_points()\n\
+items=eps.select(group='pytest11') if hasattr(eps,'select') else eps.get('pytest11',[])\n\
+print('\\n'.join(sorted({ep.value for ep in items})))";
+    let mut command = Command::new(python);
+    command.arg("-c").arg(script);
+    let Ok(output) = run_command_with_timeout(&mut command, Duration::from_secs(5), 256 * 1024)
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let mut plugins: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.contains(['\0', '\r', '\n', ' '])
+        })
+        .map(ToOwned::to_owned)
+        .collect();
+    plugins.sort();
+    plugins.dedup();
+    plugins
+}
+
 fn git_dirty_files(root: &Path) -> Result<Vec<String>> {
     let mut cmd = Command::new("git");
     cmd.args(["-c", "core.quotePath=false", "-C"])
@@ -1130,6 +1628,76 @@ fn build_pythonpath(root: &Path, existing: Option<std::ffi::OsString>) -> std::f
     std::env::join_paths(paths).unwrap_or_default()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_pytest_parallel(
+    spec: &Spec,
+    invocation_targets: &[String],
+    dep_hashes: &BTreeMap<String, String>,
+    k_expr: Option<&str>,
+    mark_expr: Option<&str>,
+    extra_args: &[String],
+    preload_modules: &[String],
+    environment_hash: &str,
+    pytest_plugins: &[String],
+    capture_dynamic_dependencies: bool,
+) -> Result<(Vec<CachedTestRecord>, String)> {
+    let parallelism = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, 4);
+    let mut all_records = Vec::new();
+    let mut outputs = Vec::new();
+    for wave in invocation_targets.chunks(parallelism) {
+        let results = std::thread::scope(|scope| {
+            let handles: Vec<_> = wave
+                .iter()
+                .map(|target| {
+                    scope.spawn(move || {
+                        let file = target.split("::").next().unwrap_or(target);
+                        let mut one_hash = BTreeMap::new();
+                        if let Some(hash) = dep_hashes.get(file) {
+                            one_hash.insert(file.to_string(), hash.clone());
+                        }
+                        let local_manager = Mutex::new(ZygoteManager::default());
+                        execute_pytest_batch(
+                            spec,
+                            std::slice::from_ref(target),
+                            &one_hash,
+                            k_expr,
+                            mark_expr,
+                            extra_args,
+                            "on_demand_parallel",
+                            Some(&local_manager),
+                            preload_modules,
+                            environment_hash,
+                            pytest_plugins,
+                            capture_dynamic_dependencies,
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| invalid("parallel pytest worker panicked").into())
+                        .and_then(|result| result)
+                })
+                .collect::<Vec<Result<(Vec<CachedTestRecord>, String)>>>()
+        });
+        for result in results {
+            let (mut records, output) = result?;
+            all_records.append(&mut records);
+            if !output.trim().is_empty() {
+                outputs.push(output);
+            }
+        }
+    }
+    Ok((all_records, outputs.join("\n")))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_pytest_batch(
     spec: &Spec,
     invocation_targets: &[String],
@@ -1138,9 +1706,13 @@ fn execute_pytest_batch(
     mark_expr: Option<&str>,
     extra_args: &[String],
     source_label: &str,
-    zygote_slot: Option<&Mutex<Option<PytestZygote>>>,
+    zygote_slot: Option<&Mutex<ZygoteManager>>,
     preload_modules: &[String],
+    environment_hash: &str,
+    pytest_plugins: &[String],
+    capture_dynamic_dependencies: bool,
 ) -> Result<(Vec<CachedTestRecord>, String)> {
+    let run_started_unix_ms = now_unix_ms();
     let pytest_cmd = spec.effective_pytest_cmd();
     let Some((program, base_args)) = pytest_cmd.split_first() else {
         return Err(invalid("empty pytest_cmd").into());
@@ -1156,9 +1728,6 @@ fn execute_pytest_batch(
         "--no-header".to_string(),
         "-p".to_string(),
         "no:cacheprovider".to_string(),
-        "-o".to_string(),
-        "junit_family=xunit1".to_string(),
-        format!("--junit-xml={}", junit_path.display()),
     ];
     if let Some(k) = k_expr
         && !k.trim().is_empty()
@@ -1181,26 +1750,24 @@ fn execute_pytest_batch(
 
     let timeout_secs = spec.policy.pytest_timeout_secs;
     let mut output_opt = None;
-
-    if let Some(slot) = zygote_slot
-        && let Ok(mut z_guard) = slot.lock()
-    {
-        let needs_respawn = z_guard
-            .as_ref()
-            .is_none_or(|z| !z.matches_config(spec, &pythonpath));
-        if needs_respawn {
-            *z_guard = PytestZygote::spawn(spec, pythonpath.clone(), preload_modules).ok();
-        }
-        if let Some(ref mut zygote) = *z_guard {
-            match zygote.run_pytest(&pytest_cli_args, timeout_secs) {
-                Ok(out) => output_opt = Some(out),
-                Err(_) => {
-                    *z_guard = None;
-                }
-            }
-        }
+    let mut zygote_args = pytest_cli_args.clone();
+    if !capture_dynamic_dependencies {
+        zygote_args.push("-o".to_string());
+        zygote_args.push("junit_family=xunit1".to_string());
+        zygote_args.push(format!("--junit-xml={}", junit_path.display()));
     }
 
+    if let Some(slot) = zygote_slot
+        && let Ok(mut manager) = slot.lock()
+        && manager
+            .ensure(spec, pythonpath.clone(), preload_modules, pytest_plugins)
+            .is_ok()
+        && let Ok(out) = manager.run(&zygote_args, timeout_secs, capture_dynamic_dependencies)
+    {
+        output_opt = Some(out);
+    }
+
+    let used_zygote = output_opt.is_some();
     let output = if let Some(out) = output_opt {
         out
     } else {
@@ -1208,6 +1775,9 @@ fn execute_pytest_batch(
         command.current_dir(&spec.root);
         command.env("PYTHONPATH", &pythonpath);
         command.args(base_args);
+        command.arg("-o");
+        command.arg("junit_family=xunit1");
+        command.arg(format!("--junit-xml={}", junit_path.display()));
         command.args(&pytest_cli_args);
         let timeout = Duration::from_secs(timeout_secs);
         run_command_with_timeout(&mut command, timeout, 2 * 1024 * 1024)?
@@ -1219,6 +1789,9 @@ fn execute_pytest_batch(
         ))
         .into());
     }
+    if output.cancelled {
+        return Err(invalid("TEST_CANCELLED: pytest child process group was terminated").into());
+    }
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     let stderr_str = String::from_utf8_lossy(&output.stderr);
@@ -1229,15 +1802,22 @@ fn execute_pytest_batch(
     };
     let snippet = truncate_str(&combined_out, 8192);
 
-    let xml_content = std::fs::read_to_string(&junit_path).unwrap_or_default();
-    let per_file = parse_junit_xml_per_file(&xml_content, dep_hashes);
+    let (per_file, dynamic_dependencies) = if let Some(structured) = output.structured.as_deref() {
+        parse_structured_reports(structured, dep_hashes)
+    } else {
+        let xml_content = std::fs::read_to_string(&junit_path).unwrap_or_default();
+        (
+            parse_junit_xml_per_file(&xml_content, dep_hashes),
+            Vec::new(),
+        )
+    };
 
     let now = now_unix_ms();
     let mut records = Vec::new();
     let overall_success = output.status.success();
     let xml_total_ms: u64 = per_file.values().map(|s| s.duration_ms).sum();
-    let overhead_per_file = output.duration_ms.saturating_sub(xml_total_ms)
-        / (dep_hashes.len().max(1) as u64);
+    let overhead_per_file =
+        output.duration_ms.saturating_sub(xml_total_ms) / (dep_hashes.len().max(1) as u64);
 
     for (test_file, dep_hash) in dep_hashes {
         if let Some(stats) = per_file.get(test_file) {
@@ -1271,6 +1851,24 @@ fn execute_pytest_batch(
                 },
                 updated_unix_ms: now,
                 source: source_label.to_string(),
+                environment_hash: environment_hash.to_string(),
+                tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+                runner_mode: if used_zygote {
+                    "zygote".to_string()
+                } else {
+                    "subprocess".to_string()
+                },
+                started_unix_ms: run_started_unix_ms,
+                completed_unix_ms: now,
+                dynamic_dependencies: if stats.dynamic_dependencies.is_empty()
+                    && dep_hashes.len() == 1
+                {
+                    dynamic_dependencies.clone()
+                } else {
+                    stats.dynamic_dependencies.iter().cloned().collect()
+                },
+                dynamic_dependencies_complete: capture_dynamic_dependencies,
+                node_results: stats.node_results.clone(),
             });
         } else {
             // Fallback when JUnit XML had no testcase entry for this file (e.g., collection error or single file)
@@ -1309,6 +1907,22 @@ fn execute_pytest_batch(
                 },
                 updated_unix_ms: now,
                 source: source_label.to_string(),
+                environment_hash: environment_hash.to_string(),
+                tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+                runner_mode: if used_zygote {
+                    "zygote".to_string()
+                } else {
+                    "subprocess".to_string()
+                },
+                started_unix_ms: run_started_unix_ms,
+                completed_unix_ms: now,
+                dynamic_dependencies: if dep_hashes.len() == 1 {
+                    dynamic_dependencies.clone()
+                } else {
+                    Vec::new()
+                },
+                dynamic_dependencies_complete: capture_dynamic_dependencies,
+                node_results: BTreeMap::new(),
             });
         }
     }
@@ -1335,6 +1949,102 @@ struct FileXmlStats {
     errors: usize,
     duration_ms: u64,
     failed_nodeids: Vec<String>,
+    node_results: BTreeMap<String, CachedNodeResult>,
+    dynamic_dependencies: BTreeSet<String>,
+}
+
+#[derive(Deserialize)]
+struct DirectReport {
+    nodeid: String,
+    path: String,
+    when: String,
+    outcome: String,
+    duration_ms: u64,
+    longrepr: String,
+    #[serde(default)]
+    dynamic_deps: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct DirectPayload {
+    reports: Vec<DirectReport>,
+    #[serde(default)]
+    dynamic_deps: Vec<String>,
+}
+
+fn parse_structured_reports(
+    bytes: &[u8],
+    known_files: &BTreeMap<String, String>,
+) -> (BTreeMap<String, FileXmlStats>, Vec<String>) {
+    let Ok(payload) = serde_json::from_slice::<DirectPayload>(bytes) else {
+        return (BTreeMap::new(), Vec::new());
+    };
+    let mut stats: BTreeMap<String, FileXmlStats> = BTreeMap::new();
+    for report in payload.reports {
+        let file_hint = report.nodeid.split("::").next().unwrap_or(&report.path);
+        let Some(test_file) = match_testcase_to_file(Some(file_hint), "", known_files) else {
+            continue;
+        };
+        let entry = stats.entry(test_file.clone()).or_default();
+        entry
+            .dynamic_dependencies
+            .extend(report.dynamic_deps.iter().cloned());
+        entry.duration_ms = entry.duration_ms.saturating_add(report.duration_ms);
+        match report.outcome.as_str() {
+            "passed" if report.when == "call" => {
+                entry.passed += 1;
+                entry.node_results.insert(
+                    report.nodeid.clone(),
+                    CachedNodeResult {
+                        nodeid: report.nodeid.clone(),
+                        outcome: TestOutcome::Passed,
+                        duration_ms: report.duration_ms,
+                        output_snippet: String::new(),
+                    },
+                );
+            }
+            "skipped" => {
+                entry.skipped += 1;
+                entry.node_results.insert(
+                    report.nodeid.clone(),
+                    CachedNodeResult {
+                        nodeid: report.nodeid.clone(),
+                        outcome: TestOutcome::Skipped,
+                        duration_ms: report.duration_ms,
+                        output_snippet: report.longrepr.clone(),
+                    },
+                );
+            }
+            "failed" if report.when == "call" => {
+                entry.failed += 1;
+                entry.failed_nodeids.push(report.nodeid.clone());
+                entry.node_results.insert(
+                    report.nodeid.clone(),
+                    CachedNodeResult {
+                        nodeid: report.nodeid.clone(),
+                        outcome: TestOutcome::Failed,
+                        duration_ms: report.duration_ms,
+                        output_snippet: report.longrepr.clone(),
+                    },
+                );
+            }
+            "failed" => {
+                entry.errors += 1;
+                entry.failed_nodeids.push(report.nodeid.clone());
+                entry.node_results.insert(
+                    report.nodeid.clone(),
+                    CachedNodeResult {
+                        nodeid: report.nodeid.clone(),
+                        outcome: TestOutcome::Error,
+                        duration_ms: report.duration_ms,
+                        output_snippet: report.longrepr.clone(),
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+    (stats, payload.dynamic_deps)
 }
 
 fn find_xml_tag_end(xml: &str, start_idx: usize) -> Option<usize> {
@@ -1411,7 +2121,16 @@ fn parse_junit_xml_per_file(
             } else {
                 format!("{matched_file}::{name_attr}")
             };
-            entry.failed_nodeids.push(nodeid);
+            entry.failed_nodeids.push(nodeid.clone());
+            entry.node_results.insert(
+                nodeid.clone(),
+                CachedNodeResult {
+                    nodeid,
+                    outcome: TestOutcome::Failed,
+                    duration_ms: case_ms,
+                    output_snippet: body.chars().take(8192).collect(),
+                },
+            );
         } else if body.contains("<error") {
             entry.errors += 1;
             let nodeid = if name_attr.is_empty() {
@@ -1419,11 +2138,48 @@ fn parse_junit_xml_per_file(
             } else {
                 format!("{matched_file}::{name_attr}")
             };
-            entry.failed_nodeids.push(nodeid);
+            entry.failed_nodeids.push(nodeid.clone());
+            entry.node_results.insert(
+                nodeid.clone(),
+                CachedNodeResult {
+                    nodeid,
+                    outcome: TestOutcome::Error,
+                    duration_ms: case_ms,
+                    output_snippet: body.chars().take(8192).collect(),
+                },
+            );
         } else if body.contains("<skipped") {
             entry.skipped += 1;
+            let nodeid = if name_attr.is_empty() {
+                matched_file
+            } else {
+                format!("{matched_file}::{name_attr}")
+            };
+            entry.node_results.insert(
+                nodeid.clone(),
+                CachedNodeResult {
+                    nodeid,
+                    outcome: TestOutcome::Skipped,
+                    duration_ms: case_ms,
+                    output_snippet: String::new(),
+                },
+            );
         } else {
             entry.passed += 1;
+            let nodeid = if name_attr.is_empty() {
+                matched_file
+            } else {
+                format!("{matched_file}::{name_attr}")
+            };
+            entry.node_results.insert(
+                nodeid.clone(),
+                CachedNodeResult {
+                    nodeid,
+                    outcome: TestOutcome::Passed,
+                    duration_ms: case_ms,
+                    output_snippet: String::new(),
+                },
+            );
         }
     }
 
@@ -1499,9 +2255,14 @@ mod tests {
   </testsuite>
 </testsuites>"#;
         let parsed = parse_junit_xml_per_file(xml, &known);
-        let st = parsed.get("tests/test_cmp.py").expect("stats for test_cmp.py");
+        let st = parsed
+            .get("tests/test_cmp.py")
+            .expect("stats for test_cmp.py");
         assert_eq!(st.passed, 1);
         assert_eq!(st.failed, 1);
-        assert_eq!(st.failed_nodeids, vec!["tests/test_cmp.py::test_fail[x > y]"]);
+        assert_eq!(
+            st.failed_nodeids,
+            vec!["tests/test_cmp.py::test_fail[x > y]"]
+        );
     }
 }

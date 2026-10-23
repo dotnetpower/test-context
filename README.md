@@ -30,12 +30,12 @@ Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store
 
 | Task | TCTX off (`pytest`) | TCTX on | Speedup [95% CI] |
 |---|---:|---:|---:|
-| Warm suite (`warm_suite`) | 1035.19 ms | **0.53 ms** (median 0.50 ms) | **1958.57×** [1877.34, 2036.13] |
-| Post-edit background pre-run (`bg_speculative`) | 1043.13 ms | **0.54 ms** (median 0.51 ms) | **1923.44×** [1824.29, 2014.54] |
-| Reverted edit Merkle hit (`merkle_revert`) | 1075.63 ms | **0.57 ms** (median 0.51 ms) | **1876.19×** [1604.49, 2112.41] |
-| Immediate 0ms-delay leaf edit (`leaf_delta`) | 1079.16 ms | **86.04 ms** (median 81.36 ms) | **12.54×** [12.25, 12.81] |
-| Impact query (`affected_graph`) | 989.91 ms | **0.50 ms** (median 0.47 ms) | **1968.25×** [1881.70, 2039.39] |
-| Fixed mixed suite (`all`, 320 pairs) | 1044.60 ms | **17.64 ms** (median 0.54 ms) | **59.23×** [57.96, 60.47] |
+| Warm suite (`warm_suite`) | 991.64 ms | **0.49 ms** (median 0.47 ms) | **2027.40×** [1890.99, 2188.77] |
+| Post-edit background pre-run (`bg_speculative`) | 988.90 ms | **0.47 ms** (median 0.46 ms) | **2104.72×** [2034.71, 2178.60] |
+| Reverted edit Merkle hit (`merkle_revert`) | 988.69 ms | **0.46 ms** (median 0.45 ms) | **2152.02×** [2052.92, 2249.68] |
+| Immediate 0ms-delay leaf edit (`leaf_delta`) | 991.53 ms | **134.31 ms** (median 120.97 ms) | **7.38×** [6.30, 8.49] |
+| Impact query (`affected_graph`) | 952.14 ms | **0.49 ms** (median 0.47 ms) | **1962.92×** [1882.12, 2049.91] |
+| Fixed mixed suite (`all`, 320 pairs) | 982.58 ms | **27.24 ms** (median 0.48 ms) | **36.07×** [30.66, 41.50] |
 
 See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology, cold-start measurements, raw samples, and reproduction instructions.
 

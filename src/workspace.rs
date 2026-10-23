@@ -279,6 +279,50 @@ impl Workspace {
         }
         Ok(buf)
     }
+
+    pub fn pytest_file_patterns(&self) -> Vec<String> {
+        let mut patterns = Vec::new();
+        for name in ["pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"] {
+            let path = self.root.join(name);
+            let Ok(text) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            let mut in_pytest_section = name == "pyproject.toml";
+            for raw in text.lines() {
+                let line = raw.trim();
+                if line.starts_with('[') && line.ends_with(']') {
+                    in_pytest_section = matches!(
+                        line,
+                        "[tool.pytest.ini_options]" | "[pytest]" | "[tool:pytest]"
+                    );
+                    continue;
+                }
+                if !in_pytest_section || !line.starts_with("python_files") {
+                    continue;
+                }
+                let Some((_, value)) = line.split_once('=') else {
+                    continue;
+                };
+                for token in value
+                    .trim()
+                    .trim_matches(['[', ']'])
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                {
+                    let pattern = token.trim().trim_matches(['\'', '"']);
+                    if !pattern.is_empty() && pattern.len() <= 128 && !pattern.contains(['/', '\\'])
+                    {
+                        patterns.push(pattern.to_string());
+                    }
+                }
+            }
+        }
+        if patterns.is_empty() {
+            patterns.extend(["test_*.py".to_string(), "*_test.py".to_string()]);
+        }
+        patterns.sort();
+        patterns.dedup();
+        patterns
+    }
 }
 
 pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
@@ -301,6 +345,8 @@ pub struct BoundedOutput {
     pub stderr: Vec<u8>,
     pub duration_ms: u64,
     pub timed_out: bool,
+    pub structured: Option<Vec<u8>>,
+    pub cancelled: bool,
 }
 
 pub fn run_command_with_timeout(
@@ -362,5 +408,7 @@ pub fn run_command_with_timeout(
         stderr,
         duration_ms,
         timed_out,
+        structured: None,
+        cancelled: false,
     })
 }

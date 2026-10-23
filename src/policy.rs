@@ -14,6 +14,9 @@ pub struct MemoryPolicy {
     pub pytest_timeout_secs: u64,
     pub background_batch_size: usize,
     pub background_enabled: bool,
+    pub background_safe_only: bool,
+    pub background_max_load_ratio_percent: usize,
+    pub parallel_delta_enabled: bool,
 }
 
 impl Default for MemoryPolicy {
@@ -28,6 +31,9 @@ impl Default for MemoryPolicy {
             pytest_timeout_secs: 180,
             background_batch_size: 4,
             background_enabled: true,
+            background_safe_only: true,
+            background_max_load_ratio_percent: 75,
+            parallel_delta_enabled: false,
         }
     }
 }
@@ -42,11 +48,15 @@ impl MemoryPolicy {
             || self.max_cached_results == 0
             || self.pytest_timeout_secs == 0
             || self.background_batch_size == 0
+            || self.background_max_load_ratio_percent == 0
         {
             return Err("all memory and runner policy limits must be positive");
         }
         if self.max_file_bytes > self.max_source_bytes {
             return Err("max_file_bytes cannot exceed max_source_bytes");
+        }
+        if self.background_max_load_ratio_percent > 200 {
+            return Err("background_max_load_ratio_percent cannot exceed 200");
         }
         Ok(())
     }

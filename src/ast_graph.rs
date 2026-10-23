@@ -13,6 +13,8 @@ pub struct FileStamp {
     pub mtime_nsec: i64,
     pub size: u64,
     pub ino: u64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: i64,
 }
 
 pub fn file_stamp(full_path: &Path) -> Option<FileStamp> {
@@ -20,11 +22,14 @@ pub fn file_stamp(full_path: &Path) -> Option<FileStamp> {
     if meta.file_type().is_symlink() || !meta.is_file() {
         return None;
     }
+
     Some(FileStamp {
         mtime_sec: meta.mtime(),
         mtime_nsec: meta.mtime_nsec(),
         size: meta.len(),
         ino: meta.ino(),
+        ctime_sec: meta.ctime(),
+        ctime_nsec: meta.ctime_nsec(),
     })
 }
 
@@ -43,6 +48,8 @@ pub struct ParsedPythonFile {
     pub fixtures_used: Vec<String>,
     pub defined_symbols: Vec<String>,
     pub data_refs: Vec<String>,
+    pub markers: Vec<String>,
+    pub module_markers: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +97,9 @@ pub struct DependencyGraph {
     pub transitive_dep_ids_for_test: BTreeMap<String, Vec<u32>>,
     pub dep_hash_for_test: BTreeMap<String, String>,
     pub config_hashes: BTreeMap<String, String>,
+    pub test_file_patterns: Vec<String>,
+    pub environment_hash: String,
+    pub runtime_deps_for_test: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Default for DependencyGraph {
@@ -109,12 +119,70 @@ impl DependencyGraph {
             transitive_dep_ids_for_test: BTreeMap::new(),
             dep_hash_for_test: BTreeMap::new(),
             config_hashes: BTreeMap::new(),
+            test_file_patterns: vec!["test_*.py".to_string(), "*_test.py".to_string()],
+            environment_hash: String::new(),
+            runtime_deps_for_test: BTreeMap::new(),
         }
+    }
+
+    pub fn apply_environment_hash(&mut self, environment_hash: String) {
+        if self.environment_hash == environment_hash {
+            return;
+        }
+        self.environment_hash = environment_hash;
+        let all_files: Vec<String> = self.files.keys().cloned().collect();
+        self.recompute_hashes_for_changed(&all_files);
+    }
+
+    pub fn apply_runtime_dependencies(
+        &mut self,
+        workspace: &Workspace,
+        policy: &MemoryPolicy,
+        test_file: &str,
+        dependencies: &[String],
+    ) -> bool {
+        let mut normalized = self
+            .runtime_deps_for_test
+            .get(test_file)
+            .cloned()
+            .unwrap_or_default();
+        for dependency in dependencies {
+            let rel = Path::new(dependency);
+            if rel.is_absolute()
+                || rel
+                    .components()
+                    .any(|component| matches!(component, std::path::Component::ParentDir))
+            {
+                continue;
+            }
+            let rel_string = normalize_rel_str(rel);
+            if rel_string == test_file {
+                continue;
+            }
+            if !self.files.contains_key(&rel_string) {
+                let full = workspace.root.join(rel);
+                let Some(stamp) = file_stamp(&full) else {
+                    continue;
+                };
+                let Ok(bytes) = workspace.read_known_with_limit(rel, policy.max_file_bytes) else {
+                    continue;
+                };
+                self.insert_file_bytes_with_stamp(&rel_string, &bytes, Some(stamp));
+            }
+            normalized.insert(rel_string);
+        }
+        let changed = self.runtime_deps_for_test.get(test_file) != Some(&normalized);
+        if changed {
+            self.runtime_deps_for_test
+                .insert(test_file.to_string(), normalized);
+        }
+        changed
     }
 
     pub fn build(workspace: &Workspace, policy: &MemoryPolicy) -> Result<Self> {
         let inventory = workspace.files_limited(policy)?;
         let mut graph = Self::new();
+        graph.test_file_patterns = workspace.pytest_file_patterns();
         let mut total_bytes = 0usize;
         for rel_path in &inventory.files {
             let full_path = workspace.root.join(rel_path);
@@ -234,7 +302,7 @@ impl DependencyGraph {
         let source = String::from_utf8_lossy(bytes);
         let parsed = parse_python_source(&source);
         let is_conftest = file_name == "conftest.py";
-        let is_test = !is_conftest && is_test_filename(file_name);
+        let is_test = !is_conftest && matches_test_filename(file_name, &self.test_file_patterns);
         let structure_changed = match self.files.get(rel_str) {
             Some(existing) => {
                 existing.is_test != is_test
@@ -266,6 +334,9 @@ impl DependencyGraph {
         }
         let mut cfg_prefix = Vec::new();
         cfg_prefix.extend_from_slice(b"tctx:merkle:v1\n");
+        cfg_prefix.extend_from_slice(b"env:");
+        cfg_prefix.extend_from_slice(self.environment_hash.as_bytes());
+        cfg_prefix.extend_from_slice(b"\n");
         for (cfg_path, cfg_sha) in &self.config_hashes {
             cfg_prefix.extend_from_slice(b"cfg:");
             cfg_prefix.extend_from_slice(cfg_path.as_bytes());
@@ -371,6 +442,14 @@ impl DependencyGraph {
                     }
                 }
             }
+            if let Some(runtime_deps) = self.runtime_deps_for_test.get(path) {
+                deps.extend(
+                    runtime_deps
+                        .iter()
+                        .filter(|dependency| self.files.contains_key(*dependency))
+                        .cloned(),
+                );
+            }
             for dep in &deps {
                 self.reverse_imports
                     .entry(dep.clone())
@@ -408,6 +487,9 @@ impl DependencyGraph {
 
         let mut cfg_prefix = Vec::new();
         cfg_prefix.extend_from_slice(b"tctx:merkle:v1\n");
+        cfg_prefix.extend_from_slice(b"env:");
+        cfg_prefix.extend_from_slice(self.environment_hash.as_bytes());
+        cfg_prefix.extend_from_slice(b"\n");
         for (cfg_path, cfg_sha) in &self.config_hashes {
             cfg_prefix.extend_from_slice(b"cfg:");
             cfg_prefix.extend_from_slice(cfg_path.as_bytes());
@@ -478,6 +560,154 @@ impl DependencyGraph {
         }
     }
 
+    pub fn recompute_structure_incremental(&mut self, changed_files: &[String]) {
+        if self.file_index_to_path.len() != self.files.len()
+            || changed_files.iter().any(|path| {
+                path.ends_with("/__init__.py")
+                    || path == "__init__.py"
+                    || path.ends_with("conftest.py")
+                    || self.files.get(path).is_some_and(|node| node.is_config)
+            })
+        {
+            self.recompute_edges();
+            return;
+        }
+        let mut affected: BTreeSet<String> = self
+            .affected_tests(changed_files)
+            .into_iter()
+            .map(|item| item.test_file)
+            .collect();
+        let module_index = ModuleIndex::build(&self.files);
+        let fixture_providers = build_fixture_provider_index(&self.files);
+        let mut replacements = BTreeMap::new();
+        for path in changed_files {
+            let Some(node) = self.files.get(path) else {
+                self.recompute_edges();
+                return;
+            };
+            replacements.insert(
+                path.clone(),
+                compute_direct_dependencies(
+                    path,
+                    node,
+                    &self.files,
+                    &module_index,
+                    &fixture_providers,
+                    &self.runtime_deps_for_test,
+                ),
+            );
+        }
+        for (path, new_deps) in replacements {
+            if let Some(old_deps) = self.direct_imports.insert(path.clone(), new_deps.clone()) {
+                for dep in old_deps {
+                    if let Some(importers) = self.reverse_imports.get_mut(&dep) {
+                        importers.remove(&path);
+                    }
+                }
+            }
+            for dep in new_deps {
+                self.reverse_imports
+                    .entry(dep)
+                    .or_default()
+                    .insert(path.clone());
+            }
+        }
+        self.reverse_imports
+            .retain(|_, importers| !importers.is_empty());
+        affected.extend(
+            self.affected_tests(changed_files)
+                .into_iter()
+                .map(|item| item.test_file),
+        );
+        self.recompute_selected_tests(&affected);
+    }
+
+    fn recompute_selected_tests(&mut self, tests: &BTreeSet<String>) {
+        if tests.is_empty() {
+            return;
+        }
+        let path_to_id: BTreeMap<String, u32> = self
+            .file_index_to_path
+            .iter()
+            .enumerate()
+            .map(|(idx, path)| (path.clone(), u32::try_from(idx).unwrap_or(u32::MAX)))
+            .collect();
+        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); self.file_index_to_path.len()];
+        for (source, deps) in &self.direct_imports {
+            if let Some(&source_id) = path_to_id.get(source) {
+                adj[source_id as usize] = deps
+                    .iter()
+                    .filter_map(|dep| path_to_id.get(dep).copied())
+                    .collect();
+            }
+        }
+        let conftests: BTreeSet<String> = self
+            .files
+            .values()
+            .filter(|node| node.is_conftest)
+            .map(|node| node.path.clone())
+            .collect();
+        let mut cfg_prefix = Vec::new();
+        cfg_prefix.extend_from_slice(b"tctx:merkle:v1\n");
+        cfg_prefix.extend_from_slice(b"env:");
+        cfg_prefix.extend_from_slice(self.environment_hash.as_bytes());
+        cfg_prefix.extend_from_slice(b"\n");
+        for (path, sha) in &self.config_hashes {
+            cfg_prefix.extend_from_slice(b"cfg:");
+            cfg_prefix.extend_from_slice(path.as_bytes());
+            cfg_prefix.extend_from_slice(b":");
+            cfg_prefix.extend_from_slice(sha.as_bytes());
+            cfg_prefix.extend_from_slice(b"\n");
+        }
+        for test_path in tests {
+            let Some(&test_id) = path_to_id.get(test_path) else {
+                continue;
+            };
+            let conftest_chain = ancestor_conftests_for(test_path, &conftests);
+            let mut seen = vec![false; self.file_index_to_path.len()];
+            let mut reachable = vec![test_id];
+            let mut queue = VecDeque::from([test_id]);
+            seen[test_id as usize] = true;
+            for conftest in &conftest_chain {
+                if let Some(&id) = path_to_id.get(conftest)
+                    && !seen[id as usize]
+                {
+                    seen[id as usize] = true;
+                    reachable.push(id);
+                    queue.push_back(id);
+                }
+            }
+            while let Some(id) = queue.pop_front() {
+                for &next in &adj[id as usize] {
+                    if !seen[next as usize] {
+                        seen[next as usize] = true;
+                        reachable.push(next);
+                        queue.push_back(next);
+                    }
+                }
+            }
+            reachable.sort_unstable();
+            let mut hasher = Sha256::new();
+            hasher.update(&cfg_prefix);
+            for &id in &reachable {
+                let path = &self.file_index_to_path[id as usize];
+                if let Some(node) = self.files.get(path) {
+                    hasher.update(b"py:");
+                    hasher.update(path.as_bytes());
+                    hasher.update(b":");
+                    hasher.update(node.sha256.as_bytes());
+                    hasher.update(b"\n");
+                }
+            }
+            self.conftest_for_test
+                .insert(test_path.clone(), conftest_chain);
+            self.transitive_dep_ids_for_test
+                .insert(test_path.clone(), reachable);
+            self.dep_hash_for_test
+                .insert(test_path.clone(), hex_encode(&hasher.finalize()));
+        }
+    }
+
     pub fn test_files(&self) -> Vec<String> {
         self.dep_hash_for_test.keys().cloned().collect()
     }
@@ -521,8 +751,10 @@ impl DependencyGraph {
                     continue;
                 }
                 externals.insert(top.to_string());
-                if matches!(top, "fastapi" | "azure" | "openai" | "pydantic" | "httpx" | "starlette")
-                    && spec.module.split('.').count() <= 2
+                if matches!(
+                    top,
+                    "fastapi" | "azure" | "openai" | "pydantic" | "httpx" | "starlette"
+                ) && spec.module.split('.').count() <= 2
                 {
                     externals.insert(spec.module.clone());
                 }
@@ -753,9 +985,67 @@ impl DependencyGraph {
     }
 }
 
+fn compute_direct_dependencies(
+    path: &str,
+    node: &FileNode,
+    files: &BTreeMap<String, FileNode>,
+    module_index: &ModuleIndex,
+    fixture_providers: &BTreeMap<String, Vec<String>>,
+    runtime_deps_for_test: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<String> {
+    let mut deps = BTreeSet::new();
+    for spec in &node.parsed.imports {
+        for resolved in module_index.resolve_import(path, spec, files) {
+            if resolved != path {
+                deps.insert(resolved);
+            }
+        }
+    }
+    for fixture_name in &node.parsed.fixtures_used {
+        if let Some(providers) = fixture_providers.get(fixture_name) {
+            for provider in providers {
+                if provider != path && is_provider_applicable(provider, path) {
+                    deps.insert(provider.clone());
+                }
+            }
+        }
+    }
+    let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+    for data_ref in &node.parsed.data_refs {
+        if files.contains_key(data_ref) && data_ref != path {
+            deps.insert(data_ref.clone());
+        }
+        if !parent.as_os_str().is_empty() {
+            let relative = normalize_rel_str(&parent.join(data_ref));
+            if files.contains_key(&relative) && relative != path {
+                deps.insert(relative);
+            }
+        }
+    }
+    if let Some(runtime_deps) = runtime_deps_for_test.get(path) {
+        deps.extend(
+            runtime_deps
+                .iter()
+                .filter(|dependency| files.contains_key(*dependency))
+                .cloned(),
+        );
+    }
+    deps
+}
+
 pub fn is_test_filename(file_name: &str) -> bool {
     (file_name.starts_with("test_") && file_name.ends_with(".py"))
         || (file_name.ends_with("_test.py") && file_name.len() > "_test.py".len())
+}
+
+fn matches_test_filename(file_name: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()
+            .ok()
+            .is_some_and(|glob| glob.compile_matcher().is_match(file_name))
+    })
 }
 
 pub fn normalize_rel_str(path: &Path) -> String {
@@ -786,7 +1076,9 @@ fn ancestor_conftests_for(test_path: &str, conftests: &BTreeSet<String>) -> Vec<
         result.push("conftest.py".to_string());
     }
     let mut prefix = String::new();
-    let parent = Path::new(test_path).parent().unwrap_or_else(|| Path::new(""));
+    let parent = Path::new(test_path)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
     for comp in parent.components() {
         if let std::path::Component::Normal(os) = comp
             && let Some(seg) = os.to_str()
@@ -869,7 +1161,8 @@ impl ModuleIndex {
                         let mut actual_targets = BTreeSet::new();
                         for t in &targets {
                             if (t == "__init__.py" || t.ends_with("/__init__.py"))
-                                && let Some(forwarded) = index.reexports.get(&(t.clone(), sym.clone()))
+                                && let Some(forwarded) =
+                                    index.reexports.get(&(t.clone(), sym.clone()))
                             {
                                 actual_targets.extend(forwarded.iter().cloned());
                             } else {
@@ -991,8 +1284,7 @@ impl ModuleIndex {
                             resolved.extend(filter_by_package_locality(importer_path, matches));
                         }
                         if let Some(parent) = Path::new(importer_path).parent() {
-                            let rel_target =
-                                parent.join(spec.module.replace('.', "/")).join(sym);
+                            let rel_target = parent.join(spec.module.replace('.', "/")).join(sym);
                             add_path_candidates(&rel_target, files, &mut resolved);
                         }
                     }
@@ -1116,7 +1408,10 @@ fn candidate_module_names(rel_py_path: &str) -> Vec<String> {
         }
     }
     if parts.len() >= 2
-        && matches!(parts[0], "src" | "services" | "apps" | "packages" | "extensions")
+        && matches!(
+            parts[0],
+            "src" | "services" | "apps" | "packages" | "extensions"
+        )
         && parts.get(2) != Some(&"src")
     {
         let tail = &parts[2..];
@@ -1340,6 +1635,8 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
     let mut fixtures_used = BTreeSet::new();
     let mut defined_symbols = BTreeSet::new();
     let mut data_refs = BTreeSet::new();
+    let mut markers = BTreeSet::new();
+    let mut module_markers = BTreeSet::new();
 
     for tok in &tokens {
         if let PyToken::StringLit(lit) = tok
@@ -1379,6 +1676,12 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                 }
                 let is_fixture_deco = deco_parts.last().copied() == Some("fixture");
                 let is_usefixtures_deco = deco_parts.last().copied() == Some("usefixtures");
+                if deco_parts.len() >= 3
+                    && deco_parts[deco_parts.len() - 2] == "mark"
+                    && let Some(marker) = deco_parts.last()
+                {
+                    markers.insert((*marker).to_string());
+                }
                 if is_fixture_deco {
                     pending_fixture_decorator = true;
                 }
@@ -1468,8 +1771,7 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                             test_symbols.insert(sym_name.clone());
                         }
                         if pending_fixture_decorator {
-                            let fx_name =
-                                pending_fixture_custom_name.take().unwrap_or(sym_name);
+                            let fx_name = pending_fixture_custom_name.take().unwrap_or(sym_name);
                             fixtures_defined.insert(fx_name);
                         }
                         if (is_test_fn || pending_fixture_decorator)
@@ -1511,6 +1813,27 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                             _ => i += 1,
                         }
                     }
+                }
+                at_statement_start = false;
+            }
+            PyToken::Ident(ident) if at_statement_start && ident == "pytestmark" => {
+                i += 1;
+                let mut module_usefixtures = false;
+                while i < n && !matches!(tokens[i], PyToken::Newline) {
+                    if matches!(tokens.get(i), Some(PyToken::Ident(name)) if name == "mark")
+                        && matches!(tokens.get(i + 1), Some(PyToken::Dot))
+                        && let Some(PyToken::Ident(marker)) = tokens.get(i + 2)
+                    {
+                        module_markers.insert(marker.clone());
+                        module_usefixtures |= marker == "usefixtures";
+                    }
+                    if module_usefixtures
+                        && let Some(PyToken::StringLit(fixture)) = tokens.get(i)
+                        && !fixture.is_empty()
+                    {
+                        fixtures_used.insert(fixture.clone());
+                    }
+                    i += 1;
                 }
                 at_statement_start = false;
             }
@@ -1583,6 +1906,8 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
         fixtures_used: fixtures_used.into_iter().collect(),
         defined_symbols: defined_symbols.into_iter().collect(),
         data_refs: data_refs.into_iter().collect(),
+        markers: markers.into_iter().collect(),
+        module_markers: module_markers.into_iter().collect(),
     }
 }
 
@@ -1816,7 +2141,11 @@ async def test_create_user(sample_db, monkeypatch: object = None):
     assert sample_db is not None
 "#;
         let parsed = parse_python_source(src);
-        assert!(parsed.test_symbols.contains(&"test_create_user".to_string()));
+        assert!(
+            parsed
+                .test_symbols
+                .contains(&"test_create_user".to_string())
+        );
         assert!(!parsed.test_symbols.contains(&"test_fake".to_string()));
         assert_eq!(parsed.fixtures_defined, vec!["sample_db".to_string()]);
         assert!(parsed.fixtures_used.contains(&"sample_db".to_string()));
@@ -1869,19 +2198,14 @@ def test_with_varargs(first_fx, *args, kw_fx: int = 1, **kwargs):
         assert!(!parsed.fixtures_used.contains(&"args".to_string()));
         assert!(!parsed.fixtures_used.contains(&"kwargs".to_string()));
         assert!(parsed.data_refs.contains(&"config/schema.json".to_string()));
+        assert!(parsed.module_markers.contains(&"usefixtures".to_string()));
     }
 
     #[test]
     fn isolates_monorepo_service_compartments_and_supports_hash_only_updates() {
         let mut graph = DependencyGraph::new();
-        graph.insert_file_bytes(
-            "services/svc_a/src/app/config.py",
-            b"VALUE = 1\n",
-        );
-        graph.insert_file_bytes(
-            "services/svc_b/src/app/config.py",
-            b"VALUE = 2\n",
-        );
+        graph.insert_file_bytes("services/svc_a/src/app/config.py", b"VALUE = 1\n");
+        graph.insert_file_bytes("services/svc_b/src/app/config.py", b"VALUE = 2\n");
         graph.insert_file_bytes(
             "services/svc_a/tests/test_a.py",
             b"from app.config import VALUE\ndef test_a(): assert VALUE == 1\n",
@@ -1901,10 +2225,8 @@ def test_with_varargs(first_fx, *args, kw_fx: int = 1, **kwargs):
         let hash_b_before = graph.dep_hash_for_test["services/svc_b/tests/test_b.py"].clone();
 
         // Body-only change returns structure_changed == false and updates only affected dep_hash
-        let structure_changed = graph.insert_file_bytes(
-            "services/svc_a/src/app/config.py",
-            b"VALUE = 100\n",
-        );
+        let structure_changed =
+            graph.insert_file_bytes("services/svc_a/src/app/config.py", b"VALUE = 100\n");
         assert!(!structure_changed);
         graph.recompute_hashes_for_changed(&["services/svc_a/src/app/config.py".to_string()]);
 
@@ -1921,10 +2243,7 @@ def test_with_varargs(first_fx, *args, kw_fx: int = 1, **kwargs):
     #[test]
     fn resolves_aks_store_demo_polyglot_hyphenated_subservice_imports() {
         let mut graph = DependencyGraph::new();
-        graph.insert_file_bytes(
-            "src/ai-service/routers/__init__.py",
-            b"",
-        );
+        graph.insert_file_bytes("src/ai-service/routers/__init__.py", b"");
         graph.insert_file_bytes(
             "src/ai-service/routers/description_generator.py",
             b"def generate_description(): return 'desc'\n",
@@ -1951,9 +2270,8 @@ def test_with_varargs(first_fx, *args, kw_fx: int = 1, **kwargs):
         );
         graph.recompute_edges();
 
-        let affected = graph.affected_tests(&[
-            "src/ai-service/routers/description_generator.py".to_string(),
-        ]);
+        let affected =
+            graph.affected_tests(&["src/ai-service/routers/description_generator.py".to_string()]);
         let test_files: Vec<String> = affected.into_iter().map(|a| a.test_file).collect();
         assert_eq!(
             test_files,
@@ -1962,9 +2280,32 @@ def test_with_varargs(first_fx, *args, kw_fx: int = 1, **kwargs):
                 "src/ai-service/tests/test_main.py".to_string(),
             ]
         );
-        let modules = graph.affected_modules(&[
-            "src/ai-service/routers/description_generator.py".to_string(),
-        ]);
+        let modules = graph
+            .affected_modules(&["src/ai-service/routers/description_generator.py".to_string()]);
         assert!(modules.contains(&"src/ai-service/main.py".to_string()));
+    }
+
+    #[test]
+    fn honors_custom_pytest_python_files_patterns() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("pytest.ini"),
+            "[pytest]\npython_files = check_*.py\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("check_feature.py"),
+            "def test_custom():\n    assert True\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("test_default.py"),
+            "def test_default():\n    assert True\n",
+        )
+        .unwrap();
+        let workspace = Workspace::new(temp.path(), Vec::new(), Vec::new()).unwrap();
+        let graph = DependencyGraph::build(&workspace, &MemoryPolicy::default()).unwrap();
+        assert!(graph.dep_hash_for_test.contains_key("check_feature.py"));
+        assert!(!graph.dep_hash_for_test.contains_key("test_default.py"));
     }
 }

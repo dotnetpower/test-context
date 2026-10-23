@@ -37,7 +37,11 @@ struct RuntimeIdentity {
 
 impl RuntimeIdentity {
     fn capture(dir: &Path, sock: &Path, lock: &std::fs::File) -> Result<Self> {
-        let paths = [dir.to_path_buf(), sock.to_path_buf(), dir.join("daemon.lock")];
+        let paths = [
+            dir.to_path_buf(),
+            sock.to_path_buf(),
+            dir.join("daemon.lock"),
+        ];
         let dir_meta = std::fs::symlink_metadata(&paths[0])?;
         let sock_meta = std::fs::symlink_metadata(&paths[1])?;
         let lock_meta = lock.metadata()?;
@@ -193,7 +197,10 @@ impl DaemonHub {
             spec.policy.background_enabled = false;
         }
         {
-            let guard = self.roots.lock().map_err(|_| invalid("hub mutex poisoned"))?;
+            let guard = self
+                .roots
+                .lock()
+                .map_err(|_| invalid("hub mutex poisoned"))?;
             if let Some(existing) = guard.get(&spec.root) {
                 return Ok(Arc::clone(existing));
             }
@@ -204,7 +211,10 @@ impl DaemonHub {
             .lock()
             .map_err(|_| invalid("load gate poisoned"))?;
         {
-            let guard = self.roots.lock().map_err(|_| invalid("hub mutex poisoned"))?;
+            let guard = self
+                .roots
+                .lock()
+                .map_err(|_| invalid("hub mutex poisoned"))?;
             if let Some(existing) = guard.get(&spec.root) {
                 return Ok(Arc::clone(existing));
             }
@@ -213,7 +223,10 @@ impl DaemonHub {
             self.evict_idle_or_excess_roots();
         }
         let loaded = ManagedRoot::load(spec.clone())?;
-        let mut guard = self.roots.lock().map_err(|_| invalid("hub mutex poisoned"))?;
+        let mut guard = self
+            .roots
+            .lock()
+            .map_err(|_| invalid("hub mutex poisoned"))?;
         if let Some(old) = guard.insert(spec.root, Arc::clone(&loaded)) {
             old.shutdown();
         }
@@ -230,7 +243,10 @@ impl DaemonHub {
             spec.policy.background_enabled = false;
         }
         let loaded = ManagedRoot::load(spec.clone())?;
-        let mut guard = self.roots.lock().map_err(|_| invalid("hub mutex poisoned"))?;
+        let mut guard = self
+            .roots
+            .lock()
+            .map_err(|_| invalid("hub mutex poisoned"))?;
         if let Some(old) = guard.insert(spec.root, Arc::clone(&loaded)) {
             old.shutdown();
         }
@@ -361,6 +377,14 @@ impl DaemonHub {
                     .unwrap_or_default();
                 let managed = self.get_or_load_root(root_path)?;
                 managed.invalidate(&files)
+            }
+            "test_cancel" => {
+                let root_path = req
+                    .root
+                    .as_deref()
+                    .ok_or_else(|| invalid("test_cancel requires a workspace root"))?;
+                let managed = self.get_or_load_root(root_path)?;
+                Ok(json!({"cancelled": managed.cancel_active()}))
             }
             "test_graph" => {
                 let root_path = req
@@ -580,7 +604,9 @@ fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
     } else {
         // One-shot JSON line protocol
         let mut line = Vec::new();
-        reader.take(MAX_WIRE as u64 + 1).read_until(b'\n', &mut line)?;
+        reader
+            .take(MAX_WIRE as u64 + 1)
+            .read_until(b'\n', &mut line)?;
         if line.len() > MAX_WIRE {
             return Err(invalid("request too large").into());
         }

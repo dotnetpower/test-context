@@ -41,11 +41,7 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         "src/pkg/service.py",
         "from pkg.math_ops import add\n\ndef compute_double(x: int) -> int:\n    return add(x, x)\n",
     );
-    write_file(
-        &repo,
-        "config/settings.json",
-        "{\"greeting\": \"hello\"}\n",
-    );
+    write_file(&repo, "config/settings.json", "{\"greeting\": \"hello\"}\n");
     write_file(
         &repo,
         "src/pkg/isolated.py",
@@ -59,7 +55,7 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     write_file(
         &repo,
         "tests/test_math.py",
-        "from pkg.math_ops import add\n\ndef test_add():\n    assert add(2, 3) == 5\n",
+        "import pytest\nfrom pkg.math_ops import add\n\npytestmark = pytest.mark.node_cache_safe\n\ndef test_add():\n    assert add(2, 3) == 5\n",
     );
     write_file(
         &repo,
@@ -81,6 +77,8 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         pytest_cmd: Vec::new(),
         policy: MemoryPolicy {
             background_enabled: true,
+            background_safe_only: false,
+            background_max_load_ratio_percent: 200,
             background_batch_size: 8,
             ..MemoryPolicy::default()
         },
@@ -161,6 +159,18 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     assert_eq!(run3.cached_files_count, 3);
     assert_eq!(run3.executed_files_count, 0);
 
+    // 5b. Safe node-level cache reuses the exact node result without returning whole-file counts.
+    let node_run = managed
+        .run_tests(&TestRunRequest {
+            targets: vec!["tests/test_math.py::test_add".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap();
+    assert_eq!(node_run.mode, "instant_cache_hit");
+    assert_eq!(node_run.passed, 1);
+    assert_eq!(node_run.cached_files_count, 1);
+    assert_eq!(node_run.executed_files_count, 0);
+
     // 6. Modify referenced JSON data file `config/settings.json` -> must invalidate `tests/test_isolated.py`!
     write_file(
         &repo,
@@ -176,7 +186,10 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         .iter()
         .map(|v| v["test_file"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(json_affected_files, vec!["tests/test_isolated.py".to_string()]);
+    assert_eq!(
+        json_affected_files,
+        vec!["tests/test_isolated.py".to_string()]
+    );
 
     // 7. Verify MCP JSON-RPC dispatch
     let mcp_tools = shared_mcp::dispatch_with_root(
@@ -189,10 +202,87 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         Some(&repo),
     )
     .unwrap();
-    assert_eq!(
-        mcp_tools["result"]["tools"].as_array().unwrap().len(),
-        7
-    );
+    assert_eq!(mcp_tools["result"]["tools"].as_array().unwrap().len(), 7);
 
     managed.shutdown();
+
+    // 8. WAL-backed cache survives a full ManagedRoot restart.
+    let reloaded_spec = catalog::resolve_spec(&repo).unwrap();
+    let reloaded = ManagedRoot::load(reloaded_spec).unwrap();
+    let persisted = reloaded
+        .run_tests(&TestRunRequest {
+            targets: vec![
+                "tests/test_math.py".to_string(),
+                "tests/test_service.py".to_string(),
+            ],
+            ..TestRunRequest::default()
+        })
+        .unwrap();
+    assert_eq!(persisted.mode, "instant_cache_hit");
+    assert_eq!(persisted.executed_files_count, 0);
+    reloaded.shutdown();
+
+    // 9. A source edit during pytest execution must discard the result rather than cache a false pass.
+    write_file(
+        &repo,
+        "src/pkg/slow.py",
+        "def value() -> int:\n    return 1\n",
+    );
+    write_file(
+        &repo,
+        "tests/test_slow.py",
+        "import time\nfrom pkg.slow import value\n\ndef test_slow():\n    time.sleep(1.0)\n    assert value() in (1, 2)\n",
+    );
+    let unstable_root = ManagedRoot::load(Spec {
+        root: repo.clone(),
+        scopes: vec![".".to_string()],
+        globs: Vec::new(),
+        excludes: Vec::new(),
+        default_excludes: true,
+        pytest_cmd: Vec::new(),
+        policy: MemoryPolicy {
+            background_enabled: false,
+            ..MemoryPolicy::default()
+        },
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+    let running = std::sync::Arc::clone(&unstable_root);
+    let handle = std::thread::spawn(move || {
+        running.run_tests(&TestRunRequest {
+            targets: vec!["tests/test_slow.py".to_string()],
+            no_cache: true,
+            ..TestRunRequest::default()
+        })
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    write_file(
+        &repo,
+        "src/pkg/slow.py",
+        "def value() -> int:\n    return 2\n",
+    );
+    let error = handle.join().unwrap().unwrap_err().to_string();
+    assert!(error.contains("SOURCE_CHANGED_DURING_TEST"), "{error}");
+
+    // 10. A client cancellation terminates the active child process group and never caches a failure.
+    let cancelling_root = std::sync::Arc::clone(&unstable_root);
+    let cancel_handle = std::thread::spawn(move || {
+        cancelling_root.run_tests(&TestRunRequest {
+            targets: vec!["tests/test_slow.py".to_string()],
+            no_cache: true,
+            ..TestRunRequest::default()
+        })
+    });
+    let cancel_deadline = Instant::now() + Duration::from_secs(2);
+    while !unstable_root.cancel_active() {
+        assert!(
+            Instant::now() < cancel_deadline,
+            "zygote child never became cancellable"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let cancelled = cancel_handle.join().unwrap().unwrap_err().to_string();
+    assert!(cancelled.contains("TEST_CANCELLED"), "{cancelled}");
+    unstable_root.shutdown();
 }

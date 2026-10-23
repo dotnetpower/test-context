@@ -87,7 +87,10 @@ pub fn dispatch_with_root(request: Value, default_root: Option<&PathBuf>) -> Opt
                     "error": { "code": -32602, "message": "missing tool name" }
                 }));
             };
-            let mut arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let mut arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let root = resolve_tool_root(name, &mut arguments, default_root);
             match root {
                 Ok(resolved_root) => {
