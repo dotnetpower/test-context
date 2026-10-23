@@ -33,6 +33,7 @@ pub struct Workspace {
     pub globs: Vec<String>,
     pub excludes: Vec<String>,
     pub default_excludes: bool,
+    include_matcher: GlobSet,
     exclude_matcher: GlobSet,
 }
 
@@ -95,6 +96,13 @@ impl Workspace {
         } else {
             globs
         };
+        let mut include_builder = GlobSetBuilder::new();
+        for pattern in &globs {
+            include_builder.add(
+                Glob::new(pattern).map_err(|e| invalid(format!("invalid include glob: {e}")))?,
+            );
+        }
+        let include_matcher = include_builder.build()?;
         let mut builder = GlobSetBuilder::new();
         for pat in &excludes {
             builder.add(Glob::new(pat).map_err(|e| invalid(format!("invalid exclude glob: {e}")))?);
@@ -106,6 +114,7 @@ impl Workspace {
             globs,
             excludes,
             default_excludes,
+            include_matcher,
             exclude_matcher,
         })
     }
@@ -133,7 +142,9 @@ impl Workspace {
         let Some(file_name) = rel.file_name().and_then(|n| n.to_str()) else {
             return false;
         };
-        file_name.ends_with(".py") || PYTEST_CONFIG_FILES.contains(&file_name)
+        self.include_matcher.is_match(rel)
+            || self.include_matcher.is_match(Path::new(file_name))
+            || PYTEST_CONFIG_FILES.contains(&file_name)
     }
 
     pub fn is_permitted_data_rel(&self, rel: &Path) -> bool {
@@ -563,5 +574,19 @@ mod tests {
         let output = handle.join().unwrap();
         assert!(output.cancelled);
         assert!(!output.timed_out);
+    }
+
+    #[test]
+    fn include_globs_limit_python_inventory_but_keep_pytest_config() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(
+            root.path(),
+            vec![".".to_string()],
+            vec!["tests/**/*.py".to_string()],
+        )
+        .unwrap();
+        assert!(workspace.is_permitted_rel(Path::new("tests/unit/test_api.py")));
+        assert!(!workspace.is_permitted_rel(Path::new("src/pkg/api.py")));
+        assert!(workspace.is_permitted_rel(Path::new("pyproject.toml")));
     }
 }
