@@ -1749,6 +1749,14 @@ struct CachedPythonRuntime {
 
 fn python_runtime_identity(spec: &Spec) -> (String, Vec<String>) {
     static CACHE: OnceLock<Mutex<BTreeMap<String, CachedPythonRuntime>>> = OnceLock::new();
+    static FAILURE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unavailable = || {
+        let nonce = FAILURE_NONCE.fetch_add(1, Ordering::Relaxed);
+        (
+            format!("runtime-identity-unavailable:{}:{nonce}", now_unix_ms()),
+            Vec::new(),
+        )
+    };
     let python = crate::zygote::resolve_python_bin(&spec.effective_pytest_cmd());
     let cache_key = format!(
         "{}\0{}",
@@ -1772,13 +1780,13 @@ print(json.dumps({'identity':[sys.version,sys.executable,platform.platform(),pyt
     command.arg("-c").arg(script);
     let Ok(output) = run_command_with_timeout(&mut command, Duration::from_secs(5), 256 * 1024)
     else {
-        return (String::new(), Vec::new());
+        return unavailable();
     };
     if !output.status.success() {
-        return (String::new(), Vec::new());
+        return unavailable();
     }
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
-        return (String::new(), Vec::new());
+        return unavailable();
     };
     let identity = value["identity"]
         .as_array()
@@ -2567,6 +2575,30 @@ mod tests {
             !background_eligible_from_parts(&base_spec, &graph, &cache, "test_plain.py"),
             "learned foreground invocations must not bypass background-safe opt-in"
         );
+    }
+
+    #[test]
+    fn unavailable_python_identity_never_reuses_a_cache_partition() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let broken_python = root.path().join("python-broken");
+        std::fs::write(&broken_python, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&broken_python, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let spec = Spec {
+            root: root.path().to_path_buf(),
+            scopes: Vec::new(),
+            globs: Vec::new(),
+            excludes: Vec::new(),
+            default_excludes: true,
+            pytest_cmd: vec![broken_python.to_string_lossy().into_owned()],
+            policy: Default::default(),
+            allow_worktrees: false,
+            managed_parent: None,
+        };
+        let first = environment_fingerprint(&spec);
+        let second = environment_fingerprint(&spec);
+        assert_ne!(first, second);
     }
 
     #[test]
