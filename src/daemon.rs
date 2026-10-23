@@ -24,6 +24,8 @@ pub const MAX_ACTIVE_CONNECTIONS: usize = 64;
 pub const MAX_RESIDENT_ROOTS: usize = 8;
 pub const MAX_DAEMON_RSS_BYTES: u64 = 192 * 1024 * 1024;
 pub const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
+pub const LARGE_ROOT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+pub const LARGE_ROOT_FILE_THRESHOLD: usize = 5_000;
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -46,6 +48,14 @@ fn daemon_rss_bytes() -> Option<u64> {
         .parse::<u64>()
         .ok()?;
     kib.checked_mul(1024)
+}
+
+fn root_idle_timeout(indexed_files: usize) -> Duration {
+    if indexed_files >= LARGE_ROOT_FILE_THRESHOLD {
+        LARGE_ROOT_IDLE_TIMEOUT
+    } else {
+        IDLE_ROOT_TIMEOUT
+    }
 }
 
 extern "C" fn request_stop(_: libc::c_int) {
@@ -228,7 +238,11 @@ impl DaemonHub {
         if let Ok(mut guard) = self.roots.lock() {
             let idle_keys: Vec<PathBuf> = guard
                 .iter()
-                .filter(|(_, r)| r.is_evictable() && r.last_activity_elapsed() >= IDLE_ROOT_TIMEOUT)
+                .filter(|(_, root)| {
+                    root.is_evictable()
+                        && root.last_activity_elapsed()
+                            >= root_idle_timeout(root.indexed_file_count())
+                })
                 .map(|(k, _)| k.clone())
                 .collect();
             for k in idle_keys {
@@ -978,5 +992,11 @@ mod tests {
     #[test]
     fn daemon_rss_probe_reports_current_process_memory() {
         assert!(daemon_rss_bytes().is_some_and(|rss| rss > 0));
+    }
+
+    #[test]
+    fn large_roots_use_shorter_idle_retention() {
+        assert_eq!(root_idle_timeout(4_999), IDLE_ROOT_TIMEOUT);
+        assert_eq!(root_idle_timeout(5_000), LARGE_ROOT_IDLE_TIMEOUT);
     }
 }

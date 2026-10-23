@@ -366,6 +366,13 @@ impl ManagedRoot {
             .unwrap_or_default()
     }
 
+    pub fn indexed_file_count(&self) -> usize {
+        self.state
+            .lock()
+            .map(|guard| guard.graph.files.len())
+            .unwrap_or(usize::MAX)
+    }
+
     pub fn is_evictable(&self) -> bool {
         self.active_pgid.load(Ordering::Acquire) <= 0
             && self
