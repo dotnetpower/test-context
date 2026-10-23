@@ -40,6 +40,20 @@ def command(argv, *, cwd=None, env=None):
     return result.stdout
 
 
+def source_tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    files = [root / "Cargo.toml", root / "Cargo.lock"]
+    files.extend(sorted((root / "src").glob("*.rs")))
+    for path in files:
+        relative = str(path.relative_to(root)).encode()
+        data = path.read_bytes()
+        digest.update(len(relative).to_bytes(8, "little"))
+        digest.update(relative)
+        digest.update(len(data).to_bytes(8, "little"))
+        digest.update(data)
+    return digest.hexdigest()
+
+
 def populate_ai_service_corpus(original_root: Path, dest_root: Path) -> dict:
     """Copy aks-store-demo/src/ai-service and attach deterministic unit/integration tests."""
     src_service = original_root / "src/ai-service"
@@ -703,6 +717,7 @@ def main():
         )
         .decode()
         .strip(),
+        "tctx_source_tree_sha256": source_tree_digest(Path(__file__).resolve().parents[1]),
         "tctx_binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
         "python_version": ".".join(map(str, sys.version_info[:3])),
         "sessions": args.sessions,

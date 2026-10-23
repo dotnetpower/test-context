@@ -44,6 +44,18 @@ function writeResponse(socket: Socket, value: unknown): void {
   socket.write(frame);
 }
 
+function responseFrame(value: unknown): Buffer {
+  const payload = Buffer.from(JSON.stringify(value), 'utf8');
+  const frame = Buffer.allocUnsafe(payload.byteLength + 4);
+  frame.writeUInt32BE(payload.byteLength, 0);
+  payload.copy(frame, 4);
+  return frame;
+}
+
+function daemonRequest(name: string): DaemonRequest {
+  return { root: null, name, arguments: {}, compact: true };
+}
+
 function attachFramedHandler(
   socket: Socket,
   handler: (requestValue: unknown, socket: Socket) => void,
@@ -184,6 +196,89 @@ void test('DaemonClient surfaces application errors without reconnecting and sup
         ),
       RequestCancelledError,
     );
+  } finally {
+    client.dispose();
+    await mock.cleanup();
+  }
+});
+
+void test('active request cancellation sends test_cancel over a second connection', async () => {
+  let cancelSeen = false;
+  let resolveCancel!: () => void;
+  const cancelArrived = new Promise<void>((resolve) => {
+    resolveCancel = resolve;
+  });
+  const mock = await createMockDaemon((raw, socket) => {
+    const req = raw as DaemonRequest;
+    if (req.name === 'test_cancel') {
+      cancelSeen = true;
+      // The production cancellation client is fire-and-forget; no response is required.
+      resolveCancel();
+      socket.end();
+    }
+    // Deliberately leave test_run pending until the client cancels.
+  });
+  const client = new DaemonClient(() => settings(mock.path, 2_000));
+  const cancellation = new TestCancellation();
+  try {
+    const pending = client.request(
+      { root: '/tmp/repo', name: 'test_run', arguments: {}, compact: false },
+      cancellation,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    cancellation.cancel();
+    await assert.rejects(() => pending, RequestCancelledError);
+    await Promise.race([
+      cancelArrived,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('test_cancel was not observed')), 1_000),
+      ),
+    ]);
+    assert.equal(cancelSeen, true);
+    assert.equal(mock.connections(), 2);
+  } finally {
+    client.dispose();
+    await mock.cleanup();
+  }
+});
+
+void test('multiple response frames are rejected as protocol desynchronization', async () => {
+  const mock = await createMockDaemon((_raw, socket) => {
+    socket.write(
+      Buffer.concat([
+        responseFrame({ result: { ok: 1 } }),
+        responseFrame({ result: { unsolicited: true } }),
+      ]),
+    );
+  });
+  const client = new DaemonClient(() => settings(mock.path));
+  try {
+    await assert.rejects(
+      () => client.request(daemonRequest('ping'), new TestCancellation()),
+      /multiple responses|desynchronized/u,
+    );
+  } finally {
+    client.dispose();
+    await mock.cleanup();
+  }
+});
+
+void test('timeout reconnects and succeeds on the second connection', async () => {
+  let calls = 0;
+  const mock = await createMockDaemon((_raw, socket) => {
+    calls += 1;
+    if (calls >= 2) {
+      writeResponse(socket, { result: { recovered: true } });
+    }
+  });
+  const client = new DaemonClient(() => settings(mock.path, 30));
+  try {
+    const result = await client.request<{ recovered: boolean }>(
+      daemonRequest('ping'),
+      new TestCancellation(),
+    );
+    assert.deepEqual(result, { recovered: true });
+    assert.equal(mock.connections(), 2);
   } finally {
     client.dispose();
     await mock.cleanup();

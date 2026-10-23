@@ -171,8 +171,24 @@ impl RootCache {
     }
 
     pub fn insert(&mut self, record: CachedTestRecord, policy: &MemoryPolicy) {
+        let mut record = record;
         if record.outcome == TestOutcome::Skipped || record.skipped > 0 {
             return;
+        }
+        truncate_utf8(&mut record.output_snippet, 8 * 1024);
+        record.failed_nodeids.truncate(10_000);
+        record.dynamic_dependencies.sort();
+        record.dynamic_dependencies.dedup();
+        record.dynamic_dependencies.truncate(4_096);
+        if record.node_results.len() > policy.max_node_results_per_file {
+            record.node_results = record
+                .node_results
+                .into_iter()
+                .take(policy.max_node_results_per_file)
+                .collect();
+        }
+        for node in record.node_results.values_mut() {
+            truncate_utf8(&mut node.output_snippet, 2 * 1024);
         }
         let key = Self::key(&record.test_file, &record.dep_hash);
         if let Some(existing) = self.history_by_key.get(&key)
@@ -188,7 +204,9 @@ impl RootCache {
         self.pending_events.push(CacheWalEvent::Upsert {
             record: Box::new(record),
         });
-        while self.history_by_key.len() > policy.max_cached_results {
+        while self.history_by_key.len() > policy.max_cached_results
+            || self.estimated_bytes() > policy.max_cache_bytes
+        {
             if let Some(oldest_key) = self
                 .history_by_key
                 .iter()
@@ -196,6 +214,15 @@ impl RootCache {
                 .map(|(k, _)| k.clone())
             {
                 self.history_by_key.remove(&oldest_key);
+                if let Some((test_file, dep_hash)) = oldest_key.rsplit_once('@')
+                    && self
+                        .latest_by_file
+                        .get(test_file)
+                        .is_some_and(|record| record.dep_hash == dep_hash)
+                {
+                    self.latest_by_file.remove(test_file);
+                }
+                self.quarantined_keys.remove(&oldest_key);
                 self.pending_events
                     .push(CacheWalEvent::RemoveKey { key: oldest_key });
             } else {
@@ -328,7 +355,10 @@ impl RootCache {
             cache.wal_valid_bytes = valid_bytes;
         }
         cache.pending_events.clear();
-        while cache.history_by_key.len() > MemoryPolicy::default().max_cached_results {
+        let default_policy = MemoryPolicy::default();
+        while cache.history_by_key.len() > default_policy.max_cached_results
+            || cache.estimated_bytes() > default_policy.max_cache_bytes
+        {
             let Some(oldest) = cache
                 .history_by_key
                 .iter()
@@ -339,6 +369,14 @@ impl RootCache {
             };
             cache.history_by_key.remove(&oldest);
             cache.quarantined_keys.remove(&oldest);
+            if let Some((test_file, dep_hash)) = oldest.rsplit_once('@')
+                && cache
+                    .latest_by_file
+                    .get(test_file)
+                    .is_some_and(|record| record.dep_hash == dep_hash)
+            {
+                cache.latest_by_file.remove(test_file);
+            }
         }
         cache
     }
@@ -420,6 +458,14 @@ impl RootCache {
             CacheWalEvent::RemoveKey { key } => {
                 self.history_by_key.remove(&key);
                 self.quarantined_keys.remove(&key);
+                if let Some((test_file, dep_hash)) = key.rsplit_once('@')
+                    && self
+                        .latest_by_file
+                        .get(test_file)
+                        .is_some_and(|record| record.dep_hash == dep_hash)
+                {
+                    self.latest_by_file.remove(test_file);
+                }
             }
             CacheWalEvent::Quarantine { key } => {
                 self.quarantined_keys.insert(key);
@@ -481,8 +527,58 @@ impl RootCache {
             "wal_sequence": self.wal_sequence,
             "history_records": self.history_by_key.len(),
             "latest_records": self.latest_by_file.len(),
+            "estimated_memory_bytes": self.estimated_bytes(),
         })
     }
+
+    pub fn estimated_bytes(&self) -> usize {
+        let record_bytes = |record: &CachedTestRecord| {
+            record.test_file.len()
+                + record.dep_hash.len()
+                + record.output_snippet.len()
+                + record.environment_hash.len()
+                + record.tctx_version.len()
+                + record.runner_mode.len()
+                + record.failed_nodeids.iter().map(String::len).sum::<usize>()
+                + record
+                    .dynamic_dependencies
+                    .iter()
+                    .map(String::len)
+                    .sum::<usize>()
+                + record
+                    .node_results
+                    .values()
+                    .map(|node| {
+                        node.nodeid.len()
+                            + node.output_snippet.len()
+                            + std::mem::size_of::<CachedNodeResult>()
+                    })
+                    .sum::<usize>()
+                + std::mem::size_of::<CachedTestRecord>()
+        };
+        self.latest_by_file
+            .values()
+            .map(record_bytes)
+            .sum::<usize>()
+            .saturating_add(
+                self.history_by_key
+                    .values()
+                    .map(record_bytes)
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.quarantined_keys.iter().map(String::len).sum::<usize>())
+    }
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
 }
 
 pub fn now_unix_ms() -> u64 {
@@ -617,5 +713,44 @@ mod tests {
                 std::env::remove_var("TCTX_HOME");
             }
         }
+    }
+
+    #[test]
+    fn enforces_record_and_total_memory_bounds() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cache = RootCache::new(root.path().to_path_buf());
+        let policy = MemoryPolicy {
+            max_cache_bytes: 32 * 1024,
+            max_node_results_per_file: 4,
+            ..MemoryPolicy::default()
+        };
+        for index in 0..20 {
+            let mut item = record(TestOutcome::Failed);
+            item.test_file = format!("tests/test_{index}.py");
+            item.dep_hash = format!("hash-{index}");
+            item.output_snippet = "실패".repeat(10_000);
+            for node_index in 0..20 {
+                let nodeid = format!("tests/test_{index}.py::test_{node_index}");
+                item.node_results.insert(
+                    nodeid.clone(),
+                    CachedNodeResult {
+                        nodeid,
+                        outcome: TestOutcome::Failed,
+                        duration_ms: 1,
+                        output_snippet: "trace".repeat(2_000),
+                    },
+                );
+            }
+            cache.insert(item, &policy);
+        }
+        assert!(cache.estimated_bytes() <= policy.max_cache_bytes);
+        assert!(cache.latest_by_file.values().all(|record| {
+            record.node_results.len() <= 4
+                && record.output_snippet.len() <= 8 * 1024
+                && record
+                    .node_results
+                    .values()
+                    .all(|node| node.output_snippet.len() <= 2 * 1024)
+        }));
     }
 }

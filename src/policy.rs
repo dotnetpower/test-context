@@ -11,6 +11,8 @@ pub struct MemoryPolicy {
     pub max_total_path_bytes: usize,
     pub max_watch_dirs: usize,
     pub max_cached_results: usize,
+    pub max_cache_bytes: usize,
+    pub max_node_results_per_file: usize,
     pub pytest_timeout_secs: u64,
     pub background_batch_size: usize,
     pub background_enabled: bool,
@@ -28,6 +30,8 @@ impl Default for MemoryPolicy {
             max_total_path_bytes: 16 * 1024 * 1024,
             max_watch_dirs: 50_000,
             max_cached_results: 50_000,
+            max_cache_bytes: 128 * 1024 * 1024,
+            max_node_results_per_file: 10_000,
             pytest_timeout_secs: 180,
             background_batch_size: 4,
             background_enabled: true,
@@ -46,6 +50,8 @@ impl MemoryPolicy {
             || self.max_total_path_bytes == 0
             || self.max_watch_dirs == 0
             || self.max_cached_results == 0
+            || self.max_cache_bytes == 0
+            || self.max_node_results_per_file == 0
             || self.pytest_timeout_secs == 0
             || self.background_batch_size == 0
             || self.background_max_load_ratio_percent == 0

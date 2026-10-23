@@ -233,3 +233,76 @@ It found and fixed these additional defects:
 8. Large-workspace cache hits unnecessarily recomputed preload module lists; that work now happens only when tests execute.
 
 All strict Clippy, Rust unit/integration/doc tests, Python benchmark artifact tests, TypeScript compile, ESLint, Node tests, clean-target checks, and paired benchmark parity checks pass. No known Critical, High, or Medium issue remains.
+
+---
+
+## Additional Hardening Rounds 17–21
+
+### Round 17 — Pytest collection semantics (10 criteria)
+
+1. Added multiline `python_files` parsing for TOML and INI-style configuration.
+2. Added `testpaths` parsing and safe relative-path validation.
+3. Restricted test-file classification to configured `testpaths` when present.
+4. Preserved default `test_*.py` and `*_test.py` behavior when no override exists.
+5. Added support for both `=` and `:` configuration delimiters.
+6. Added quoted list and whitespace-separated pattern parsing.
+7. Added tests proving matching files outside configured testpaths are not treated as tests.
+8. Changed explicit unmatched targets from success-shaped `no_tests` to `NO_TESTS_MATCHED`.
+9. Preserved parameterized nodeid execution and safe exact node-result reuse.
+10. Kept broad fallback invalidation for unresolved wildcard/package re-exports.
+
+### Round 18 — Cache memory and disk bounds (10 criteria)
+
+1. Added a 128 MiB in-memory cache budget.
+2. Added a 10,000 node-results-per-file limit.
+3. Capped file failure snippets at 8 KiB.
+4. Capped node failure snippets at 2 KiB.
+5. Capped failed node IDs at 10,000.
+6. Deduplicated and capped dynamic dependencies at 4,096 entries.
+7. Evicted oldest records until both count and byte limits are met.
+8. Removed matching latest/quarantine entries when history is evicted.
+9. Reapplied byte and count limits after snapshot/WAL replay.
+10. Added estimated memory usage to cache status and a stress test with Unicode traces and oversized node maps.
+
+### Round 19 — Graceful shutdown and recovery (10 criteria)
+
+1. Installed SIGTERM/SIGINT stop handling.
+2. Replaced blocking `incoming()` with `poll()`-driven acceptance that wakes immediately on new connections.
+3. Added graceful root/Zygote shutdown before process exit.
+4. Added a bounded connection drain deadline.
+5. Added maintenance-thread termination and join.
+6. Removed the Unix socket after graceful shutdown.
+7. Refused to replace stale runtime paths unless they are owned Unix sockets.
+8. Reduced persistent connection read timeout and checked stop state between frames.
+9. Added daemon shutdown integration coverage proving zero exit and socket cleanup.
+10. Added stale regular-file rejection coverage.
+
+### Round 20 — Native IPC cancellation and protocol hardening (10 criteria)
+
+1. Added daemon `test_cancel` capability reporting.
+2. Added fire-and-forget cancellation over a second native connection.
+3. Added an active request cancellation test proving the second connection carries `test_cancel`.
+4. Added protocol desynchronization coverage for multiple response frames in one chunk.
+5. Added timeout/reconnect/recovery coverage.
+6. Preserved application errors without unnecessary reconnects.
+7. Added a fixed connection worker pool to remove per-request thread creation.
+8. Preserved the 64-connection admission bound and RAII release.
+9. Added `poll()` acceptance to avoid the nonblocking-loop latency regression.
+10. Added multi-PGID cancellation for opt-in parallel execution.
+
+### Round 21 — Final audit and performance gates (12 criteria)
+
+1. Added source-tree SHA-256 provenance to benchmark records.
+2. Added test enforcement that published results match the current `src/*.rs`, Cargo.toml, and Cargo.lock.
+3. Added lower-bound speedup gates for warm, delta, affected, and mixed workloads.
+4. Added upper-bound warm latency gates.
+5. Added exact record/session/task count validation.
+6. Added exact installed/release binary SHA-256 verification.
+7. Re-ran 8 independent sessions and 320 paired observations.
+8. Inspected both final PNG charts for overlap and label clipping.
+9. Verified `aks-store-demo` remains clean.
+10. Re-ran strict Clippy, Rust, Python, TypeScript, ESLint, and Node suites.
+11. Verified graceful service restart and idle resource use.
+12. Repeated the final review after every discovered defect until no known Critical/High/Medium finding remained.
+
+The last five rounds found and repaired: success-shaped no-test targets, multiline pytest config loss, testpaths false positives, cache memory amplification, unbounded child output, SIGTERM socket leakage, unsafe stale socket replacement, timeout/cancellation misclassification, fixed-poll accept latency, nested native tests, WAL append after truncated tails, and eager connection-thread creation.

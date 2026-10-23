@@ -282,48 +282,102 @@ impl Workspace {
         Ok(buf)
     }
 
-    pub fn pytest_file_patterns(&self) -> Vec<String> {
-        let mut patterns = Vec::new();
+    fn pytest_option_tokens(&self, option: &str) -> Vec<String> {
+        let mut values = Vec::new();
         for name in ["pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"] {
             let path = self.root.join(name);
             let Ok(text) = std::fs::read_to_string(path) else {
                 continue;
             };
             let mut in_pytest_section = name == "pyproject.toml";
+            let mut collecting = false;
+            let mut bracketed = false;
             for raw in text.lines() {
                 let line = raw.trim();
                 if line.starts_with('[') && line.ends_with(']') {
+                    if collecting && bracketed && line == "]" {
+                        collecting = false;
+                        bracketed = false;
+                        continue;
+                    }
                     in_pytest_section = matches!(
                         line,
                         "[tool.pytest.ini_options]" | "[pytest]" | "[tool:pytest]"
                     );
+                    collecting = false;
+                    bracketed = false;
                     continue;
                 }
-                if !in_pytest_section || !line.starts_with("python_files") {
+                if !in_pytest_section {
                     continue;
                 }
-                let Some((_, value)) = line.split_once('=') else {
+                let value = if line.starts_with(option)
+                    && line[option.len()..].trim_start().starts_with(['=', ':'])
+                {
+                    let rest = line[option.len()..].trim_start();
+                    let value = rest[1..].trim();
+                    collecting =
+                        value.is_empty() || (value.starts_with('[') && !value.contains(']'));
+                    bracketed = value.starts_with('[');
+                    Some(value)
+                } else if collecting && (bracketed || raw.starts_with([' ', '\t'])) {
+                    if bracketed && line.contains(']') {
+                        collecting = false;
+                        bracketed = false;
+                    }
+                    Some(line)
+                } else {
+                    collecting = false;
+                    bracketed = false;
+                    None
+                };
+                let Some(value) = value else {
                     continue;
                 };
                 for token in value
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
                     .trim()
                     .trim_matches(['[', ']'])
                     .split(|c: char| c == ',' || c.is_whitespace())
                 {
                     let pattern = token.trim().trim_matches(['\'', '"']);
-                    if !pattern.is_empty() && pattern.len() <= 128 && !pattern.contains(['/', '\\'])
+                    if !pattern.is_empty()
+                        && pattern.len() <= 256
+                        && !pattern.contains(['\0', '\r', '\n'])
                     {
-                        patterns.push(pattern.to_string());
+                        values.push(pattern.to_string());
                     }
                 }
             }
         }
+        values.sort();
+        values.dedup();
+        values
+    }
+
+    pub fn pytest_file_patterns(&self) -> Vec<String> {
+        let mut patterns = self.pytest_option_tokens("python_files");
         if patterns.is_empty() {
             patterns.extend(["test_*.py".to_string(), "*_test.py".to_string()]);
         }
-        patterns.sort();
-        patterns.dedup();
         patterns
+    }
+
+    pub fn pytest_testpaths(&self) -> Vec<String> {
+        self.pytest_option_tokens("testpaths")
+            .into_iter()
+            .map(|path| path.trim_matches('/').replace('\\', "/"))
+            .filter(|path| {
+                !path.is_empty()
+                    && path != "."
+                    && !Path::new(path).is_absolute()
+                    && !Path::new(path)
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir))
+            })
+            .collect()
     }
 }
 

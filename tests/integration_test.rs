@@ -172,6 +172,15 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     assert_eq!(node_run.cached_files_count, 1);
     assert_eq!(node_run.executed_files_count, 0);
 
+    let no_match = managed
+        .run_tests(&TestRunRequest {
+            targets: vec!["tests/typo_does_not_exist.py".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(no_match.contains("NO_TESTS_MATCHED"), "{no_match}");
+
     // 6. Modify referenced JSON data file `config/settings.json` -> must invalidate `tests/test_isolated.py`!
     write_file(
         &repo,
@@ -303,4 +312,55 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     assert_eq!(noisy.status, "passed");
     assert!(noisy.stdout_summary.len() < 12_000);
     unstable_root.shutdown();
+}
+
+#[test]
+fn daemon_graceful_shutdown_cleans_socket_and_rejects_unsafe_stale_path() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    let temp = tempfile::tempdir().unwrap();
+    let state = temp.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = env!("CARGO_BIN_EXE_tctx");
+
+    let mut daemon = Command::new(executable)
+        .arg("daemon")
+        .env("TCTX_HOME", &state)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let socket = state.join("daemon.sock");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "daemon socket did not appear");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    unsafe {
+        assert_eq!(
+            libc::kill(i32::try_from(daemon.id()).unwrap(), libc::SIGTERM),
+            0
+        );
+    }
+    let status = daemon.wait().unwrap();
+    assert!(status.success(), "daemon did not stop cleanly: {status}");
+    assert!(
+        !socket.exists(),
+        "daemon socket remained after graceful stop"
+    );
+
+    std::fs::write(&socket, b"unsafe-stale-regular-file").unwrap();
+    let output = Command::new(executable)
+        .arg("daemon")
+        .env("TCTX_HOME", &state)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("refusing to replace non-socket"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

@@ -183,6 +183,7 @@ pub struct ManagedRoot {
     fs_events_rx: Mutex<Receiver<Event>>,
     fs_overflow: Arc<AtomicBool>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    watcher_filter_dirs: Arc<Mutex<BTreeSet<PathBuf>>>,
     zygote: Mutex<ZygoteManager>,
     active_pgid: Arc<AtomicI32>,
     active_pgids: Mutex<BTreeSet<i32>>,
@@ -229,6 +230,9 @@ impl ManagedRoot {
         let watch_dirs =
             workspace.watch_directories_for(graph.files.keys().map(Path::new), &spec.policy)?;
         let watched_dirs_set: BTreeSet<PathBuf> = watch_dirs.iter().cloned().collect();
+        let watcher_filter_dirs = Arc::new(Mutex::new(watched_dirs_set.clone()));
+        let watcher_filter_for_callback = Arc::clone(&watcher_filter_dirs);
+        let watcher_workspace = workspace.clone();
 
         let state = RootState {
             spec: spec.clone(),
@@ -270,6 +274,25 @@ impl ManagedRoot {
                 ) {
                     return;
                 }
+                if !event.need_rescan()
+                    && !event.paths.is_empty()
+                    && event.paths.iter().all(|path| {
+                        if path.is_dir() {
+                            return watcher_filter_for_callback
+                                .lock()
+                                .map(|directories| directories.contains(path))
+                                .unwrap_or(false);
+                        }
+                        path.strip_prefix(&watcher_workspace.root)
+                            .ok()
+                            .is_none_or(|relative| {
+                                !watcher_workspace.is_permitted_rel(relative)
+                                    && !watcher_workspace.is_permitted_data_rel(relative)
+                            })
+                    })
+                {
+                    return;
+                }
                 if event.need_rescan() {
                     overflow_for_cb.store(true, Ordering::Release);
                 }
@@ -299,6 +322,7 @@ impl ManagedRoot {
                 fs_events_rx: Mutex::new(fs_rx),
                 fs_overflow,
                 watcher: Mutex::new(watcher),
+                watcher_filter_dirs,
                 zygote: Mutex::new(zygote_manager),
                 active_pgid,
                 active_pgids: Mutex::new(BTreeSet::new()),
@@ -690,6 +714,9 @@ impl ManagedRoot {
         {
             for dir in new_watch_dirs {
                 let _ = w.watch(&dir, RecursiveMode::NonRecursive);
+                if let Ok(mut directories) = self.watcher_filter_dirs.lock() {
+                    directories.insert(dir);
+                }
             }
         }
 
@@ -1130,6 +1157,13 @@ impl ManagedRoot {
             });
 
             if target_test_files.is_empty() {
+                if !req.targets.is_empty() {
+                    return Err(invalid(format!(
+                        "NO_TESTS_MATCHED targets={}; check pytest python_files/testpaths configuration or target spelling",
+                        req.targets.join(",")
+                    ))
+                    .into());
+                }
                 return Ok(TestRunResponse {
                     root: guard.workspace.root.clone(),
                     status: "no_tests".to_string(),

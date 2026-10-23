@@ -98,6 +98,7 @@ pub struct DependencyGraph {
     pub dep_hash_for_test: BTreeMap<String, String>,
     pub config_hashes: BTreeMap<String, String>,
     pub test_file_patterns: Vec<String>,
+    pub testpaths: Vec<String>,
     pub environment_hash: String,
     pub runtime_deps_for_test: BTreeMap<String, BTreeSet<String>>,
 }
@@ -120,6 +121,7 @@ impl DependencyGraph {
             dep_hash_for_test: BTreeMap::new(),
             config_hashes: BTreeMap::new(),
             test_file_patterns: vec!["test_*.py".to_string(), "*_test.py".to_string()],
+            testpaths: Vec::new(),
             environment_hash: String::new(),
             runtime_deps_for_test: BTreeMap::new(),
         }
@@ -183,6 +185,7 @@ impl DependencyGraph {
         let inventory = workspace.files_limited(policy)?;
         let mut graph = Self::new();
         graph.test_file_patterns = workspace.pytest_file_patterns();
+        graph.testpaths = workspace.pytest_testpaths();
         let mut total_bytes = 0usize;
         for rel_path in &inventory.files {
             let full_path = workspace.root.join(rel_path);
@@ -302,7 +305,9 @@ impl DependencyGraph {
         let source = String::from_utf8_lossy(bytes);
         let parsed = parse_python_source(&source);
         let is_conftest = file_name == "conftest.py";
-        let is_test = !is_conftest && matches_test_filename(file_name, &self.test_file_patterns);
+        let is_test = !is_conftest
+            && matches_test_filename(file_name, &self.test_file_patterns)
+            && matches_test_path(rel_str, &self.testpaths);
         let structure_changed = match self.files.get(rel_str) {
             Some(existing) => {
                 existing.is_test != is_test
@@ -1046,6 +1051,13 @@ fn matches_test_filename(file_name: &str, patterns: &[String]) -> bool {
             .ok()
             .is_some_and(|glob| glob.compile_matcher().is_match(file_name))
     })
+}
+
+fn matches_test_path(rel_path: &str, testpaths: &[String]) -> bool {
+    testpaths.is_empty()
+        || testpaths
+            .iter()
+            .any(|testpath| rel_path == testpath || rel_path.starts_with(&format!("{testpath}/")))
 }
 
 pub fn normalize_rel_str(path: &Path) -> String {
@@ -2307,5 +2319,52 @@ def test_with_varargs(first_fx, *args, kw_fx: int = 1, **kwargs):
         let graph = DependencyGraph::build(&workspace, &MemoryPolicy::default()).unwrap();
         assert!(graph.dep_hash_for_test.contains_key("check_feature.py"));
         assert!(!graph.dep_hash_for_test.contains_key("test_default.py"));
+    }
+
+    #[test]
+    fn honors_multiline_python_files_and_testpaths() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("pyproject.toml"),
+            "[tool.pytest.ini_options]\n\
+python_files = [\n\
+  \"check_*.py\",\n\
+  \"*_spec.py\",\n\
+]\n\
+testpaths = [\n\
+  \"tests/unit\",\n\
+]\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(temp.path().join("tests/unit")).unwrap();
+        std::fs::create_dir_all(temp.path().join("src")).unwrap();
+        std::fs::write(
+            temp.path().join("tests/unit/check_feature.py"),
+            "def test_feature():\n    assert True\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("tests/unit/other_spec.py"),
+            "def test_other():\n    assert True\n",
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("src/check_helper.py"),
+            "def test_not_collected():\n    assert True\n",
+        )
+        .unwrap();
+        let workspace = Workspace::new(temp.path(), Vec::new(), Vec::new()).unwrap();
+        let graph = DependencyGraph::build(&workspace, &MemoryPolicy::default()).unwrap();
+        assert!(
+            graph
+                .dep_hash_for_test
+                .contains_key("tests/unit/check_feature.py")
+        );
+        assert!(
+            graph
+                .dep_hash_for_test
+                .contains_key("tests/unit/other_spec.py")
+        );
+        assert!(!graph.dep_hash_for_test.contains_key("src/check_helper.py"));
     }
 }

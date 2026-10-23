@@ -7,10 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +23,11 @@ pub const TRACE_ARGUMENT: &str = "_tctx_trace";
 pub const MAX_ACTIVE_CONNECTIONS: usize = 64;
 pub const MAX_RESIDENT_ROOTS: usize = 8;
 pub const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn request_stop(_: libc::c_int) {
+    STOP_REQUESTED.store(true, Ordering::Release);
+}
 
 struct ActiveConnection(Arc<AtomicUsize>);
 
@@ -28,6 +35,11 @@ impl Drop for ActiveConnection {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+struct ConnectionWork {
+    stream: UnixStream,
+    _guard: ActiveConnection,
 }
 
 struct RuntimeIdentity {
@@ -264,6 +276,7 @@ impl DaemonHub {
             "test_status": true,
             "test_sync": true,
             "test_invalidate": true,
+            "test_cancel": true,
             "authorized_worktrees": true,
             "request_tracing": true,
             "trace_clock": "unix_ms",
@@ -458,6 +471,17 @@ fn extract_trace_id(arguments: &mut Value) -> Option<String> {
 }
 
 pub fn serve() -> Result<()> {
+    STOP_REQUESTED.store(false, Ordering::Release);
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            request_stop as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            request_stop as *const () as libc::sighandler_t,
+        );
+    }
     let dir = catalog::state_dir()?;
     let lock_path = dir.join("daemon.lock");
     let lock_file = std::fs::OpenOptions::new()
@@ -473,37 +497,106 @@ pub fn serve() -> Result<()> {
 
     let sock_path = catalog::socket_path()?;
     if sock_path.exists() {
+        let metadata = std::fs::symlink_metadata(&sock_path)?;
+        if !metadata.file_type().is_socket()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(invalid(format!(
+                "refusing to replace non-socket or unowned runtime path: {}",
+                sock_path.display()
+            ))
+            .into());
+        }
         let _ = std::fs::remove_file(&sock_path);
     }
     let listener = UnixListener::bind(&sock_path)?;
+    listener.set_nonblocking(true)?;
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
     let runtime_identity = Arc::new(RuntimeIdentity::capture(&dir, &sock_path, &lock_file)?);
 
     let hub = Arc::new(DaemonHub::new());
     let active_connections = Arc::new(AtomicUsize::new(0));
-
-    // Background maintenance loop for RuntimeIdentity verification and idle root eviction
-    {
-        let hub_maint = Arc::clone(&hub);
-        let id_maint = Arc::clone(&runtime_identity);
-        std::thread::Builder::new()
-            .name("tctx-maint".to_string())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(Duration::from_secs(5));
-                    if let Err(err) = id_maint.check() {
-                        eprintln!("{err}");
-                        hub_maint.shutdown_all();
-                        std::process::exit(1);
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(4)
+        .clamp(4, 16);
+    let (connection_tx, connection_rx) = sync_channel::<ConnectionWork>(MAX_ACTIVE_CONNECTIONS);
+    let connection_rx = Arc::new(Mutex::new(connection_rx));
+    let mut connection_workers = Vec::new();
+    for index in 0..worker_count {
+        let hub_worker = Arc::clone(&hub);
+        let rx_worker = Arc::clone(&connection_rx);
+        connection_workers.push(
+            std::thread::Builder::new()
+                .name(format!("tctx-conn-{index}"))
+                .spawn(move || {
+                    loop {
+                        let work = {
+                            let Ok(receiver) = rx_worker.lock() else {
+                                return;
+                            };
+                            receiver.recv()
+                        };
+                        let Ok(work) = work else {
+                            return;
+                        };
+                        let _ = handle_connection(work.stream, &hub_worker);
                     }
-                    hub_maint.evict_idle_or_excess_roots();
-                }
-            })?;
+                })?,
+        );
     }
 
-    for incoming in listener.incoming() {
-        let Ok(stream) = incoming else {
+    // Background maintenance loop for RuntimeIdentity verification and idle root eviction
+    let maintenance = {
+        let hub_maint = Arc::clone(&hub);
+        let id_maint = Arc::clone(&runtime_identity);
+        Some(
+            std::thread::Builder::new()
+                .name("tctx-maint".to_string())
+                .spawn(move || {
+                    let mut last_identity_check = Instant::now();
+                    while !STOP_REQUESTED.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(100));
+                        if last_identity_check.elapsed() < Duration::from_secs(5) {
+                            continue;
+                        }
+                        if let Err(err) = id_maint.check() {
+                            eprintln!("{err}");
+                            hub_maint.shutdown_all();
+                            STOP_REQUESTED.store(true, Ordering::Release);
+                            break;
+                        }
+                        hub_maint.evict_idle_or_excess_roots();
+                        last_identity_check = Instant::now();
+                    }
+                })?,
+        )
+    };
+
+    while !STOP_REQUESTED.load(Ordering::Acquire) {
+        let mut descriptor = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 100) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        if ready == 0 {
             continue;
+        }
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
         };
         let current = active_connections.fetch_add(1, Ordering::AcqRel);
         if current >= MAX_ACTIVE_CONNECTIONS {
@@ -511,17 +604,34 @@ pub fn serve() -> Result<()> {
             continue;
         }
         let conn_guard = ActiveConnection(Arc::clone(&active_connections));
-        let hub_clone = Arc::clone(&hub);
-        std::thread::spawn(move || {
-            let _guard = conn_guard;
-            let _ = handle_connection(stream, &hub_clone);
-        });
+        match connection_tx.try_send(ConnectionWork {
+            stream,
+            _guard: conn_guard,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => continue,
+            Err(TrySendError::Disconnected(_)) => break,
+        }
     }
+    hub.shutdown_all();
+    drop(connection_tx);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while active_connections.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if let Some(handle) = maintenance {
+        let _ = handle.join();
+    }
+    for handle in connection_workers {
+        let _ = handle.join();
+    }
+    drop(listener);
+    let _ = std::fs::remove_file(&sock_path);
     Ok(())
 }
 
 fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_secs(300)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(60)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let peek = reader.fill_buf()?;
@@ -536,6 +646,22 @@ fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
             match reader.read_exact(&mut len_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) && STOP_REQUESTED.load(Ordering::Acquire) =>
+                {
+                    return Ok(());
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
                 Err(e) => return Err(e.into()),
             }
             let len = u32::from_be_bytes(len_buf) as usize;
@@ -578,6 +704,22 @@ fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
             match reader.read_exact(&mut len_buf) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) && STOP_REQUESTED.load(Ordering::Acquire) =>
+                {
+                    return Ok(());
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    continue;
+                }
                 Err(e) => return Err(e.into()),
             }
             let len = u32::from_be_bytes(len_buf) as usize;
