@@ -611,6 +611,11 @@ impl PytestZygote {
         self.stdin.flush()?;
 
         let mut started_length = [0_u8; 4];
+        wait_readable(
+            self.stdout.get_ref().as_raw_fd(),
+            ZYGOTE_STARTUP_TIMEOUT,
+            "zygote child-start frame",
+        )?;
         self.stdout.read_exact(&mut started_length)?;
         let length = u32::from_be_bytes(started_length) as usize;
         if length > MAX_ZYGOTE_FRAME {
@@ -636,6 +641,15 @@ impl PytestZygote {
         };
 
         let mut final_length = [0_u8; 4];
+        let response_timeout = Duration::from_secs(timeout_secs.saturating_add(10));
+        if let Err(error) = wait_readable(
+            self.stdout.get_ref().as_raw_fd(),
+            response_timeout,
+            "zygote test-result frame",
+        ) {
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+            return Err(error);
+        }
         self.stdout.read_exact(&mut final_length)?;
         let length = u32::from_be_bytes(final_length) as usize;
         if length > MAX_ZYGOTE_FRAME {
@@ -881,5 +895,15 @@ mod tests {
         .to_string();
         assert!(error.contains("test readiness timed out"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn readable_wait_returns_when_data_arrives() {
+        let (mut reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"x").unwrap();
+        wait_readable(reader.as_raw_fd(), Duration::from_secs(1), "test response").unwrap();
+        let mut byte = [0_u8; 1];
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [b'x']);
     }
 }
