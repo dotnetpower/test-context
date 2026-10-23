@@ -3,7 +3,7 @@ use crate::ast_graph::{
 };
 use crate::cache::{CachedNodeResult, CachedTestRecord, RootCache, TestOutcome, now_unix_ms};
 use crate::catalog::Spec;
-use crate::workspace::{Workspace, run_command_with_timeout};
+use crate::workspace::{Workspace, run_command_with_timeout, run_command_with_timeout_tracked};
 use crate::zygote::{ZygoteManager, cancel_process_group};
 use crate::{Result, invalid};
 use notify::{Event, RecursiveMode, Watcher};
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{Receiver, TrySendError, sync_channel};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -96,6 +96,7 @@ fn background_eligible(spec: &Spec, graph: &DependencyGraph, test_file: &str) ->
         .parsed
         .markers
         .iter()
+        .chain(node.parsed.module_markers.iter())
         .any(|marker| BACKGROUND_DENY_MARKERS.contains(&marker.as_str()))
     {
         return false;
@@ -115,6 +116,7 @@ fn test_resource_keys(graph: &DependencyGraph, test_file: &str) -> BTreeSet<Stri
     node.parsed
         .markers
         .iter()
+        .chain(node.parsed.module_markers.iter())
         .filter_map(|marker| {
             marker
                 .strip_prefix("resource_")
@@ -168,6 +170,10 @@ struct RootState {
     background_resources: BTreeSet<String>,
     background_runs_deferred_load: u64,
     last_safety_scan: Instant,
+    generation: u64,
+    watch_events_drained: u64,
+    background_batches: u64,
+    last_environment_check: Instant,
 }
 
 pub struct ManagedRoot {
@@ -179,6 +185,8 @@ pub struct ManagedRoot {
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
     zygote: Mutex<ZygoteManager>,
     active_pgid: Arc<AtomicI32>,
+    active_pgids: Mutex<BTreeSet<i32>>,
+    cancel_requested: AtomicBool,
 }
 
 impl ManagedRoot {
@@ -215,15 +223,6 @@ impl ManagedRoot {
                         pending_queue.push_back(item.test_file);
                     }
                 }
-            } else if graph.dep_hash_for_test.len() <= 32 {
-                for (test_file, dep_hash) in &graph.dep_hash_for_test {
-                    if cache.get_matching(test_file, dep_hash).is_none() {
-                        if !background_eligible(&spec, &graph, test_file) {
-                            continue;
-                        }
-                        pending_queue.push_back(test_file.clone());
-                    }
-                }
             }
         }
 
@@ -245,6 +244,10 @@ impl ManagedRoot {
             background_resources: BTreeSet::new(),
             background_runs_deferred_load: 0,
             last_safety_scan: Instant::now(),
+            generation: 1,
+            watch_events_drained: 0,
+            background_batches: 0,
+            last_environment_check: Instant::now(),
         };
 
         let (fs_tx, fs_rx) = sync_channel(4096);
@@ -298,6 +301,8 @@ impl ManagedRoot {
                 watcher: Mutex::new(watcher),
                 zygote: Mutex::new(zygote_manager),
                 active_pgid,
+                active_pgids: Mutex::new(BTreeSet::new()),
+                cancel_requested: AtomicBool::new(false),
             }
         });
 
@@ -348,7 +353,16 @@ impl ManagedRoot {
     }
 
     pub fn cancel_active(&self) -> bool {
-        cancel_process_group(&self.active_pgid)
+        let mut cancelled = cancel_process_group(&self.active_pgid);
+        if let Ok(pgids) = self.active_pgids.lock() {
+            for &pgid in pgids.iter() {
+                cancelled |= unsafe { libc::kill(-pgid, libc::SIGKILL) == 0 };
+            }
+        }
+        if cancelled {
+            self.cancel_requested.store(true, Ordering::Release);
+        }
+        cancelled
     }
 
     fn spawn_background_worker(this: Arc<Self>) {
@@ -405,14 +419,27 @@ impl ManagedRoot {
                 }
                 let max_batch = guard.spec.policy.background_batch_size.max(1);
                 let mut sorted: Vec<String> = guard.pending_queue.drain(..).collect();
-                sorted.sort_by_key(|test_file| {
-                    guard
-                        .cache
-                        .latest_by_file
-                        .get(test_file)
-                        .map(|record| record.duration_ms)
-                        .unwrap_or(0)
-                });
+                if guard.background_batches % 4 == 3 {
+                    sorted.sort_by_key(|test_file| {
+                        std::cmp::Reverse(
+                            guard
+                                .cache
+                                .latest_by_file
+                                .get(test_file)
+                                .map(|record| record.duration_ms)
+                                .unwrap_or(0),
+                        )
+                    });
+                } else {
+                    sorted.sort_by_key(|test_file| {
+                        guard
+                            .cache
+                            .latest_by_file
+                            .get(test_file)
+                            .map(|record| record.duration_ms)
+                            .unwrap_or(0)
+                    });
+                }
                 guard.pending_queue.extend(sorted);
                 let mut selected = Vec::new();
                 while selected.len() < max_batch {
@@ -437,6 +464,7 @@ impl ManagedRoot {
                     continue;
                 }
                 guard.background_running = true;
+                guard.background_batches = guard.background_batches.saturating_add(1);
                 guard.background_resources = selected
                     .iter()
                     .flat_map(|(test_file, _)| {
@@ -466,11 +494,25 @@ impl ManagedRoot {
                 &[],
                 "background",
                 Some(&self.zygote),
+                Some(&self.active_pgid),
+                Some(&self.active_pgids),
                 &preload_modules,
                 &environment_hash,
                 &pytest_plugin_manifest(&spec),
                 capture_dynamic_dependencies,
             );
+            if self.cancel_requested.swap(false, Ordering::AcqRel) {
+                let mut guard = self.state.lock().expect("state lock");
+                for (test_file, dep_hash) in &batch {
+                    guard.in_flight.remove(&flight_key(test_file, dep_hash));
+                }
+                guard.last_background_error =
+                    Some("TEST_CANCELLED: background pytest was terminated".to_string());
+                guard.background_running = !guard.pending_queue.is_empty();
+                guard.background_resources.clear();
+                self.condvar.notify_all();
+                continue;
+            }
             let exec_res = exec_res.map(|(mut records, raw)| {
                 records.shrink_to_fit();
                 (records, raw)
@@ -550,6 +592,7 @@ impl ManagedRoot {
         let mut overflowed = self.fs_overflow.swap(false, Ordering::AcqRel);
         if let Ok(rx) = self.fs_events_rx.lock() {
             while let Ok(event) = rx.try_recv() {
+                guard.watch_events_drained = guard.watch_events_drained.saturating_add(1);
                 if event.need_rescan() {
                     overflowed = true;
                 }
@@ -651,6 +694,7 @@ impl ManagedRoot {
         }
 
         if !changed_rels.is_empty() {
+            guard.generation = guard.generation.saturating_add(1);
             if structure_changed {
                 guard
                     .graph
@@ -721,6 +765,11 @@ impl ManagedRoot {
             Self::reconcile_live_files_locked(guard, None);
             guard.last_safety_scan = Instant::now();
         }
+        if guard.last_environment_check.elapsed() >= Duration::from_secs(60) {
+            let environment_hash = environment_fingerprint(&guard.spec);
+            guard.graph.apply_environment_hash(environment_hash);
+            guard.last_environment_check = Instant::now();
+        }
     }
 
     /// Reconciles live disk contents for candidate files before serving a test_run or affected query.
@@ -783,6 +832,7 @@ impl ManagedRoot {
         }
 
         if !changed.is_empty() {
+            guard.generation = guard.generation.saturating_add(1);
             if structure_changed {
                 guard
                     .graph
@@ -812,6 +862,7 @@ impl ManagedRoot {
             let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
             guard.last_activity = Instant::now();
             guard.graph = DependencyGraph::build(&guard.workspace, &guard.spec.policy)?;
+            guard.generation = guard.generation.saturating_add(1);
             let environment_hash = environment_fingerprint(&guard.spec);
             guard.graph.apply_environment_hash(environment_hash);
             if guard.spec.policy.background_enabled {
@@ -913,7 +964,16 @@ impl ManagedRoot {
         let pytest_cmd = guard.spec.effective_pytest_cmd();
         let background_safe_only = guard.spec.policy.background_safe_only;
         let background_deferred = guard.background_runs_deferred_load;
+        let generation = guard.generation;
+        let watch_events_drained = guard.watch_events_drained;
+        let background_batches = guard.background_batches;
+        let environment_check_age_ms =
+            u64::try_from(guard.last_environment_check.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let safety_scan_age_ms =
+            u64::try_from(guard.last_safety_scan.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let watched_directories = guard.watched_dirs.len();
         let watcher_overflow = self.fs_overflow.load(Ordering::Acquire);
+        let cache_storage = guard.cache.storage_metrics();
         let payload = serde_json::json!({
             "root": root,
             "pytest_cmd": pytest_cmd,
@@ -933,8 +993,15 @@ impl ManagedRoot {
             "background_safe_only": background_safe_only,
             "background_runs_deferred_load": background_deferred,
             "watcher_overflow_pending": watcher_overflow,
+            "generation": generation,
+            "watch_events_drained": watch_events_drained,
+            "background_batches": background_batches,
+            "environment_check_age_ms": environment_check_age_ms,
+            "safety_scan_age_ms": safety_scan_age_ms,
+            "watched_directories": watched_directories,
             "cache_quarantined_keys": guard.cache.quarantined_keys.len(),
             "cache_persistence_error": guard.cache.persistence_error,
+            "cache_storage": cache_storage,
         });
         drop(guard);
         let zygote = self
@@ -1038,6 +1105,8 @@ impl ManagedRoot {
 
             // 1. Resolve target test files (and reconcile live files on disk)
             Self::maybe_safety_reconcile_locked(&mut guard);
+            let initial_targets = guard.graph.resolve_target_test_files(&req.targets);
+            Self::reconcile_live_files_locked(&mut guard, Some(&initial_targets));
             target_test_files = guard.graph.resolve_target_test_files(&req.targets);
             spec = guard.spec.clone();
             environment_hash = guard.graph.environment_hash.clone();
@@ -1289,6 +1358,7 @@ impl ManagedRoot {
                     &environment_hash,
                     &plugin_manifest,
                     capture_dynamic_dependencies,
+                    &self.active_pgids,
                 )
             } else {
                 execute_pytest_batch(
@@ -1300,12 +1370,22 @@ impl ManagedRoot {
                     &req.pytest_args,
                     "on_demand",
                     Some(&self.zygote),
+                    Some(&self.active_pgid),
+                    Some(&self.active_pgids),
                     &preload_modules,
                     &environment_hash,
                     &plugin_manifest,
                     capture_dynamic_dependencies,
                 )
             };
+            if self.cancel_requested.swap(false, Ordering::AcqRel) {
+                let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+                for (test_file, dep_hash) in &dep_hashes_for_exec {
+                    guard.in_flight.remove(&flight_key(test_file, dep_hash));
+                }
+                self.condvar.notify_all();
+                return Err(invalid("TEST_CANCELLED: pytest process group was terminated").into());
+            }
             let (mut records, raw_out) = exec_res?;
 
             let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
@@ -1471,7 +1551,7 @@ fn flight_key(test_file: &str, dep_hash: &str) -> String {
 
 fn environment_fingerprint(spec: &Spec) -> String {
     let pytest_cmd = spec.effective_pytest_cmd();
-    let python = crate::zygote::resolve_python_bin(&pytest_cmd);
+    let (runtime_identity, plugins) = python_runtime_identity(spec);
     let mut evidence = Vec::new();
     evidence.extend_from_slice(b"tctx-env-v2\n");
     evidence.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
@@ -1481,26 +1561,10 @@ fn environment_fingerprint(spec: &Spec) -> String {
     evidence.extend_from_slice(pytest_cmd.join("\0").as_bytes());
     evidence.push(b'\n');
 
-    for (program, args) in [(
-        python.to_string_lossy().into_owned(),
-        vec![
-            "-c",
-            "import platform,sys,pytest;print(sys.version);print(sys.executable);print(platform.platform());print(pytest.__version__)",
-        ],
-    )] {
-        let mut command = Command::new(program);
-        command.args(args);
-        if let Ok(output) =
-            run_command_with_timeout(&mut command, Duration::from_secs(5), 64 * 1024)
-        {
-            evidence.extend_from_slice(&output.stdout);
-            evidence.extend_from_slice(&output.stderr);
-        }
-        for plugin in pytest_plugin_manifest(spec) {
-            evidence.extend_from_slice(b"plugin:");
-            evidence.extend_from_slice(plugin.as_bytes());
-            evidence.push(b'\n');
-        }
+    evidence.extend_from_slice(runtime_identity.as_bytes());
+    for plugin in plugins {
+        evidence.extend_from_slice(b"plugin:");
+        evidence.extend_from_slice(plugin.as_bytes());
         evidence.push(b'\n');
     }
 
@@ -1540,22 +1604,64 @@ fn environment_fingerprint(spec: &Spec) -> String {
 }
 
 fn pytest_plugin_manifest(spec: &Spec) -> Vec<String> {
+    python_runtime_identity(spec).1
+}
+
+#[derive(Clone)]
+struct CachedPythonRuntime {
+    captured: Instant,
+    identity: String,
+    plugins: Vec<String>,
+}
+
+fn python_runtime_identity(spec: &Spec) -> (String, Vec<String>) {
+    static CACHE: OnceLock<Mutex<BTreeMap<String, CachedPythonRuntime>>> = OnceLock::new();
     let python = crate::zygote::resolve_python_bin(&spec.effective_pytest_cmd());
-    let script = "import importlib.metadata as m\n\
+    let cache_key = format!(
+        "{}\0{}",
+        python.to_string_lossy(),
+        spec.effective_pytest_cmd().join("\0")
+    );
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(&cache_key)
+        && cached.captured.elapsed() < Duration::from_secs(60)
+    {
+        return (cached.identity.clone(), cached.plugins.clone());
+    }
+
+    let script = "import importlib.metadata as m,json,platform,sys,pytest\n\
 eps=m.entry_points()\n\
 items=eps.select(group='pytest11') if hasattr(eps,'select') else eps.get('pytest11',[])\n\
-print('\\n'.join(sorted({ep.value for ep in items})))";
+print(json.dumps({'identity':[sys.version,sys.executable,platform.platform(),pytest.__version__],\
+'plugins':sorted({ep.value for ep in items})},separators=(',',':')))";
     let mut command = Command::new(python);
     command.arg("-c").arg(script);
     let Ok(output) = run_command_with_timeout(&mut command, Duration::from_secs(5), 256 * 1024)
     else {
-        return Vec::new();
+        return (String::new(), Vec::new());
     };
     if !output.status.success() {
-        return Vec::new();
+        return (String::new(), Vec::new());
     }
-    let mut plugins: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return (String::new(), Vec::new());
+    };
+    let identity = value["identity"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    let mut plugins: Vec<String> = value["plugins"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| {
             !value.is_empty() && value.len() <= 256 && !value.contains(['\0', '\r', '\n', ' '])
@@ -1564,7 +1670,17 @@ print('\\n'.join(sorted({ep.value for ep in items})))";
         .collect();
     plugins.sort();
     plugins.dedup();
-    plugins
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(
+            cache_key,
+            CachedPythonRuntime {
+                captured: Instant::now(),
+                identity: identity.clone(),
+                plugins: plugins.clone(),
+            },
+        );
+    }
+    (identity, plugins)
 }
 
 fn git_dirty_files(root: &Path) -> Result<Vec<String>> {
@@ -1640,6 +1756,7 @@ fn execute_pytest_parallel(
     environment_hash: &str,
     pytest_plugins: &[String],
     capture_dynamic_dependencies: bool,
+    active_pgids: &Mutex<BTreeSet<i32>>,
 ) -> Result<(Vec<CachedTestRecord>, String)> {
     let parallelism = std::thread::available_parallelism()
         .map(usize::from)
@@ -1668,6 +1785,8 @@ fn execute_pytest_parallel(
                             extra_args,
                             "on_demand_parallel",
                             Some(&local_manager),
+                            None,
+                            Some(active_pgids),
                             preload_modules,
                             environment_hash,
                             pytest_plugins,
@@ -1707,6 +1826,8 @@ fn execute_pytest_batch(
     extra_args: &[String],
     source_label: &str,
     zygote_slot: Option<&Mutex<ZygoteManager>>,
+    active_pgid: Option<&AtomicI32>,
+    active_pgids: Option<&Mutex<BTreeSet<i32>>>,
     preload_modules: &[String],
     environment_hash: &str,
     pytest_plugins: &[String],
@@ -1762,7 +1883,12 @@ fn execute_pytest_batch(
         && manager
             .ensure(spec, pythonpath.clone(), preload_modules, pytest_plugins)
             .is_ok()
-        && let Ok(out) = manager.run(&zygote_args, timeout_secs, capture_dynamic_dependencies)
+        && let Ok(out) = manager.run(
+            &zygote_args,
+            timeout_secs,
+            capture_dynamic_dependencies,
+            active_pgids,
+        )
     {
         output_opt = Some(out);
     }
@@ -1780,7 +1906,13 @@ fn execute_pytest_batch(
         command.arg(format!("--junit-xml={}", junit_path.display()));
         command.args(&pytest_cli_args);
         let timeout = Duration::from_secs(timeout_secs);
-        run_command_with_timeout(&mut command, timeout, 2 * 1024 * 1024)?
+        run_command_with_timeout_tracked(
+            &mut command,
+            timeout,
+            2 * 1024 * 1024,
+            active_pgid,
+            active_pgids,
+        )?
     };
     if output.timed_out {
         return Err(invalid(format!(
@@ -2264,5 +2396,50 @@ mod tests {
             st.failed_nodeids,
             vec!["tests/test_cmp.py::test_fail[x > y]"]
         );
+    }
+
+    #[test]
+    fn background_policy_requires_module_opt_in_and_denies_live_markers() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(root.path(), Vec::new(), Vec::new()).unwrap();
+        let base_spec = Spec {
+            root: root.path().to_path_buf(),
+            scopes: Vec::new(),
+            globs: Vec::new(),
+            excludes: Vec::new(),
+            default_excludes: true,
+            pytest_cmd: Vec::new(),
+            policy: Default::default(),
+            allow_worktrees: false,
+            managed_parent: None,
+        };
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "test_safe.py",
+            b"import pytest\npytestmark = pytest.mark.background_safe\ndef test_ok(): pass\n",
+        );
+        graph.insert_file_bytes(
+            "test_live.py",
+            b"import pytest\npytestmark = [pytest.mark.background_safe, pytest.mark.live]\ndef test_live(): pass\n",
+        );
+        graph.insert_file_bytes("test_plain.py", b"def test_plain(): pass\n");
+        graph.recompute_edges();
+        let _ = workspace;
+        assert!(background_eligible(&base_spec, &graph, "test_safe.py"));
+        assert!(!background_eligible(&base_spec, &graph, "test_live.py"));
+        assert!(!background_eligible(&base_spec, &graph, "test_plain.py"));
+    }
+
+    #[test]
+    fn resource_keys_are_derived_from_module_markers() {
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "test_db.py",
+            b"import pytest\npytestmark = [pytest.mark.background_safe, pytest.mark.resource_postgres, pytest.mark.serial]\ndef test_db(): pass\n",
+        );
+        graph.recompute_edges();
+        let keys = test_resource_keys(&graph, "test_db.py");
+        assert!(keys.contains("postgres"));
+        assert!(keys.contains("serial"));
     }
 }

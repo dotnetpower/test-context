@@ -7,6 +7,8 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 pub const PYTEST_CONFIG_FILES: &[&str] = &[
@@ -354,6 +356,16 @@ pub fn run_command_with_timeout(
     timeout: Duration,
     max_output_bytes: usize,
 ) -> Result<BoundedOutput> {
+    run_command_with_timeout_tracked(command, timeout, max_output_bytes, None, None)
+}
+
+pub fn run_command_with_timeout_tracked(
+    command: &mut Command,
+    timeout: Duration,
+    max_output_bytes: usize,
+    active_pgid: Option<&AtomicI32>,
+    active_pgids: Option<&Mutex<BTreeSet<i32>>>,
+) -> Result<BoundedOutput> {
     let started = Instant::now();
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
@@ -361,6 +373,40 @@ pub fn run_command_with_timeout(
     command.process_group(0);
     let mut child = command.spawn()?;
     let pid = child.id();
+    if let Some(active) = active_pgid
+        && let Ok(pgid) = i32::try_from(pid)
+    {
+        active.store(pgid, Ordering::Release);
+    }
+    if let Some(active) = active_pgids
+        && let Ok(pgid) = i32::try_from(pid)
+        && let Ok(mut guard) = active.lock()
+    {
+        guard.insert(pgid);
+    }
+    struct PgidReset<'a> {
+        single: Option<&'a AtomicI32>,
+        many: Option<&'a Mutex<BTreeSet<i32>>>,
+        pid: u32,
+    }
+    impl Drop for PgidReset<'_> {
+        fn drop(&mut self) {
+            if let Some(active) = self.single {
+                active.store(0, Ordering::Release);
+            }
+            if let Some(active) = self.many
+                && let Ok(pgid) = i32::try_from(self.pid)
+                && let Ok(mut guard) = active.lock()
+            {
+                guard.remove(&pgid);
+            }
+        }
+    }
+    let _pgid_reset = PgidReset {
+        single: active_pgid,
+        many: active_pgids,
+        pid,
+    };
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let stderr_pipe = child.stderr.take().expect("piped stderr");
 

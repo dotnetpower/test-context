@@ -5,7 +5,7 @@ use crate::policy::MemoryPolicy;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -74,7 +74,7 @@ pub struct CachedTestRecord {
 }
 
 fn current_cache_schema() -> u32 {
-    4
+    5
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,6 +94,12 @@ pub struct RootCache {
     pub persistence_error: Option<String>,
     #[serde(skip)]
     pending_events: Vec<CacheWalEvent>,
+    #[serde(default)]
+    wal_sequence: u64,
+    #[serde(skip)]
+    wal_valid_bytes: u64,
+    #[serde(skip)]
+    wal_needs_repair: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,6 +126,13 @@ enum CacheWalEvent {
     },
 }
 
+#[derive(Serialize, Deserialize)]
+struct CacheWalEnvelope {
+    sequence: u64,
+    checksum: String,
+    event: CacheWalEvent,
+}
+
 impl RootCache {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -134,6 +147,9 @@ impl RootCache {
             quarantined_keys: BTreeSet::new(),
             persistence_error: None,
             pending_events: Vec::new(),
+            wal_sequence: 0,
+            wal_valid_bytes: 0,
+            wal_needs_repair: false,
         }
     }
 
@@ -155,7 +171,7 @@ impl RootCache {
     }
 
     pub fn insert(&mut self, record: CachedTestRecord, policy: &MemoryPolicy) {
-        if record.outcome == TestOutcome::Skipped {
+        if record.outcome == TestOutcome::Skipped || record.skipped > 0 {
             return;
         }
         let key = Self::key(&record.test_file, &record.dep_hash);
@@ -272,6 +288,8 @@ impl RootCache {
             let mut reader = BufReader::new(file);
             let mut line = String::new();
             let mut total = 0usize;
+            let mut expected_sequence = cache.wal_sequence.saturating_add(1);
+            let mut valid_bytes = 0u64;
             while total <= 64 * 1024 * 1024 {
                 line.clear();
                 let Ok(read) = reader.read_line(&mut line) else {
@@ -281,10 +299,33 @@ impl RootCache {
                     break;
                 }
                 total = total.saturating_add(read);
-                if let Ok(event) = serde_json::from_str::<CacheWalEvent>(&line) {
-                    cache.apply_wal_event(event);
+                let Ok(envelope) = serde_json::from_str::<CacheWalEnvelope>(&line) else {
+                    // A crash can leave only the last line truncated; preserve all earlier events.
+                    cache.persistence_error = Some("CACHE_WAL_TRUNCATED_TAIL".to_string());
+                    cache.wal_needs_repair = true;
+                    break;
+                };
+                let Ok(event_bytes) = serde_json::to_vec(&envelope.event) else {
+                    cache.persistence_error = Some("CACHE_WAL_EVENT_SERIALIZE_FAILED".to_string());
+                    cache.wal_needs_repair = true;
+                    break;
+                };
+                if envelope.sequence != expected_sequence
+                    || sha256_hex(&event_bytes) != envelope.checksum
+                {
+                    cache.persistence_error = Some(format!(
+                        "CACHE_WAL_CORRUPT expected_sequence={} actual_sequence={}",
+                        expected_sequence, envelope.sequence
+                    ));
+                    cache.wal_needs_repair = true;
+                    break;
                 }
+                cache.apply_wal_event(envelope.event);
+                cache.wal_sequence = envelope.sequence;
+                expected_sequence = expected_sequence.saturating_add(1);
+                valid_bytes = valid_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
             }
+            cache.wal_valid_bytes = valid_bytes;
         }
         cache.pending_events.clear();
         while cache.history_by_key.len() > MemoryPolicy::default().max_cached_results {
@@ -320,16 +361,30 @@ impl RootCache {
         });
         let wal_path = Self::wal_path(&self.root)?;
         {
-            let mut wal = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .mode(0o600)
-                .open(&wal_path)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).read(true).write(true);
+            let mut wal = options.mode(0o600).open(&wal_path)?;
+            if self.wal_needs_repair {
+                wal.set_len(self.wal_valid_bytes)?;
+                wal.sync_data()?;
+                self.wal_needs_repair = false;
+            }
+            wal.seek(std::io::SeekFrom::End(0))?;
+            let mut next_sequence = self.wal_sequence.saturating_add(1);
             for event in &self.pending_events {
-                serde_json::to_writer(&mut wal, event)?;
+                let event_bytes = serde_json::to_vec(event)?;
+                let envelope = CacheWalEnvelope {
+                    sequence: next_sequence,
+                    checksum: sha256_hex(&event_bytes),
+                    event: event.clone(),
+                };
+                serde_json::to_writer(&mut wal, &envelope)?;
                 wal.write_all(b"\n")?;
+                next_sequence = next_sequence.saturating_add(1);
             }
             wal.sync_data()?;
+            self.wal_sequence = next_sequence.saturating_sub(1);
+            self.wal_valid_bytes = wal.stream_position()?;
         }
         self.pending_events.clear();
 
@@ -398,6 +453,7 @@ impl RootCache {
             file.sync_all()?;
         }
         std::fs::rename(&tmp_path, &path)?;
+        std::fs::File::open(catalog::cache_dir()?)?.sync_all()?;
         let wal = std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -405,6 +461,27 @@ impl RootCache {
             .open(wal_path)?;
         wal.sync_all()?;
         Ok(())
+    }
+
+    pub fn storage_metrics(&self) -> serde_json::Value {
+        let snapshot_bytes = Self::storage_path(&self.root)
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let wal_bytes = Self::wal_path(&self.root)
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        serde_json::json!({
+            "schema": self.schema,
+            "snapshot_bytes": snapshot_bytes,
+            "wal_bytes": wal_bytes,
+            "wal_sequence": self.wal_sequence,
+            "history_records": self.history_by_key.len(),
+            "latest_records": self.latest_by_file.len(),
+        })
     }
 }
 
@@ -418,6 +495,7 @@ pub fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
 
     fn record(outcome: TestOutcome) -> CachedTestRecord {
         CachedTestRecord {
@@ -470,5 +548,74 @@ mod tests {
                 .get_matching("tests/test_one.py", "skip-hash")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn wal_recovers_valid_prefix_from_truncated_tail_and_compacts_atomically() {
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            state.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let previous = std::env::var_os("TCTX_HOME");
+        unsafe {
+            std::env::set_var("TCTX_HOME", state.path());
+        }
+        let root = state.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut cache = RootCache::new(root.clone());
+        cache.insert(record(TestOutcome::Passed), &MemoryPolicy::default());
+        cache.save().unwrap();
+        let wal_path = RootCache::wal_path(&root).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap()
+            .write_all(b"{\"sequence\":")
+            .unwrap();
+
+        let mut loaded = RootCache::load_or_new(&root);
+        assert!(
+            loaded
+                .get_matching("tests/test_one.py", "same-hash")
+                .is_some()
+        );
+        assert_eq!(
+            loaded.persistence_error.as_deref(),
+            Some("CACHE_WAL_TRUNCATED_TAIL")
+        );
+
+        let mut second = record(TestOutcome::Passed);
+        second.test_file = "tests/test_two.py".to_string();
+        second.dep_hash = "second-hash".to_string();
+        loaded.insert(second, &MemoryPolicy::default());
+        loaded.save().unwrap();
+        let repaired = RootCache::load_or_new(&root);
+        assert!(
+            repaired
+                .get_matching("tests/test_one.py", "same-hash")
+                .is_some()
+        );
+        assert!(
+            repaired
+                .get_matching("tests/test_two.py", "second-hash")
+                .is_some()
+        );
+
+        loaded.compact_snapshot(&wal_path).unwrap();
+        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+        assert!(RootCache::storage_path(&root).unwrap().is_file());
+
+        unsafe {
+            if let Some(value) = previous {
+                std::env::set_var("TCTX_HOME", value);
+            } else {
+                std::env::remove_var("TCTX_HOME");
+            }
+        }
     }
 }

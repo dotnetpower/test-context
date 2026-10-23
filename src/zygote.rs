@@ -2,25 +2,53 @@ use crate::catalog::Spec;
 use crate::workspace::BoundedOutput;
 use crate::{Result, invalid};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::io::{BufReader, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_ZYGOTE_FRAME: usize = 4 * 1024 * 1024;
 
+struct ActivePgidGuard<'a>(&'a AtomicI32);
+
+impl Drop for ActivePgidGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(0, Ordering::Release);
+    }
+}
+
+struct ParallelPgidGuard<'a> {
+    registry: Option<&'a Mutex<BTreeSet<i32>>>,
+    pgid: i32,
+}
+
+impl Drop for ParallelPgidGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(registry) = self.registry
+            && let Ok(mut guard) = registry.lock()
+        {
+            guard.remove(&self.pgid);
+        }
+    }
+}
+
 const ZYGOTE_SCRIPT: &str = r#"
 import gc
+import ctypes
 import importlib
 import io
 import json
+import math
 import os
 import select
 import signal
 import struct
+import resource
 import sys
 import tempfile
 import threading
@@ -198,12 +226,6 @@ class TctxReporter:
         global audit_current_node
         audit_current_node = None
 
-def make_mem_file(name):
-    if hasattr(os, "memfd_create"):
-        fd = os.memfd_create(name, flags=getattr(os, "MFD_CLOEXEC", 0))
-        return os.fdopen(fd, "w+b", buffering=0)
-    return tempfile.TemporaryFile(mode="w+b")
-
 def close_unneeded_fds(keep):
     try:
         for name in os.listdir("/proc/self/fd"):
@@ -243,19 +265,36 @@ while True:
         continue
 
     r_fd, w_fd = os.pipe()
-    out_file = make_mem_file("tctx-pytest-stdout")
-    err_file = make_mem_file("tctx-pytest-stderr")
+    out_r, out_w = os.pipe()
+    err_r, err_w = os.pipe()
 
+    parent_pid = os.getpid()
     pid = os.fork()
     if pid == 0:
         try:
             os.close(r_fd)
+            os.close(out_r)
+            os.close(err_r)
             os.setsid()
+            try:
+                libc = ctypes.CDLL(None)
+                libc.prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+                if os.getppid() != parent_pid:
+                    os._exit(125)
+            except Exception:
+                pass
+            try:
+                cpu_limit = max(1, int(math.ceil(timeout_secs)) + 5)
+                resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+            except Exception:
+                pass
             gc.disable()
             gc.collect = lambda *a, **kw: 0
-            os.dup2(out_file.fileno(), 1)
-            os.dup2(err_file.fileno(), 2)
-            keep = {w_fd, out_file.fileno(), err_file.fileno()}
+            os.dup2(out_w, 1)
+            os.dup2(err_w, 2)
+            os.close(out_w)
+            os.close(err_w)
+            keep = {w_fd}
             close_unneeded_fds(keep)
             sys.stdout = io.TextIOWrapper(os.fdopen(1, "wb", closefd=False), encoding="utf-8", errors="replace", write_through=True)
             sys.stderr = io.TextIOWrapper(os.fdopen(2, "wb", closefd=False), encoding="utf-8", errors="replace", write_through=True)
@@ -276,9 +315,12 @@ while True:
             payload = json.dumps({
                 "exit_code": code,
                 "reports": reporter.reports if reporter is not None else [],
-                "dynamic_deps": sorted(audit_paths),
+                "dynamic_deps": sorted(audit_paths or ()),
             }, separators=(",", ":")).encode("utf-8")
-            os.write(w_fd, payload[:MAX_FRAME])
+            payload = payload[:MAX_FRAME]
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(w_fd, payload[offset:])
         finally:
             try:
                 os.close(w_fd)
@@ -287,46 +329,86 @@ while True:
             os._exit(0)
     else:
         os.close(w_fd)
+        os.close(out_w)
+        os.close(err_w)
+        os.set_blocking(r_fd, False)
+        os.set_blocking(out_r, False)
+        os.set_blocking(err_r, False)
         write_frame(proto_out, {"started_pid": pid})
         timed_out = False
-        ready, _, _ = select.select([r_fd], [], [], timeout_secs)
-        if not ready:
-            timed_out = True
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except Exception:
+        result_chunks = []
+        stdout_chunks = []
+        stderr_chunks = []
+        result_done = False
+        open_fds = {r_fd: result_chunks, out_r: stdout_chunks, err_r: stderr_chunks}
+        deadline = time.monotonic() + timeout_secs
+        while open_fds and not result_done and time.monotonic() < deadline:
+            ready, _, _ = select.select(list(open_fds), [], [], max(0.0, deadline - time.monotonic()))
+            if not ready:
+                break
+            for fd in ready:
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                except Exception:
-                    pass
-            child_result = {"exit_code": 124, "reports": [], "dynamic_deps": []}
-        else:
-            chunks = []
-            while True:
-                chunk = os.read(r_fd, 65536)
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
                 if not chunk:
-                    break
-                chunks.append(chunk)
-                if sum(map(len, chunks)) >= MAX_FRAME:
-                    break
+                    open_fds.pop(fd, None)
+                    continue
+                target = open_fds[fd]
+                current = sum(map(len, target))
+                if current < 2 * 1024 * 1024:
+                    target.append(chunk[: 2 * 1024 * 1024 - current])
+                if fd == r_fd:
+                    result_done = True
+        wait_status = 0
+        waited = False
+        if not result_done:
             try:
-                child_result = json.loads(b"".join(chunks).decode("utf-8"))
+                done_pid, wait_status = os.waitpid(pid, os.WNOHANG)
+                waited = done_pid == pid
+            except Exception:
+                waited = False
+            if waited:
+                child_result = {"exit_code": 130, "reports": [], "dynamic_deps": []}
+            else:
+                timed_out = True
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except Exception:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                child_result = {"exit_code": 124, "reports": [], "dynamic_deps": []}
+        else:
+            try:
+                child_result = json.loads(b"".join(result_chunks).decode("utf-8"))
             except Exception:
                 child_result = {"exit_code": 1, "reports": [], "dynamic_deps": []}
-        os.close(r_fd)
-        wait_status = 0
-        try:
-            _, wait_status = os.waitpid(pid, 0)
-        except Exception:
-            pass
+        if not waited:
+            try:
+                _, wait_status = os.waitpid(pid, 0)
+            except Exception:
+                pass
+        # Drain any output written between result delivery and process exit.
+        for fd, target in list(open_fds.items()):
+            while True:
+                try:
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                current = sum(map(len, target))
+                if current < 2 * 1024 * 1024:
+                    target.append(chunk[: 2 * 1024 * 1024 - current])
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         cancelled = os.WIFSIGNALED(wait_status) and os.WTERMSIG(wait_status) in (signal.SIGKILL, signal.SIGTERM)
-
-        out_file.seek(0)
-        err_file.seek(0)
-        stdout_text = out_file.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
-        stderr_text = err_file.read(2 * 1024 * 1024).decode("utf-8", errors="replace")
-        out_file.close()
-        err_file.close()
+        stdout_text = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
         duration_ms = max(1, int(round((time.perf_counter() - started) * 1000.0)))
         write_frame(proto_out, {
@@ -374,6 +456,7 @@ pub struct PytestZygote {
     pytest_plugins: String,
     root: PathBuf,
     plugin_errors: Vec<String>,
+    runs: u32,
 }
 
 impl PytestZygote {
@@ -399,6 +482,14 @@ impl PytestZygote {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         let mut child = cmd.spawn()?;
         let stdin = child
@@ -432,17 +523,20 @@ impl PytestZygote {
             pytest_plugins: plugin_str,
             root: spec.root.clone(),
             plugin_errors: Vec::new(),
+            runs: 0,
         })
     }
 
     pub fn matches_config(
-        &self,
+        &mut self,
         spec: &Spec,
         pythonpath: &std::ffi::OsStr,
         preload_modules: &[String],
         pytest_plugins: &[String],
     ) -> bool {
-        self.root == spec.root
+        self.child.try_wait().ok().flatten().is_none()
+            && self.runs < 200
+            && self.root == spec.root
             && self.pythonpath == pythonpath
             && self.python_bin == resolve_python_bin(&spec.effective_pytest_cmd())
             && self.preload_modules == preload_modules.join(",")
@@ -455,8 +549,10 @@ impl PytestZygote {
         timeout_secs: u64,
         active_pgid: &AtomicI32,
         capture_dynamic_deps: bool,
+        parallel_pgids: Option<&Mutex<BTreeSet<i32>>>,
     ) -> Result<BoundedOutput> {
         let started = Instant::now();
+        self.runs = self.runs.saturating_add(1);
         let req = ZygoteRequest {
             args,
             timeout_secs,
@@ -486,17 +582,25 @@ impl PytestZygote {
             .and_then(|value| i32::try_from(value).ok())
             .ok_or_else(|| invalid("zygote did not return a child pid"))?;
         active_pgid.store(pid, Ordering::Release);
+        let _active_guard = ActivePgidGuard(active_pgid);
+        if let Some(registry) = parallel_pgids
+            && let Ok(mut guard) = registry.lock()
+        {
+            guard.insert(pid);
+        }
+        let _parallel_guard = ParallelPgidGuard {
+            registry: parallel_pgids,
+            pgid: pid,
+        };
 
         let mut final_length = [0_u8; 4];
         self.stdout.read_exact(&mut final_length)?;
         let length = u32::from_be_bytes(final_length) as usize;
         if length > MAX_ZYGOTE_FRAME {
-            active_pgid.store(0, Ordering::Release);
             return Err(invalid("zygote response too large").into());
         }
         let mut reply_bytes = vec![0_u8; length];
         self.stdout.read_exact(&mut reply_bytes)?;
-        active_pgid.store(0, Ordering::Release);
         let reply: ZygoteReply = serde_json::from_slice(&reply_bytes)?;
         if let Some(err) = reply.error {
             return Err(invalid(format!("zygote error: {err}")).into());
@@ -579,7 +683,7 @@ impl ZygoteManager {
             return Err(invalid("zygote circuit breaker is open").into());
         }
 
-        let needs_spawn = self.zygote.as_ref().is_none_or(|zygote| {
+        let needs_spawn = self.zygote.as_mut().is_none_or(|zygote| {
             !zygote.matches_config(spec, &pythonpath, preload_modules, pytest_plugins)
         });
         if needs_spawn {
@@ -598,11 +702,18 @@ impl ZygoteManager {
         args: &[String],
         timeout_secs: u64,
         capture_dynamic_deps: bool,
+        parallel_pgids: Option<&Mutex<BTreeSet<i32>>>,
     ) -> Result<BoundedOutput> {
         let Some(zygote) = self.zygote.as_mut() else {
             return Err(invalid("zygote unavailable").into());
         };
-        match zygote.run_pytest(args, timeout_secs, &self.active_pgid, capture_dynamic_deps) {
+        match zygote.run_pytest(
+            args,
+            timeout_secs,
+            &self.active_pgid,
+            capture_dynamic_deps,
+            parallel_pgids,
+        ) {
             Ok(output) => {
                 self.failures = 0;
                 self.last_error = None;
@@ -628,6 +739,7 @@ impl ZygoteManager {
             "last_error": self.last_error,
             "active_pgid": self.active_pgid.load(Ordering::Acquire),
             "plugin_errors": self.zygote.as_ref().map(|zygote| &zygote.plugin_errors),
+            "runs": self.zygote.as_ref().map(|zygote| zygote.runs).unwrap_or(0),
         })
     }
 

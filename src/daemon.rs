@@ -233,24 +233,17 @@ impl DaemonHub {
         Ok(loaded)
     }
 
-    fn reload_root(&self, requested_root: &Path) -> Result<Arc<ManagedRoot>> {
-        let _load_guard = self
-            .load_gate
-            .lock()
-            .map_err(|_| invalid("load gate poisoned"))?;
-        let mut spec = registration::prepare_or_resolve_spec(requested_root)?;
-        if self.local_oneshot {
-            spec.policy.background_enabled = false;
-        }
-        let loaded = ManagedRoot::load(spec.clone())?;
-        let mut guard = self
+    fn loaded_root(&self, requested_root: &Path) -> Result<Option<Arc<ManagedRoot>>> {
+        let requested = requested_root.canonicalize()?;
+        let guard = self
             .roots
             .lock()
             .map_err(|_| invalid("hub mutex poisoned"))?;
-        if let Some(old) = guard.insert(spec.root, Arc::clone(&loaded)) {
-            old.shutdown();
-        }
-        Ok(loaded)
+        Ok(guard
+            .iter()
+            .filter(|(root, _)| requested.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, managed)| Arc::clone(managed)))
     }
 
     fn record_trace(&self, trace: Value) {
@@ -356,7 +349,7 @@ impl DaemonHub {
                     .get("wait")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                let managed = self.reload_root(root_path)?;
+                let managed = self.get_or_load_root(root_path)?;
                 managed.sync(wait)
             }
             "test_invalidate" => {
@@ -383,8 +376,10 @@ impl DaemonHub {
                     .root
                     .as_deref()
                     .ok_or_else(|| invalid("test_cancel requires a workspace root"))?;
-                let managed = self.get_or_load_root(root_path)?;
-                Ok(json!({"cancelled": managed.cancel_active()}))
+                let cancelled = self
+                    .loaded_root(root_path)?
+                    .is_some_and(|managed| managed.cancel_active());
+                Ok(json!({"cancelled": cancelled}))
             }
             "test_graph" => {
                 let root_path = req
@@ -709,6 +704,7 @@ pub fn native_bridge(mut input: impl Read, mut output: impl Write) -> Result<()>
     if magic != FRAMED_JSON_MAGIC {
         return Err(invalid("native bridge requires TCTXJ1 framed IPC").into());
     }
+
     loop {
         let mut len_buf = [0u8; 4];
         match input.read_exact(&mut len_buf) {
@@ -731,5 +727,20 @@ pub fn native_bridge(mut input: impl Read, mut output: impl Write) -> Result<()>
         output.write_all(&u32::try_from(bytes.len())?.to_be_bytes())?;
         output.write_all(&bytes)?;
         output.flush()?;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_connection_guard_releases_exactly_one_slot() {
+        let count = Arc::new(AtomicUsize::new(1));
+        {
+            let _guard = ActiveConnection(Arc::clone(&count));
+            assert_eq!(count.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(count.load(Ordering::Acquire), 0);
     }
 }

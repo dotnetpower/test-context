@@ -159,3 +159,77 @@ The final audit checked snapshot stability, environment identity, fork safety, i
 4. Runtime audit dependencies were initially assigned batch-wide; changed to nodeid-specific attribution.
 
 After repair, all Rust tests, strict Clippy (`-D warnings`), TypeScript compilation, ESLint, Node tests, WAL restart, source-race rejection, process-group cancellation, and 320 paired AKS Store Demo observations pass. No known Critical, High, or Medium finding remains.
+
+---
+
+## Additional Hardening Rounds 12–16
+
+### Round 12 — Linearizable freshness and sync safety (10 criteria)
+
+1. Restored a target-dependency metadata barrier on every `test_run`; watcher delivery is no longer assumed to precede an immediate request.
+2. Kept the 60-second full metadata safety scan for missed membership events.
+3. Added `ctime_sec` and `ctime_nsec` to file stamps, complementing mtime, size, and inode.
+4. Kept live SHA-256 verification when a stamp changes.
+5. Prevented `test_sync` from replacing a `ManagedRoot` while a test is executing.
+6. Reused the existing root for sync so in-flight singleflight/resource state is preserved.
+7. Changed `test_cancel` to act only on an already loaded root; cancellation never cold-loads a workspace.
+8. Retained post-execution `dep_hash` verification and explicit `SOURCE_CHANGED_DURING_TEST`.
+9. Added environment identity revalidation every 60 seconds.
+10. Added generation, watcher event, safety-scan age, and environment-check age diagnostics.
+
+### Round 13 — Zygote lifecycle and bounded output (11 criteria)
+
+1. Replaced unbounded `memfd` output growth with concurrently drained bounded stdout/stderr pipes.
+2. Bounded each captured stream at 2 MiB while continuing to drain overflow to avoid child deadlock.
+3. Added `PR_SET_PDEATHSIG=SIGKILL` to the Zygote launched by Rust.
+4. Added `PR_SET_PDEATHSIG` to each pytest fork child.
+5. Closed the parent-death race by checking `getppid()` immediately after `prctl`.
+6. Added an RLIMIT_CPU safety ceiling derived from the configured timeout.
+7. Added active-PGID RAII cleanup on every Rust error path.
+8. Added Zygote liveness checks through `try_wait()`.
+9. Added automatic Zygote recycling after 200 child runs.
+10. Added cancellation tracking for subprocess fallback, not just fork children.
+11. Added a multi-megabyte stdout integration test proving bounded response size and no pipe deadlock.
+
+### Round 14 — WAL crash recovery and cache semantics (10 criteria)
+
+1. Bumped cache schema to v5.
+2. Added monotonic WAL sequence numbers.
+3. Added SHA-256 checksum verification for every WAL event.
+4. Isolated WAL filenames by schema version.
+5. Preserved the valid prefix of a crash-truncated final line.
+6. Truncated a damaged tail under exclusive lock before appending new events.
+7. Added directory fsync after atomic snapshot rename.
+8. Added WAL sequence, bytes, snapshot bytes, and record counts to status.
+9. Prevented caching files containing any skipped tests, not only all-skipped files.
+10. Added a test that recovers a valid prefix, repairs the tail, appends a new record, reloads both records, and compacts atomically.
+
+### Round 15 — Daemon concurrency and operational controls (10 criteria)
+
+1. Added starvation prevention: shortest-first scheduling uses every fourth batch for the longest queued tests.
+2. Preserved recent-edit LIFO priority before duration scheduling.
+3. Added watcher generation and drained-event counters.
+4. Added background batch counters and load-deferral diagnostics.
+5. Added connection-slot RAII unit coverage.
+6. Added module-level deny-marker policy tests.
+7. Added module-level resource-key extraction tests.
+8. Added a configurable `--background-max-load-ratio`; deterministic benchmarks explicitly use 200%.
+9. Removed eager initial full-suite background warming; speculative execution now follows actual edits or explicit invalidation/sync.
+10. Added process-group registry support so opt-in parallel delta children can all be cancelled.
+
+### Round 16 — Final 12+ criteria audit (13 criteria)
+
+The final repeated audit covered immediate-save freshness, sync/run concurrency, parent/child lifecycle, bounded output, timeout/cancellation distinction, WAL prefix recovery, WAL repair-and-append, background authorization, resource conflicts, starvation, plugin identity caching, large-repository cache-hit cost, and exact-binary benchmark provenance.
+
+It found and fixed these additional defects:
+
+1. A killed child whose result pipe closed before `waitpid` could be mislabeled as timeout.
+2. Subprocess fallback was not included in active process-group cancellation.
+3. Parallel opt-in workers needed a multi-PGID cancellation registry.
+4. A truncated WAL tail was detected but not removed before later appends.
+5. Module-level deny/resource markers were initially read only from function markers.
+6. Eager small-suite warmup made cold benchmark behavior nondeterministic.
+7. Runtime identity and plugin entry-point discovery used duplicate Python subprocesses; they now share a 60-second identity cache.
+8. Large-workspace cache hits unnecessarily recomputed preload module lists; that work now happens only when tests execute.
+
+All strict Clippy, Rust unit/integration/doc tests, Python benchmark artifact tests, TypeScript compile, ESLint, Node tests, clean-target checks, and paired benchmark parity checks pass. No known Critical, High, or Medium issue remains.

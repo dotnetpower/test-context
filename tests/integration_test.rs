@@ -88,6 +88,7 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     .unwrap();
 
     let managed = ManagedRoot::load(spec).unwrap();
+    managed.invalidate(&[]).unwrap();
 
     // 1. Check AST graph & affected analysis for `src/pkg/math_ops.py`
     let affected = managed
@@ -284,5 +285,22 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     }
     let cancelled = cancel_handle.join().unwrap().unwrap_err().to_string();
     assert!(cancelled.contains("TEST_CANCELLED"), "{cancelled}");
+
+    // 11. Multi-megabyte stdout is drained without deadlock and bounded in the response.
+    write_file(
+        &repo,
+        "tests/test_noisy.py",
+        "def test_noisy():\n    print('x' * (3 * 1024 * 1024))\n    assert True\n",
+    );
+    let noisy = unstable_root
+        .run_tests(&TestRunRequest {
+            targets: vec!["tests/test_noisy.py".to_string()],
+            no_cache: true,
+            pytest_args: vec!["-s".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap();
+    assert_eq!(noisy.status, "passed");
+    assert!(noisy.stdout_summary.len() < 12_000);
     unstable_root.shutdown();
 }
