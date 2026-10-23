@@ -379,60 +379,6 @@ impl RootCache {
         )
     }
 
-    fn persisted_snapshot_sequence(root: &Path) -> u64 {
-        Self::storage_path(root)
-            .ok()
-            .and_then(|path| std::fs::File::open(path).ok())
-            .and_then(|file| {
-                let mut bytes = Vec::new();
-                file.take(16 * 1024 * 1024)
-                    .read_to_end(&mut bytes)
-                    .ok()
-                    .map(|_| bytes)
-            })
-            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
-            .filter(|cache| cache.schema == current_cache_schema() && cache.root == root)
-            .map(|cache| cache.wal_sequence)
-            .unwrap_or(0)
-    }
-
-    fn inspect_persisted_wal(root: &Path, wal_path: &Path) -> (u64, u64, bool) {
-        let mut sequence = Self::persisted_snapshot_sequence(root);
-        let Ok(file) = std::fs::File::open(wal_path) else {
-            return (sequence, 0, false);
-        };
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        let mut valid_bytes = 0u64;
-        let mut total = 0usize;
-        loop {
-            line.clear();
-            let Ok(read) = reader.read_line(&mut line) else {
-                return (sequence, valid_bytes, true);
-            };
-            if read == 0 {
-                return (sequence, valid_bytes, false);
-            }
-            total = total.saturating_add(read);
-            if total > 64 * 1024 * 1024 {
-                return (sequence, valid_bytes, true);
-            }
-            let Ok(envelope) = serde_json::from_str::<CacheWalEnvelope>(&line) else {
-                return (sequence, valid_bytes, true);
-            };
-            let Ok(event_bytes) = serde_json::to_vec(&envelope.event) else {
-                return (sequence, valid_bytes, true);
-            };
-            if envelope.sequence != sequence.saturating_add(1)
-                || sha256_hex(&event_bytes) != envelope.checksum
-            {
-                return (sequence, valid_bytes, true);
-            }
-            sequence = envelope.sequence;
-            valid_bytes = valid_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-        }
-    }
-
     pub fn load_or_new(root: &Path) -> Self {
         let Ok(lock_path) = Self::lock_path(root) else {
             return Self::new(root.to_path_buf());
@@ -448,6 +394,10 @@ impl RootCache {
         if let Some(ref lf) = lock_file {
             let _ = lf.lock_shared();
         }
+        Self::load_unlocked(root)
+    }
+
+    fn load_unlocked(root: &Path) -> Self {
         let mut cache = Self::storage_path(root)
             .ok()
             .and_then(|path| std::fs::File::open(path).ok())
@@ -545,27 +495,32 @@ impl RootCache {
             .mode(0o600)
             .open(&lock_path)?;
         lock_file.lock_exclusive()?;
-        let wal_path = Self::wal_path(&self.root)?;
-        let (persisted_sequence, persisted_valid_bytes, persisted_needs_repair) =
-            Self::inspect_persisted_wal(&self.root, &wal_path);
-        let concurrent_writes = persisted_sequence != self.wal_sequence;
         self.pending_events.push(CacheWalEvent::Metrics {
             total_saved_ms: self.total_saved_ms,
             total_cache_hits: self.total_cache_hits,
             total_delta_runs: self.total_delta_runs,
             total_background_runs: self.total_background_runs,
         });
+        let pending_events = std::mem::take(&mut self.pending_events);
+        let mut durable = Self::load_unlocked(&self.root);
+        for event in pending_events.iter().cloned() {
+            durable.apply_wal_event(event);
+        }
+        durable.pending_events = pending_events;
+        *self = durable;
+
+        let wal_path = Self::wal_path(&self.root)?;
         {
             let mut options = std::fs::OpenOptions::new();
             options.create(true).read(true).write(true);
             let mut wal = options.mode(0o600).open(&wal_path)?;
-            if persisted_needs_repair {
-                wal.set_len(persisted_valid_bytes)?;
+            if self.wal_needs_repair {
+                wal.set_len(self.wal_valid_bytes)?;
                 wal.sync_data()?;
             }
             self.wal_needs_repair = false;
             wal.seek(std::io::SeekFrom::End(0))?;
-            let mut next_sequence = persisted_sequence.saturating_add(1);
+            let mut next_sequence = self.wal_sequence.saturating_add(1);
             for event in &self.pending_events {
                 let event_bytes = serde_json::to_vec(event)?;
                 let envelope = CacheWalEnvelope {
@@ -584,7 +539,7 @@ impl RootCache {
         self.pending_events.clear();
 
         let wal_bytes = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-        if wal_bytes > 16 * 1024 * 1024 && !concurrent_writes {
+        if wal_bytes > 16 * 1024 * 1024 {
             self.compact_snapshot(&wal_path)?;
         }
         Ok(())
@@ -888,6 +843,9 @@ mod tests {
         concurrent_b.insert(fourth, &MemoryPolicy::default());
         concurrent_a.save().unwrap();
         concurrent_b.save().unwrap();
+        concurrent_a.record_invocation(&["tests/test_three.py".to_string()]);
+        concurrent_a.save().unwrap();
+        concurrent_a.compact_snapshot(&wal_path).unwrap();
         let mut merged = RootCache::load_or_new(&root);
         assert!(
             merged
