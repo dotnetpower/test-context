@@ -1,0 +1,407 @@
+{
+  "name": "test-context-native",
+  "displayName": "Test Context",
+  "description": "Fast incremental Python AST dependency graph, speculative background pytest runner, and zero-startup test result cache for AI coding agents.",
+  "version": "0.1.0",
+  "publisher": "moonchoi",
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "preview": true,
+  "galleryBanner": {
+    "color": "#0B1220",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dotnetpower/test-context.git",
+    "directory": "vscode-extension"
+  },
+  "homepage": "https://github.com/dotnetpower/test-context/tree/main/vscode-extension#readme",
+  "bugs": {
+    "url": "https://github.com/dotnetpower/test-context/issues"
+  },
+  "engines": {
+    "vscode": "^1.140.0"
+  },
+  "extensionKind": [
+    "workspace",
+    "ui"
+  ],
+  "capabilities": {
+    "agentsWindow": {
+      "supported": true
+    },
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "categories": [
+    "AI",
+    "Testing",
+    "Other"
+  ],
+  "keywords": [
+    "copilot",
+    "language model tool",
+    "pytest",
+    "python",
+    "ast",
+    "rust",
+    "test context"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/src/extension.js",
+  "files": [
+    "out/src",
+    "prompts",
+    "resources/*.png",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "contributes": {
+    "chatInstructions": [
+      {
+        "path": "./prompts/test-context.instructions.md"
+      }
+    ],
+    "commands": [
+      {
+        "command": "testContextNative.gettingStarted",
+        "title": "Test Context: Getting Started",
+        "category": "Test Context",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "testContextNative.configureConnection",
+        "title": "Test Context: Configure Connection",
+        "category": "Test Context",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "testContextNative.showStatus",
+        "title": "Test Context: Show Native Tool Status",
+        "category": "Test Context"
+      },
+      {
+        "command": "testContextNative.selfTest",
+        "title": "Test Context: Run Native Tool Self-Test",
+        "category": "Test Context"
+      },
+      {
+        "command": "testContextNative.registerWorkspace",
+        "title": "Test Context: Register Current Workspace",
+        "category": "Test Context"
+      },
+      {
+        "command": "testContextNative.syncWorkspace",
+        "title": "Test Context: Sync AST Graph & Queue Background Tests",
+        "category": "Test Context"
+      }
+    ],
+    "configuration": {
+      "title": "Test Context Native",
+      "properties": {
+        "testContextNative.socketPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute test-context daemon socket path. Empty uses TCTX_HOME or ~/.local/state/test-context/daemon.sock."
+        },
+        "testContextNative.autoStartService": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start test-context.service through systemctl --user when the daemon socket is unavailable."
+        },
+        "testContextNative.wslDistribution": {
+          "type": "string",
+          "default": "",
+          "description": "Windows extension hosts: WSL distribution running the shared tctx daemon."
+        },
+        "testContextNative.wslExecutablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Windows extension hosts: absolute Linux tctx executable supporting native-bridge."
+        },
+        "testContextNative.autoRegisterWorkspace": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically register trusted Python workspaces on the first native test tool lookup."
+        },
+        "testContextNative.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute tctx executable path used for workspace registration. Empty uses ~/.local/bin/tctx."
+        },
+        "testContextNative.requestTimeoutMs": {
+          "type": "number",
+          "default": 180000,
+          "minimum": 5000,
+          "maximum": 600000,
+          "description": "Native tool request timeout in milliseconds."
+        }
+      }
+    },
+    "languageModelTools": [
+      {
+        "name": "test-context-native_testRun",
+        "toolReferenceName": "tctxNativeRun",
+        "displayName": "Test Context: Incremental Pytest Run",
+        "modelDescription": "Use this FIRST instead of running shell pytest in a registered Python workspace. Resolves target test files or expands modified Python source files through the Rust AST reverse dependency graph, verifies live SHA-256 Merkle dependency hashes (dep_hash), skips tests that already passed in the background worker, joins in-flight background runs, and runs only the uncached delta. Returns instant results (< 5ms) when all targeted tests are already cached green.",
+        "userDescription": "Run pytest incrementally using the Rust AST dependency graph and background test cache.",
+        "tags": [
+          "test",
+          "pytest",
+          "python",
+          "ast",
+          "cache",
+          "native",
+          "test-context"
+        ],
+        "canBeReferencedInPrompt": true,
+        "icon": "$(beaker)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional absolute registered workspace root. Omit for the current workspace."
+            },
+            "targets": {
+              "type": "array",
+              "maxItems": 128,
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional relative test file paths, test directories, pytest nodeids (path::test_name), or modified Python source file paths. Omit to target all workspace tests."
+            },
+            "k": {
+              "type": "string",
+              "description": "Optional pytest -k expression filter."
+            },
+            "mark": {
+              "type": "string",
+              "description": "Optional pytest -m marker filter."
+            },
+            "rerun_failed": {
+              "type": "boolean",
+              "default": true,
+              "description": "Re-run tests whose cached result for the current dep_hash was failed."
+            },
+            "no_cache": {
+              "type": "boolean",
+              "default": false,
+              "description": "Bypass cached pass results and force pytest execution."
+            },
+            "pytest_args": {
+              "type": "array",
+              "maxItems": 32,
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional additional pytest CLI flags."
+            }
+          }
+        }
+      },
+      {
+        "name": "test-context-native_testAffected",
+        "toolReferenceName": "tctxNativeAffected",
+        "displayName": "Test Context: Affected Tests",
+        "modelDescription": "Use this FIRST to discover which pytest test files are impacted by modified Python source files or git working-tree changes via the Rust AST reverse dependency graph, along with each test file's dependency chain and live background cache status (cached_passed, cached_failed, running_in_background, queued_in_background, uncached).",
+        "userDescription": "Find pytest files affected by source changes and inspect their background cache status.",
+        "tags": [
+          "test",
+          "pytest",
+          "ast",
+          "affected",
+          "native",
+          "test-context"
+        ],
+        "canBeReferencedInPrompt": true,
+        "icon": "$(references)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional absolute registered workspace root."
+            },
+            "files": {
+              "type": "array",
+              "maxItems": 128,
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional relative paths of modified Python or config files. Omit to use git dirty files when git_diff=true."
+            },
+            "git_diff": {
+              "type": "boolean",
+              "default": true,
+              "description": "Use git working-tree dirty files when files is empty."
+            }
+          }
+        }
+      },
+      {
+        "name": "test-context-native_testGraph",
+        "toolReferenceName": "tctxNativeGraph",
+        "displayName": "Test Context: AST Dependency Graph",
+        "modelDescription": "Inspect the Python AST dependency graph for a specific Python source or test file: direct imports, reverse importers, transitive dependencies, conftest.py chain, affected test files, test symbols, fixtures, and Merkle dep_hash.",
+        "userDescription": "Inspect the Python AST import and fixture dependency graph for a file.",
+        "tags": [
+          "test",
+          "ast",
+          "graph",
+          "python",
+          "native",
+          "test-context"
+        ],
+        "canBeReferencedInPrompt": true,
+        "icon": "$(type-hierarchy)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional absolute registered workspace root."
+            },
+            "file": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Relative path to the Python file within the workspace."
+            }
+          },
+          "required": [
+            "file"
+          ]
+        }
+      },
+      {
+        "name": "test-context-native_testStatus",
+        "toolReferenceName": "tctxNativeStatus",
+        "displayName": "Test Context: Status",
+        "modelDescription": "Show test-context daemon health, AST graph file counts, cached pass/fail counts, background worker queue status, and cumulative time saved.",
+        "userDescription": "Show test-context daemon and background cache status.",
+        "tags": [
+          "status",
+          "test-context"
+        ],
+        "canBeReferencedInPrompt": true,
+        "icon": "$(pulse)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional absolute registered workspace root."
+            }
+          }
+        }
+      },
+      {
+        "name": "test-context-native_testSync",
+        "toolReferenceName": "tctxNativeSync",
+        "displayName": "Test Context: Sync AST & Background Queue",
+        "modelDescription": "Synchronize the Python AST dependency graph with saved files on disk and queue any uncached or modified tests for background execution. Set wait=true to wait for background execution to finish.",
+        "userDescription": "Synchronize the Python AST dependency graph and trigger background test runs.",
+        "tags": [
+          "sync",
+          "test",
+          "test-context"
+        ],
+        "canBeReferencedInPrompt": true,
+        "icon": "$(sync)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional absolute registered workspace root."
+            },
+            "wait": {
+              "type": "boolean",
+              "default": false,
+              "description": "Wait for queued background test runs to finish before returning."
+            }
+          }
+        }
+      },
+      {
+        "name": "test-context-native_testInvalidate",
+        "toolReferenceName": "tctxNativeInvalidate",
+        "displayName": "Test Context: Invalidate Test Cache",
+        "modelDescription": "Invalidate cached test results for specific test/source files (or the entire workspace when files is omitted) and schedule background re-execution.",
+        "userDescription": "Invalidate cached pytest results and trigger background re-execution.",
+        "tags": [
+          "cache",
+          "test",
+          "test-context"
+        ],
+        "canBeReferencedInPrompt": true,
+        "icon": "$(clear-all)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {
+              "type": "string",
+              "description": "Optional absolute registered workspace root."
+            },
+            "files": {
+              "type": "array",
+              "maxItems": 128,
+              "items": {
+                "type": "string"
+              },
+              "description": "Optional relative test or source file paths to invalidate. Omit to invalidate all cached results in the workspace."
+            }
+          }
+        }
+      },
+      {
+        "name": "test-context-native_testWorkspaces",
+        "toolReferenceName": "tctxNativeWorkspaces",
+        "displayName": "Test Context: Registered Workspaces",
+        "modelDescription": "List explicitly registered test-context workspace roots, scopes, globs, and detected pytest commands.",
+        "userDescription": "List registered test-context workspaces.",
+        "tags": [
+          "workspace",
+          "test-context"
+        ],
+        "canBeReferencedInPrompt": true,
+        "icon": "$(root-folder)",
+        "inputSchema": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {}
+        }
+      }
+    ]
+  },
+  "scripts": {
+    "clean": "node ./scripts/clean.mjs",
+    "compile": "tsc -p ./",
+    "check": "tsc -p ./ --noEmit",
+    "lint": "eslint .",
+    "test": "npm run compile && node --test out/test/**/*.test.js",
+    "package": "npm run clean && npm run lint && npm test && vsce package --out dist/test-context-native.vsix",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.19.0",
+    "@types/vscode": "^1.140.0",
+    "@vscode/vsce": "^4.0.0",
+    "eslint": "^10.13.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.71.2"
+  }
+}

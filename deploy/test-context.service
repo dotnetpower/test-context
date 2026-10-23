@@ -1,0 +1,25 @@
+[Unit]
+Description=Shared local Rust incremental pytest dependency graph and background test cache
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/tctx daemon
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+KillMode=mixed
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+TasksMax=96
+LimitNOFILE=16384
+MemoryAccounting=yes
+CPUWeight=30
+IOAccounting=yes
+IOWeight=20
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+/target/
+/logs/
+/scripts/__pycache__/
+__pycache__/
+*.py[cod]
+/.ruff_cache/
+/.pytest_cache/
+/vscode-extension/node_modules/
+/vscode-extension/out/
+/vscode-extension/dist/
+.env
+.env.*
+!.env.example
+*.vsix
+*.perf.data
+*.perf.data.old

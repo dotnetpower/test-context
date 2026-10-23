@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="480" viewBox="0 0 1440 480">
+  <defs>
+    <linearGradient id="background" x2="1" y2="1">
+      <stop stop-color="#111f33"/>
+      <stop offset="1" stop-color="#080f1d"/>
+    </linearGradient>
+    <linearGradient id="accent" x2="1" y2="1">
+      <stop stop-color="#54ead2"/>
+      <stop offset="1" stop-color="#7795ff"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0v32" fill="none" stroke="#24344b" stroke-width="1" opacity=".3"/>
+    </pattern>
+  </defs>
+  <rect width="1440" height="480" rx="28" fill="url(#background)"/>
+  <rect width="1440" height="480" rx="28" fill="url(#grid)"/>
+  <rect x="56" y="59" width="49" height="5" rx="2.5" fill="#54ead2"/>
+  <text x="56" y="105" font-family="DejaVu Sans,sans-serif" font-size="18" font-weight="bold" letter-spacing="4" fill="#92a7c6">LOCAL CONTEXT. LESS FRICTION.</text>
+  <text x="50" y="202" font-family="DejaVu Sans,sans-serif" font-size="76" font-weight="bold" letter-spacing="-3" fill="#edf4ff">Code Context</text>
+  <text x="56" y="260" font-family="DejaVu Sans,sans-serif" font-size="28" fill="#b1c2db">The right code, ready for your AI agent.</text>
+  <text x="56" y="306" font-family="DejaVu Sans,sans-serif" font-size="21" fill="#8da3c1">Search, read, and gather context without leaving your machine.</text>
+  <rect x="56" y="354" width="150" height="39" rx="19.5" fill="#193b40" stroke="#2e665e"/>
+  <text x="79" y="380" font-family="DejaVu Sans,sans-serif" font-size="16" fill="#90efd9">Native tools</text>
+  <rect x="219" y="354" width="151" height="39" rx="19.5" fill="#182b44" stroke="#334b6b"/>
+  <text x="242" y="380" font-family="DejaVu Sans,sans-serif" font-size="16" fill="#bbd0f5">Shared cache</text>
+  <rect x="383" y="354" width="164" height="39" rx="19.5" fill="#222746" stroke="#46466a"/>
+  <text x="406" y="380" font-family="DejaVu Sans,sans-serif" font-size="16" fill="#c9c8ff">Your boundaries</text>
+  <rect x="832" y="78" width="548" height="324" rx="18" fill="#0b1423" stroke="#304561" stroke-width="2"/>
+  <path d="M832 126h548" stroke="#243a55" stroke-width="2"/>
+  <circle cx="860" cy="102" r="5" fill="#4c6689"/>
+  <circle cx="879" cy="102" r="5" fill="#4c6689"/>
+  <circle cx="898" cy="102" r="5" fill="#54ead2"/>
+  <text x="933" y="108" font-family="DejaVu Sans Mono,monospace" font-size="15" fill="#8da3c1">saved source / local index</text>
+  <path d="m873 162-15 15 15 15m72-30 15 15-15 15" stroke="url(#accent)" stroke-width="5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="989" y="183" font-family="DejaVu Sans Mono,monospace" font-size="21" fill="#e4edfc">context</text>
+  <rect x="860" y="219" width="491" height="45" rx="8" fill="#162b3c"/>
+  <rect x="860" y="219" width="4" height="45" rx="2" fill="#54ead2"/>
+  <text x="880" y="247" font-family="DejaVu Sans Mono,monospace" font-size="17" fill="#8fead5">src/feature.ts : matching lines</text>
+  <path d="M880 290h183m-183 24h290m-290 24h232" stroke="#354e6c" stroke-width="8" stroke-linecap="round"/>
+  <rect x="1194" y="314" width="127" height="36" rx="18" fill="#183b3b"/>
+  <circle cx="1215" cy="332" r="5" fill="#54ead2"/>
+  <text x="1230" y="338" font-family="DejaVu Sans Mono,monospace" font-size="14" fill="#a0eedb">native</text>
+</svg>
