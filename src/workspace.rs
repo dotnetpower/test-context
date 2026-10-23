@@ -405,6 +405,21 @@ pub struct BoundedOutput {
     pub cancelled: bool,
 }
 
+fn drain_bounded(mut reader: impl Read, max_output_bytes: usize) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(max_output_bytes.min(64 * 1024));
+    let mut chunk = [0_u8; 64 * 1024];
+    while let Ok(read) = reader.read(&mut chunk) {
+        if read == 0 {
+            break;
+        }
+        let remaining = max_output_bytes.saturating_sub(kept.len());
+        if remaining > 0 {
+            kept.extend_from_slice(&chunk[..read.min(remaining)]);
+        }
+    }
+    kept
+}
+
 pub fn run_command_with_timeout(
     command: &mut Command,
     timeout: Duration,
@@ -464,20 +479,8 @@ pub fn run_command_with_timeout_tracked(
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let stderr_pipe = child.stderr.take().expect("piped stderr");
 
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe
-            .take(max_output_bytes as u64)
-            .read_to_end(&mut buf);
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe
-            .take(max_output_bytes as u64)
-            .read_to_end(&mut buf);
-        buf
-    });
+    let stdout_handle = std::thread::spawn(move || drain_bounded(stdout_pipe, max_output_bytes));
+    let stderr_handle = std::thread::spawn(move || drain_bounded(stderr_pipe, max_output_bytes));
 
     let mut timed_out = false;
     let status = loop {
@@ -511,4 +514,18 @@ pub fn run_command_with_timeout_tracked(
         structured: None,
         cancelled: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_output_drains_excess_without_signalling_child() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "head -c 1048576 /dev/zero"]);
+        let output = run_command_with_timeout(&mut command, Duration::from_secs(5), 1024).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 1024);
+    }
 }
