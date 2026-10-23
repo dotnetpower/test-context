@@ -4,6 +4,7 @@ use crate::{Result, invalid};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::{BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,34 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_ZYGOTE_FRAME: usize = 4 * 1024 * 1024;
+const ZYGOTE_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn wait_readable(fd: i32, timeout: Duration, context: &str) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(invalid(format!("{context} timed out")).into());
+        }
+        let timeout_ms = i32::try_from(remaining.as_millis().max(1)).unwrap_or(i32::MAX);
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, timeout_ms) };
+        if ready > 0 {
+            return Ok(());
+        }
+        if ready == 0 {
+            return Err(invalid(format!("{context} timed out")).into());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+    }
+}
 
 struct ActivePgidGuard<'a>(&'a AtomicI32);
 
@@ -506,6 +535,15 @@ impl PytestZygote {
             .ok_or_else(|| invalid("missing zygote stdout"))?;
         let mut stdout = BufReader::new(stdout_pipe);
         let mut banner = String::new();
+        if let Err(error) = wait_readable(
+            stdout.get_ref().as_raw_fd(),
+            ZYGOTE_STARTUP_TIMEOUT,
+            "zygote readiness handshake",
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         std::io::BufRead::read_line(&mut stdout, &mut banner)?;
         if banner.trim() != "TCTX_ZYGOTE_READY" {
             let _ = child.kill();
@@ -812,6 +850,7 @@ pub fn resolve_python_bin(pytest_cmd: &[String]) -> PathBuf {
         if name.starts_with("python") {
             return first_path.to_path_buf();
         }
+
         if let Some(parent) = first_path.parent() {
             for candidate in ["python3", "python"] {
                 let py = parent.join(candidate);
@@ -822,4 +861,25 @@ pub fn resolve_python_bin(pytest_cmd: &[String]) -> PathBuf {
         }
     }
     PathBuf::from("python3")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn readable_wait_has_a_bounded_timeout() {
+        let (reader, _writer) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let error = wait_readable(
+            reader.as_raw_fd(),
+            Duration::from_millis(20),
+            "test readiness",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("test readiness timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }
