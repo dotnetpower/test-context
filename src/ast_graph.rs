@@ -720,6 +720,10 @@ impl DependencyGraph {
     /// Returns safe 3rd-party packages imported across the workspace that can be pre-imported in the Warm Pytest Zygote
     /// without touching any workspace-local Python module.
     pub fn external_preload_modules(&self) -> Vec<String> {
+        self.external_preload_modules_for_tests(&self.test_files())
+    }
+
+    pub fn external_preload_modules_for_tests(&self, test_files: &[String]) -> Vec<String> {
         let mut local_roots = BTreeSet::new();
         for path in self.files.keys() {
             if !path.ends_with(".py") {
@@ -746,7 +750,15 @@ impl DependencyGraph {
             "pytest_cov",
         ];
         let mut externals = BTreeSet::new();
-        for node in self.files.values() {
+        let mut relevant_paths = BTreeSet::new();
+        for test_file in test_files {
+            relevant_paths.insert(test_file.clone());
+            relevant_paths.extend(self.transitive_deps_for(test_file));
+        }
+        for path in relevant_paths {
+            let Some(node) = self.files.get(&path) else {
+                continue;
+            };
             for spec in &node.parsed.imports {
                 if spec.level > 0 || spec.module.is_empty() {
                     continue;

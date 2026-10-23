@@ -19,6 +19,7 @@ pub struct MemoryPolicy {
     pub background_safe_only: bool,
     pub background_max_load_ratio_percent: usize,
     pub parallel_delta_enabled: bool,
+    pub predictive_background_enabled: bool,
 }
 
 impl Default for MemoryPolicy {
@@ -38,6 +39,7 @@ impl Default for MemoryPolicy {
             background_safe_only: true,
             background_max_load_ratio_percent: 75,
             parallel_delta_enabled: false,
+            predictive_background_enabled: true,
         }
     }
 }

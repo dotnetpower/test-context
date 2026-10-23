@@ -353,6 +353,10 @@ while True:
                     continue
                 if not chunk:
                     open_fds.pop(fd, None)
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                     continue
                 target = open_fds[fd]
                 current = sum(map(len, target))
@@ -637,6 +641,10 @@ impl PytestZygote {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 impl Drop for PytestZygote {
@@ -651,6 +659,7 @@ pub struct ZygoteManager {
     disabled_until: Option<Instant>,
     last_error: Option<String>,
     active_pgid: Arc<AtomicI32>,
+    last_used: Option<Instant>,
 }
 
 impl Default for ZygoteManager {
@@ -661,6 +670,7 @@ impl Default for ZygoteManager {
             disabled_until: None,
             last_error: None,
             active_pgid: Arc::new(AtomicI32::new(0)),
+            last_used: None,
         }
     }
 }
@@ -715,6 +725,7 @@ impl ZygoteManager {
             parallel_pgids,
         ) {
             Ok(output) => {
+                self.last_used = Some(Instant::now());
                 self.failures = 0;
                 self.last_error = None;
                 Ok(output)
@@ -732,6 +743,14 @@ impl ZygoteManager {
     }
 
     pub fn status(&self) -> serde_json::Value {
+        let (pid, rss_bytes) = self
+            .zygote
+            .as_ref()
+            .map(|zygote| {
+                let pid = zygote.pid();
+                (Some(pid), process_rss_bytes(pid))
+            })
+            .unwrap_or((None, None));
         serde_json::json!({
             "ready": self.zygote.is_some(),
             "failures": self.failures,
@@ -740,6 +759,9 @@ impl ZygoteManager {
             "active_pgid": self.active_pgid.load(Ordering::Acquire),
             "plugin_errors": self.zygote.as_ref().map(|zygote| &zygote.plugin_errors),
             "runs": self.zygote.as_ref().map(|zygote| zygote.runs).unwrap_or(0),
+            "pid": pid,
+            "rss_bytes": rss_bytes,
+            "idle_ms": self.last_used.map(|last| u64::try_from(last.elapsed().as_millis()).unwrap_or(u64::MAX)),
         })
     }
 
@@ -751,6 +773,26 @@ impl ZygoteManager {
         let result = unsafe { libc::kill(-pgid, libc::SIGKILL) };
         result == 0
     }
+
+    pub fn shutdown_if_idle(&mut self, timeout: Duration) -> bool {
+        if self
+            .last_used
+            .is_some_and(|last_used| last_used.elapsed() >= timeout)
+            && self.active_pgid.load(Ordering::Acquire) == 0
+        {
+            self.zygote = None;
+            self.last_used = None;
+            return true;
+        }
+        false
+    }
+}
+
+fn process_rss_bytes(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    kib.checked_mul(1024)
 }
 
 pub fn cancel_process_group(active_pgid: &AtomicI32) -> bool {

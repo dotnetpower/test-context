@@ -130,6 +130,10 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     assert_eq!(run1.executed_files_count, 0);
     assert_eq!(run1.passed, 3);
     assert_eq!(run1.failed, 0);
+    assert_eq!(
+        managed.status()["cache_storage"]["invocation_patterns"].as_u64(),
+        Some(1)
+    );
 
     // 4. Modify `src/pkg/math_ops.py` and immediately invoke `run_tests` (before background finishes or with hybrid delta)
     write_file(
@@ -180,6 +184,11 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         .unwrap_err()
         .to_string();
     assert!(no_match.contains("NO_TESTS_MATCHED"), "{no_match}");
+    assert_eq!(
+        managed.status()["cache_storage"]["invocation_patterns"].as_u64(),
+        Some(1),
+        "nodeid and failed target requests must not be learned"
+    );
 
     // 6. Modify referenced JSON data file `config/settings.json` -> must invalidate `tests/test_isolated.py`!
     write_file(

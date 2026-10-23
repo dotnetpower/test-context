@@ -235,9 +235,17 @@ def timed(operation):
 
 
 @contextmanager
-def daemon_session(executable: Path, pytest_bin: Path, root: Path, home: Path):
+def daemon_session(
+    executable: Path,
+    pytest_bin: Path,
+    root: Path,
+    home: Path,
+    extra_env: dict[str, str] | None = None,
+):
     env = os.environ.copy()
     env.update(TCTX_HOME=str(home), TCTX_PYTEST_BIN=str(pytest_bin))
+    if extra_env:
+        env.update(extra_env)
     command(
         [
             str(executable),

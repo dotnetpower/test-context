@@ -163,20 +163,35 @@ impl DaemonHub {
     }
 
     fn shutdown_all(&self) {
-        if let Ok(mut guard) = self.roots.lock() {
-            for (_, root) in guard.iter() {
-                root.shutdown();
-            }
-            guard.clear();
+        let roots = self
+            .roots
+            .lock()
+            .map(|mut guard| {
+                std::mem::take(&mut *guard)
+                    .into_values()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for root in roots {
+            root.shutdown();
         }
     }
 
     fn evict_idle_or_excess_roots(&self) {
         let mut evicted = Vec::new();
+        let roots = self
+            .roots
+            .lock()
+            .map(|guard| guard.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for root in roots {
+            root.reclaim_idle_zygote();
+            root.flush_pending_cache();
+        }
         if let Ok(mut guard) = self.roots.lock() {
             let idle_keys: Vec<PathBuf> = guard
                 .iter()
-                .filter(|(_, r)| r.last_activity_elapsed() >= IDLE_ROOT_TIMEOUT)
+                .filter(|(_, r)| r.is_evictable() && r.last_activity_elapsed() >= IDLE_ROOT_TIMEOUT)
                 .map(|(k, _)| k.clone())
                 .collect();
             for k in idle_keys {
@@ -187,6 +202,7 @@ impl DaemonHub {
             while guard.len() >= MAX_RESIDENT_ROOTS {
                 let oldest_key = guard
                     .iter()
+                    .filter(|(_, r)| r.is_evictable())
                     .max_by_key(|(_, r)| r.last_activity_elapsed())
                     .map(|(k, _)| k.clone());
                 if let Some(k) = oldest_key
@@ -613,7 +629,6 @@ pub fn serve() -> Result<()> {
             Err(TrySendError::Disconnected(_)) => break,
         }
     }
-    hub.shutdown_all();
     drop(connection_tx);
     let deadline = Instant::now() + Duration::from_secs(10);
     while active_connections.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
@@ -625,6 +640,7 @@ pub fn serve() -> Result<()> {
     for handle in connection_workers {
         let _ = handle.join();
     }
+    hub.shutdown_all();
     drop(listener);
     let _ = std::fs::remove_file(&sock_path);
     Ok(())

@@ -74,7 +74,14 @@ pub struct CachedTestRecord {
 }
 
 fn current_cache_schema() -> u32 {
-    5
+    6
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InvocationPattern {
+    pub test_files: Vec<String>,
+    pub frequency: u64,
+    pub last_used_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,6 +99,8 @@ pub struct RootCache {
     pub quarantined_keys: BTreeSet<String>,
     #[serde(default)]
     pub persistence_error: Option<String>,
+    #[serde(default)]
+    pub invocation_patterns: BTreeMap<String, InvocationPattern>,
     #[serde(skip)]
     pending_events: Vec<CacheWalEvent>,
     #[serde(default)]
@@ -124,6 +133,10 @@ enum CacheWalEvent {
         total_delta_runs: u64,
         total_background_runs: u64,
     },
+    Invocation {
+        key: String,
+        pattern: InvocationPattern,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -146,6 +159,7 @@ impl RootCache {
             total_background_runs: 0,
             quarantined_keys: BTreeSet::new(),
             persistence_error: None,
+            invocation_patterns: BTreeMap::new(),
             pending_events: Vec::new(),
             wal_sequence: 0,
             wal_valid_bytes: 0,
@@ -262,6 +276,91 @@ impl RootCache {
         count
     }
 
+    pub fn record_invocation(&mut self, test_files: &[String]) {
+        if test_files.is_empty() || test_files.len() > 256 {
+            return;
+        }
+        let mut files = test_files.to_vec();
+        files.sort();
+        files.dedup();
+        let key = sha256_hex(files.join("\0").as_bytes());
+        let pattern = self
+            .invocation_patterns
+            .entry(key.clone())
+            .or_insert_with(|| InvocationPattern {
+                test_files: files,
+                frequency: 0,
+                last_used_unix_ms: 0,
+            });
+        pattern.frequency = pattern.frequency.saturating_add(1);
+        pattern.last_used_unix_ms = now_unix_ms();
+        let updated_pattern = pattern.clone();
+        if let Some(pending_pattern) = self.pending_events.iter_mut().rev().find_map(|event| {
+            if let CacheWalEvent::Invocation {
+                key: pending_key,
+                pattern,
+            } = event
+                && pending_key == &key
+            {
+                return Some(pattern);
+            }
+            None
+        }) {
+            *pending_pattern = updated_pattern;
+        } else {
+            self.pending_events.push(CacheWalEvent::Invocation {
+                key,
+                pattern: updated_pattern,
+            });
+        }
+        self.trim_invocation_patterns();
+    }
+
+    fn trim_invocation_patterns(&mut self) {
+        while self.invocation_patterns.len() > 128 {
+            let Some(oldest) = self
+                .invocation_patterns
+                .iter()
+                .min_by_key(|(_, pattern)| pattern.last_used_unix_ms)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.invocation_patterns.remove(&oldest);
+            self.pending_events.retain(|event| {
+                !matches!(
+                    event,
+                    CacheWalEvent::Invocation { key, .. } if key == &oldest
+                )
+            });
+        }
+    }
+
+    pub fn predicted_affected_tests(&self, affected: &[String]) -> Vec<String> {
+        let affected: BTreeSet<&str> = affected.iter().map(String::as_str).collect();
+        let mut scores: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        for pattern in self.invocation_patterns.values() {
+            for test_file in &pattern.test_files {
+                if affected.contains(test_file.as_str()) {
+                    let entry = scores.entry(test_file.clone()).or_insert((0, 0));
+                    entry.0 = entry.0.saturating_add(pattern.frequency);
+                    entry.1 = entry.1.max(pattern.last_used_unix_ms);
+                }
+            }
+        }
+        let mut ranked: Vec<_> = scores.into_iter().collect();
+        ranked.sort_by_key(|(_, (frequency, last_used))| {
+            (std::cmp::Reverse(*frequency), std::cmp::Reverse(*last_used))
+        });
+        ranked.into_iter().map(|(test_file, _)| test_file).collect()
+    }
+
+    pub fn was_invoked(&self, test_file: &str) -> bool {
+        self.invocation_patterns
+            .values()
+            .any(|pattern| pattern.test_files.iter().any(|path| path == test_file))
+    }
+
     fn storage_path(root: &Path) -> Result<PathBuf> {
         let root_hash = sha256_hex(root.to_string_lossy().as_bytes());
         Ok(catalog::cache_dir()?.join(format!("{root_hash}.json")))
@@ -278,6 +377,60 @@ impl RootCache {
             catalog::cache_dir()?
                 .join(format!("{root_hash}.v{}.wal.jsonl", current_cache_schema())),
         )
+    }
+
+    fn persisted_snapshot_sequence(root: &Path) -> u64 {
+        Self::storage_path(root)
+            .ok()
+            .and_then(|path| std::fs::File::open(path).ok())
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(16 * 1024 * 1024)
+                    .read_to_end(&mut bytes)
+                    .ok()
+                    .map(|_| bytes)
+            })
+            .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
+            .filter(|cache| cache.schema == current_cache_schema() && cache.root == root)
+            .map(|cache| cache.wal_sequence)
+            .unwrap_or(0)
+    }
+
+    fn inspect_persisted_wal(root: &Path, wal_path: &Path) -> (u64, u64, bool) {
+        let mut sequence = Self::persisted_snapshot_sequence(root);
+        let Ok(file) = std::fs::File::open(wal_path) else {
+            return (sequence, 0, false);
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = String::new();
+        let mut valid_bytes = 0u64;
+        let mut total = 0usize;
+        loop {
+            line.clear();
+            let Ok(read) = reader.read_line(&mut line) else {
+                return (sequence, valid_bytes, true);
+            };
+            if read == 0 {
+                return (sequence, valid_bytes, false);
+            }
+            total = total.saturating_add(read);
+            if total > 64 * 1024 * 1024 {
+                return (sequence, valid_bytes, true);
+            }
+            let Ok(envelope) = serde_json::from_str::<CacheWalEnvelope>(&line) else {
+                return (sequence, valid_bytes, true);
+            };
+            let Ok(event_bytes) = serde_json::to_vec(&envelope.event) else {
+                return (sequence, valid_bytes, true);
+            };
+            if envelope.sequence != sequence.saturating_add(1)
+                || sha256_hex(&event_bytes) != envelope.checksum
+            {
+                return (sequence, valid_bytes, true);
+            }
+            sequence = envelope.sequence;
+            valid_bytes = valid_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        }
     }
 
     pub fn load_or_new(root: &Path) -> Self {
@@ -355,6 +508,7 @@ impl RootCache {
             cache.wal_valid_bytes = valid_bytes;
         }
         cache.pending_events.clear();
+        cache.trim_invocation_patterns();
         let default_policy = MemoryPolicy::default();
         while cache.history_by_key.len() > default_policy.max_cached_results
             || cache.estimated_bytes() > default_policy.max_cache_bytes
@@ -391,24 +545,27 @@ impl RootCache {
             .mode(0o600)
             .open(&lock_path)?;
         lock_file.lock_exclusive()?;
+        let wal_path = Self::wal_path(&self.root)?;
+        let (persisted_sequence, persisted_valid_bytes, persisted_needs_repair) =
+            Self::inspect_persisted_wal(&self.root, &wal_path);
+        let concurrent_writes = persisted_sequence != self.wal_sequence;
         self.pending_events.push(CacheWalEvent::Metrics {
             total_saved_ms: self.total_saved_ms,
             total_cache_hits: self.total_cache_hits,
             total_delta_runs: self.total_delta_runs,
             total_background_runs: self.total_background_runs,
         });
-        let wal_path = Self::wal_path(&self.root)?;
         {
             let mut options = std::fs::OpenOptions::new();
             options.create(true).read(true).write(true);
             let mut wal = options.mode(0o600).open(&wal_path)?;
-            if self.wal_needs_repair {
-                wal.set_len(self.wal_valid_bytes)?;
+            if persisted_needs_repair {
+                wal.set_len(persisted_valid_bytes)?;
                 wal.sync_data()?;
-                self.wal_needs_repair = false;
             }
+            self.wal_needs_repair = false;
             wal.seek(std::io::SeekFrom::End(0))?;
-            let mut next_sequence = self.wal_sequence.saturating_add(1);
+            let mut next_sequence = persisted_sequence.saturating_add(1);
             for event in &self.pending_events {
                 let event_bytes = serde_json::to_vec(event)?;
                 let envelope = CacheWalEnvelope {
@@ -427,7 +584,7 @@ impl RootCache {
         self.pending_events.clear();
 
         let wal_bytes = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-        if wal_bytes > 16 * 1024 * 1024 {
+        if wal_bytes > 16 * 1024 * 1024 && !concurrent_writes {
             self.compact_snapshot(&wal_path)?;
         }
         Ok(())
@@ -481,6 +638,9 @@ impl RootCache {
                 self.total_delta_runs = total_delta_runs;
                 self.total_background_runs = total_background_runs;
             }
+            CacheWalEvent::Invocation { key, pattern } => {
+                self.invocation_patterns.insert(key, pattern);
+            }
         }
     }
 
@@ -528,6 +688,7 @@ impl RootCache {
             "history_records": self.history_by_key.len(),
             "latest_records": self.latest_by_file.len(),
             "estimated_memory_bytes": self.estimated_bytes(),
+            "invocation_patterns": self.invocation_patterns.len(),
         })
     }
 
@@ -567,6 +728,19 @@ impl RootCache {
                     .sum::<usize>(),
             )
             .saturating_add(self.quarantined_keys.iter().map(String::len).sum::<usize>())
+            .saturating_add(
+                self.invocation_patterns
+                    .values()
+                    .map(|pattern| {
+                        std::mem::size_of::<InvocationPattern>()
+                            + pattern.test_files.iter().map(String::len).sum::<usize>()
+                    })
+                    .sum::<usize>(),
+            )
+    }
+
+    pub fn has_pending_events(&self) -> bool {
+        !self.pending_events.is_empty()
     }
 }
 
@@ -702,7 +876,38 @@ mod tests {
                 .is_some()
         );
 
-        loaded.compact_snapshot(&wal_path).unwrap();
+        let mut concurrent_a = RootCache::load_or_new(&root);
+        let mut concurrent_b = RootCache::load_or_new(&root);
+        let mut third = record(TestOutcome::Passed);
+        third.test_file = "tests/test_three.py".to_string();
+        third.dep_hash = "third-hash".to_string();
+        concurrent_a.insert(third, &MemoryPolicy::default());
+        let mut fourth = record(TestOutcome::Passed);
+        fourth.test_file = "tests/test_four.py".to_string();
+        fourth.dep_hash = "fourth-hash".to_string();
+        concurrent_b.insert(fourth, &MemoryPolicy::default());
+        concurrent_a.save().unwrap();
+        concurrent_b.save().unwrap();
+        let mut merged = RootCache::load_or_new(&root);
+        assert!(
+            merged
+                .get_matching("tests/test_three.py", "third-hash")
+                .is_some()
+        );
+        assert!(
+            merged
+                .get_matching("tests/test_four.py", "fourth-hash")
+                .is_some()
+        );
+
+        for index in 0..200 {
+            merged.record_invocation(&[format!("tests/test_pattern_{index}.py")]);
+        }
+        merged.save().unwrap();
+        let bounded = RootCache::load_or_new(&root);
+        assert!(bounded.invocation_patterns.len() <= 128);
+
+        merged.compact_snapshot(&wal_path).unwrap();
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
         assert!(RootCache::storage_path(&root).unwrap().is_file());
 
@@ -752,5 +957,42 @@ mod tests {
                     .values()
                     .all(|node| node.output_snippet.len() <= 2 * 1024)
         }));
+    }
+
+    #[test]
+    fn learns_bounded_invocation_patterns_and_ranks_affected_tests() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cache = RootCache::new(root.path().to_path_buf());
+        cache.record_invocation(&["tests/test_recent.py".to_string()]);
+        for _ in 0..3 {
+            cache.record_invocation(&["tests/test_frequent.py".to_string()]);
+        }
+        let ranked = cache.predicted_affected_tests(&[
+            "tests/test_other.py".to_string(),
+            "tests/test_recent.py".to_string(),
+            "tests/test_frequent.py".to_string(),
+        ]);
+        assert_eq!(
+            ranked,
+            vec![
+                "tests/test_frequent.py".to_string(),
+                "tests/test_recent.py".to_string()
+            ]
+        );
+        assert!(cache.was_invoked("tests/test_frequent.py"));
+        assert!(!cache.was_invoked("tests/test_other.py"));
+
+        for index in 0..200 {
+            cache.record_invocation(&[format!("tests/test_pattern_{index}.py")]);
+        }
+        assert!(cache.invocation_patterns.len() <= 128);
+        assert!(
+            cache
+                .pending_events
+                .iter()
+                .filter(|event| matches!(event, CacheWalEvent::Invocation { .. }))
+                .count()
+                <= 128
+        );
     }
 }

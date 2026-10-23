@@ -109,6 +109,19 @@ fn background_eligible(spec: &Spec, graph: &DependencyGraph, test_file: &str) ->
             .any(|marker| marker == "background_safe")
 }
 
+fn background_eligible_with_cache(guard: &RootState, test_file: &str) -> bool {
+    background_eligible_from_parts(&guard.spec, &guard.graph, &guard.cache, test_file)
+}
+
+fn background_eligible_from_parts(
+    spec: &Spec,
+    graph: &DependencyGraph,
+    _cache: &RootCache,
+    test_file: &str,
+) -> bool {
+    background_eligible(spec, graph, test_file)
+}
+
 fn test_resource_keys(graph: &DependencyGraph, test_file: &str) -> BTreeSet<String> {
     let Some(node) = graph.files.get(test_file) else {
         return BTreeSet::new();
@@ -174,6 +187,7 @@ struct RootState {
     watch_events_drained: u64,
     background_batches: u64,
     last_environment_check: Instant,
+    prediction_enqueues: u64,
 }
 
 pub struct ManagedRoot {
@@ -218,7 +232,7 @@ impl ManagedRoot {
                     if cache
                         .get_matching(&item.test_file, &item.dep_hash)
                         .is_none()
-                        && background_eligible(&spec, &graph, &item.test_file)
+                        && background_eligible_from_parts(&spec, &graph, &cache, &item.test_file)
                         && !pending_queue.contains(&item.test_file)
                     {
                         pending_queue.push_back(item.test_file);
@@ -252,6 +266,7 @@ impl ManagedRoot {
             watch_events_drained: 0,
             background_batches: 0,
             last_environment_check: Instant::now(),
+            prediction_enqueues: 0,
         };
 
         let (fs_tx, fs_rx) = sync_channel(4096);
@@ -331,31 +346,10 @@ impl ManagedRoot {
         });
 
         if spec.policy.background_enabled {
-            Self::spawn_zygote_warmer(Arc::clone(&arc));
             Self::spawn_background_worker(Arc::clone(&arc));
         }
 
         Ok(arc)
-    }
-
-    fn spawn_zygote_warmer(this: Arc<Self>) {
-        let _ = std::thread::Builder::new()
-            .name("tctx-zygote-warm".to_string())
-            .spawn(move || {
-                let (spec, preload) = {
-                    let Ok(guard) = this.state.lock() else {
-                        return;
-                    };
-                    (guard.spec.clone(), guard.graph.external_preload_modules())
-                };
-                let pythonpath = build_pythonpath(&spec.root, std::env::var_os("PYTHONPATH"));
-                let plugins = pytest_plugin_manifest(&spec);
-                if let Ok(mut manager) = this.zygote.lock()
-                    && !this.stopped.load(Ordering::SeqCst)
-                {
-                    let _ = manager.ensure(&spec, pythonpath, &preload, &plugins);
-                }
-            });
     }
 
     pub fn last_activity_elapsed(&self) -> Duration {
@@ -365,8 +359,54 @@ impl ManagedRoot {
             .unwrap_or_default()
     }
 
+    pub fn is_evictable(&self) -> bool {
+        self.active_pgid.load(Ordering::Acquire) <= 0
+            && self
+                .active_pgids
+                .lock()
+                .map(|pgids| pgids.is_empty())
+                .unwrap_or(false)
+            && self
+                .state
+                .lock()
+                .map(|guard| {
+                    !guard.background_running
+                        && guard.in_flight.is_empty()
+                        && guard.pending_queue.is_empty()
+                })
+                .unwrap_or(false)
+    }
+
+    pub fn reclaim_idle_zygote(&self) -> bool {
+        let timeout_secs = std::env::var("TCTX_ZYGOTE_IDLE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=3_600).contains(value))
+            .unwrap_or(60);
+        self.zygote
+            .lock()
+            .map(|mut manager| manager.shutdown_if_idle(Duration::from_secs(timeout_secs)))
+            .unwrap_or(false)
+    }
+
+    pub fn flush_pending_cache(&self) {
+        if let Ok(mut guard) = self.state.lock()
+            && guard.cache.has_pending_events()
+        {
+            match guard.cache.save() {
+                Ok(()) => guard.cache.persistence_error = None,
+                Err(error) => guard.cache.persistence_error = Some(error.to_string()),
+            }
+        }
+    }
+
     pub fn shutdown(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        if let Ok(mut guard) = self.state.lock()
+            && let Err(error) = guard.cache.save()
+        {
+            guard.cache.persistence_error = Some(error.to_string());
+        }
         if let Ok(mut w) = self.watcher.lock() {
             *w = None;
         }
@@ -374,6 +414,33 @@ impl ManagedRoot {
             *z = ZygoteManager::default();
         }
         self.condvar.notify_all();
+    }
+
+    fn enqueue_affected_locked(guard: &mut RootState, affected: Vec<AffectedTest>) {
+        let affected_files: Vec<String> =
+            affected.iter().map(|item| item.test_file.clone()).collect();
+        let predicted = guard.cache.predicted_affected_tests(&affected_files);
+        guard.prediction_enqueues = guard
+            .prediction_enqueues
+            .saturating_add(u64::try_from(predicted.len()).unwrap_or(u64::MAX));
+        let predicted_set: BTreeSet<String> = predicted.iter().cloned().collect();
+        let mut ordered = predicted;
+        ordered.extend(
+            affected_files
+                .into_iter()
+                .filter(|test_file| !predicted_set.contains(test_file)),
+        );
+        for test_file in ordered.into_iter().rev() {
+            let Some(dep_hash) = guard.graph.dep_hash_for_test.get(&test_file) else {
+                continue;
+            };
+            if guard.cache.get_matching(&test_file, dep_hash).is_none()
+                && background_eligible_with_cache(guard, &test_file)
+            {
+                guard.pending_queue.retain(|queued| queued != &test_file);
+                guard.pending_queue.push_front(test_file);
+            }
+        }
     }
 
     pub fn cancel_active(&self) -> bool {
@@ -443,9 +510,37 @@ impl ManagedRoot {
                 }
                 let max_batch = guard.spec.policy.background_batch_size.max(1);
                 let mut sorted: Vec<String> = guard.pending_queue.drain(..).collect();
+                let prediction_rank: BTreeMap<String, usize> = guard
+                    .cache
+                    .predicted_affected_tests(&sorted)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(rank, test_file)| (test_file, rank))
+                    .collect();
                 if guard.background_batches % 4 == 3 {
                     sorted.sort_by_key(|test_file| {
-                        std::cmp::Reverse(
+                        (
+                            prediction_rank
+                                .get(test_file)
+                                .copied()
+                                .unwrap_or(usize::MAX),
+                            std::cmp::Reverse(
+                                guard
+                                    .cache
+                                    .latest_by_file
+                                    .get(test_file)
+                                    .map(|record| record.duration_ms)
+                                    .unwrap_or(0),
+                            ),
+                        )
+                    });
+                } else {
+                    sorted.sort_by_key(|test_file| {
+                        (
+                            prediction_rank
+                                .get(test_file)
+                                .copied()
+                                .unwrap_or(usize::MAX),
                             guard
                                 .cache
                                 .latest_by_file
@@ -453,15 +548,6 @@ impl ManagedRoot {
                                 .map(|record| record.duration_ms)
                                 .unwrap_or(0),
                         )
-                    });
-                } else {
-                    sorted.sort_by_key(|test_file| {
-                        guard
-                            .cache
-                            .latest_by_file
-                            .get(test_file)
-                            .map(|record| record.duration_ms)
-                            .unwrap_or(0)
                     });
                 }
                 guard.pending_queue.extend(sorted);
@@ -495,9 +581,14 @@ impl ManagedRoot {
                         test_resource_keys(&guard.graph, test_file).into_iter()
                     })
                     .collect();
-                batch = selected;
                 spec = guard.spec.clone();
-                preload_modules = guard.graph.external_preload_modules();
+                preload_modules = guard.graph.external_preload_modules_for_tests(
+                    &selected
+                        .iter()
+                        .map(|(test_file, _)| test_file.clone())
+                        .collect::<Vec<_>>(),
+                );
+                batch = selected;
                 environment_hash = guard.graph.environment_hash.clone();
                 capture_dynamic_dependencies = batch.iter().any(|(test_file, dep_hash)| {
                     guard
@@ -556,7 +647,7 @@ impl ManagedRoot {
                     .map(|(test_file, _)| test_file.clone())
                     .collect();
                 for test_file in unstable.iter().rev() {
-                    if background_eligible(&guard.spec, &guard.graph, test_file) {
+                    if background_eligible_with_cache(&guard, test_file) {
                         guard.pending_queue.retain(|queued| queued != test_file);
                         guard.pending_queue.push_front(test_file.clone());
                     }
@@ -732,17 +823,7 @@ impl ManagedRoot {
             }
             if guard.spec.policy.background_enabled {
                 let affected = guard.graph.affected_tests(&changed_rels);
-                for item in affected.into_iter().rev() {
-                    if guard
-                        .cache
-                        .get_matching(&item.test_file, &item.dep_hash)
-                        .is_none()
-                        && background_eligible(&guard.spec, &guard.graph, &item.test_file)
-                    {
-                        guard.pending_queue.retain(|p| p != &item.test_file);
-                        guard.pending_queue.push_front(item.test_file);
-                    }
-                }
+                Self::enqueue_affected_locked(guard, affected);
                 self.condvar.notify_all();
             }
         }
@@ -869,17 +950,8 @@ impl ManagedRoot {
                 guard.graph.recompute_hashes_for_changed(&changed);
             }
             if guard.spec.policy.background_enabled {
-                for item in guard.graph.affected_tests(&changed).into_iter().rev() {
-                    if guard
-                        .cache
-                        .get_matching(&item.test_file, &item.dep_hash)
-                        .is_none()
-                        && background_eligible(&guard.spec, &guard.graph, &item.test_file)
-                    {
-                        guard.pending_queue.retain(|p| p != &item.test_file);
-                        guard.pending_queue.push_front(item.test_file);
-                    }
-                }
+                let affected = guard.graph.affected_tests(&changed);
+                Self::enqueue_affected_locked(guard, affected);
             }
         }
     }
@@ -901,7 +973,7 @@ impl ManagedRoot {
                     .collect();
                 for (test_file, dep_hash) in candidates {
                     if guard.cache.get_matching(&test_file, &dep_hash).is_none()
-                        && background_eligible(&guard.spec, &guard.graph, &test_file)
+                        && background_eligible_with_cache(&guard, &test_file)
                         && !guard.pending_queue.contains(&test_file)
                     {
                         guard.pending_queue.push_back(test_file);
@@ -937,7 +1009,7 @@ impl ManagedRoot {
                 let all_tests: Vec<String> =
                     guard.graph.dep_hash_for_test.keys().cloned().collect();
                 for test_file in all_tests {
-                    if !background_eligible(&guard.spec, &guard.graph, &test_file) {
+                    if !background_eligible_with_cache(&guard, &test_file) {
                         continue;
                     }
                     if !guard.pending_queue.contains(&test_file) {
@@ -953,7 +1025,7 @@ impl ManagedRoot {
             for test_file in resolved {
                 count += guard.cache.invalidate_file(&test_file);
                 if guard.spec.policy.background_enabled
-                    && background_eligible(&guard.spec, &guard.graph, &test_file)
+                    && background_eligible_with_cache(&guard, &test_file)
                     && !guard.pending_queue.contains(&test_file)
                 {
                     guard.pending_queue.push_back(test_file);
@@ -994,6 +1066,7 @@ impl ManagedRoot {
         let generation = guard.generation;
         let watch_events_drained = guard.watch_events_drained;
         let background_batches = guard.background_batches;
+        let prediction_enqueues = guard.prediction_enqueues;
         let environment_check_age_ms =
             u64::try_from(guard.last_environment_check.elapsed().as_millis()).unwrap_or(u64::MAX);
         let safety_scan_age_ms =
@@ -1023,6 +1096,7 @@ impl ManagedRoot {
             "generation": generation,
             "watch_events_drained": watch_events_drained,
             "background_batches": background_batches,
+            "prediction_enqueues": prediction_enqueues,
             "environment_check_age_ms": environment_check_age_ms,
             "safety_scan_age_ms": safety_scan_age_ms,
             "watched_directories": watched_directories,
@@ -1110,6 +1184,7 @@ impl ManagedRoot {
         let started = Instant::now();
         let has_subfile_filter =
             req.k.is_some() || req.mark.is_some() || req.targets.iter().any(|t| t.contains("::"));
+        let learn_invocation = !has_subfile_filter && req.pytest_args.is_empty();
 
         let mut cached_summaries = Vec::new();
         let mut cached_failure_outputs = Vec::new();
@@ -1357,7 +1432,7 @@ impl ManagedRoot {
             preload_modules = if to_execute.is_empty() {
                 Vec::new()
             } else {
-                guard.graph.external_preload_modules()
+                guard.graph.external_preload_modules_for_tests(&to_execute)
             };
         }
 
@@ -1436,7 +1511,7 @@ impl ManagedRoot {
                 .collect();
             if !unstable.is_empty() {
                 for test_file in unstable.iter().rev() {
-                    if background_eligible(&guard.spec, &guard.graph, test_file) {
+                    if background_eligible_with_cache(&guard, test_file) {
                         guard.pending_queue.retain(|queued| queued != test_file);
                         guard.pending_queue.push_front(test_file.clone());
                     }
@@ -1526,6 +1601,10 @@ impl ManagedRoot {
         } else {
             "passed".to_string()
         };
+        if status == "passed" && learn_invocation {
+            let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+            guard.cache.record_invocation(&target_test_files);
+        }
         let mode = if executed_summaries.is_empty() {
             "instant_cache_hit".to_string()
         } else if cached_summaries.is_empty() {
@@ -2462,6 +2541,12 @@ mod tests {
         assert!(background_eligible(&base_spec, &graph, "test_safe.py"));
         assert!(!background_eligible(&base_spec, &graph, "test_live.py"));
         assert!(!background_eligible(&base_spec, &graph, "test_plain.py"));
+        let mut cache = RootCache::new(root.path().to_path_buf());
+        cache.record_invocation(&["test_plain.py".to_string()]);
+        assert!(
+            !background_eligible_from_parts(&base_spec, &graph, &cache, "test_plain.py"),
+            "learned foreground invocations must not bypass background-safe opt-in"
+        );
     }
 
     #[test]

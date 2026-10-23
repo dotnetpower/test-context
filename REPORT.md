@@ -306,3 +306,18 @@ All strict Clippy, Rust unit/integration/doc tests, Python benchmark artifact te
 12. Repeated the final review after every discovered defect until no known Critical/High/Medium finding remained.
 
 The last five rounds found and repaired: success-shaped no-test targets, multiline pytest config loss, testpaths false positives, cache memory amplification, unbounded child output, SIGTERM socket leakage, unsafe stale socket replacement, timeout/cancellation misclassification, fixed-poll accept latency, nested native tests, WAL append after truncated tails, and eager connection-thread creation.
+
+### Round 22 — Predictive invocation and long-running resources (12 criteria)
+
+1. Added bounded learning for successful whole-file `test_run` patterns.
+2. Excluded failed, filtered, node-level, and arbitrary-argument invocations from prediction.
+3. Ranked affected tests by observed frequency and recency before background batching.
+4. Persisted invocation patterns through the checksummed WAL and snapshot format.
+5. Coalesced repeated pending invocation events so cache-hit traffic cannot grow memory linearly.
+6. Bounded learned patterns to 128 entries and re-applied the bound after WAL recovery.
+7. Replaced Linux access-heavy watcher subscriptions with explicit write/change `inotify` masks.
+8. Preserved overflow detection and dynamic directory watch registration.
+9. Removed eager Zygote creation and limited preload discovery to requested tests.
+10. Added idle Zygote reclamation and parent/child RSS diagnostics.
+11. Added a resource soak covering 500 cache hits, 50 edit/delta cycles, repeated cancellation, FD/thread bounds, RSS growth, idle CPU, and idle child reclamation.
+12. Documented that direct shell `pytest` commands are not intercepted and must use `tctx pytest` to participate in learning.

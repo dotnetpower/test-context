@@ -15,12 +15,18 @@ When GitHub Copilot (or a developer) invokes tests:
   - Automatically links `conftest.py` hierarchies and `pyproject.toml`/`pytest.ini` configurations into each test file's Merkle dependency hash (`dep_hash`).
   - Supports root packages, `src/` layouts, and monorepo layouts (`services/*/src`, `packages/*/src`).
 - **Speculative Background Daemon (`tctx daemon`)**:
-  - Watches workspace files with `notify` and immediately queues affected test files in a background worker upon file changes.
+  - Watches workspace writes with a Linux `inotify` backend (and a portable `notify` fallback) and immediately queues affected test files in a background worker upon file changes.
+  - Learns bounded, successful whole-file `test_run` invocation patterns and prioritizes those affected tests on later edits; filtered, node-level, failed, and arbitrary-argument runs are not learned.
   - Persists content-addressed test results (`dep_hash -> pass/fail/counts/duration/output`) per workspace root.
+  - Creates the warm pytest Zygote lazily, preloads only imports needed by the requested tests, and reclaims it after 60 seconds of inactivity.
 - **Native GitHub Copilot Integration (`moonchoi.test-context-native`)**:
   - 7 Native VS Code Language Model Tools (`#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeWorkspaces`, `#tctxNativeInvalidate`).
   - Shared MCP Server (`tctx shared-mcp`) for background/CLI agent sessions (`test_run`, `test_affected`, `test_graph`, `test_status`, `test_sync`, `test_workspaces`, `test_invalidate`).
   - Drop-in CLI (`tctx run`, `tctx pytest`, `tctx affected`, `tctx graph`, `tctx status`, `tctx sync`).
+
+`tctx` can learn only invocations routed through its Native, MCP, or CLI surfaces. A direct shell
+command such as `pytest tests/test_api.py` is not intercepted; use `tctx pytest
+tests/test_api.py` when invocation learning and cache reuse are desired.
 
 ## Measured Performance (`aks-store-demo` Python AI Service)
 
@@ -30,12 +36,12 @@ Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store
 
 | Task | TCTX off (`pytest`) | TCTX on | Speedup [95% CI] |
 |---|---:|---:|---:|
-| Warm suite (`warm_suite`) | 773.69 ms | **0.45 ms** (median 0.42 ms) | **1720.96×** [1533.72, 1874.07] |
-| Post-edit background pre-run (`bg_speculative`) | 788.46 ms | **0.48 ms** (median 0.41 ms) | **1633.09×** [1417.19, 1879.41] |
-| Reverted edit Merkle hit (`merkle_revert`) | 790.21 ms | **0.42 ms** (median 0.41 ms) | **1862.04×** [1777.18, 1942.46] |
-| Immediate 0ms-delay leaf edit (`leaf_delta`) | 783.59 ms | **55.63 ms** (median 54.57 ms) | **14.09×** [13.64, 14.54] |
-| Impact query (`affected_graph`) | 749.46 ms | **0.48 ms** (median 0.40 ms) | **1562.70×** [1235.58, 1845.61] |
-| Fixed mixed suite (`all`, 320 pairs) | 777.08 ms | **11.49 ms** (median 0.43 ms) | **67.61×** [65.79, 69.35] |
+| Warm suite (`warm_suite`) | 759.42 ms | **0.47 ms** (median 0.41 ms) | **1621.08×** [1370.79, 1848.10] |
+| Post-edit background pre-run (`bg_speculative`) | 735.72 ms | **0.43 ms** (median 0.41 ms) | **1695.29×** [1571.75, 1823.50] |
+| Reverted edit Merkle hit (`merkle_revert`) | 730.23 ms | **0.44 ms** (median 0.41 ms) | **1659.69×** [1481.43, 1823.71] |
+| Immediate 0ms-delay leaf edit (`leaf_delta`) | 750.60 ms | **55.62 ms** (median 53.72 ms) | **13.49×** [12.91, 14.04] |
+| Impact query (`affected_graph`) | 712.73 ms | **0.42 ms** (median 0.38 ms) | **1716.14×** [1637.37, 1786.31] |
+| Fixed mixed suite (`all`, 320 pairs) | 737.74 ms | **11.48 ms** (median 0.42 ms) | **64.29×** [62.15, 66.39] |
 
 See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology, cold-start measurements, raw samples, and reproduction instructions.
 
