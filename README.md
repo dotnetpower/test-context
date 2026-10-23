@@ -19,6 +19,7 @@ When GitHub Copilot (or a developer) invokes tests:
   - Learns bounded, successful whole-file `test_run` invocation patterns and prioritizes those affected tests on later edits; filtered, node-level, failed, and arbitrary-argument runs are not learned.
   - Persists content-addressed test results (`dep_hash -> pass/fail/counts/duration/output`) per workspace root.
   - Creates the warm pytest Zygote lazily, preloads only imports needed by the requested tests, and reclaims it after 60 seconds of inactivity.
+  - Returns released allocator arenas to the OS, evicts inactive large graphs and roots under RSS pressure, and expires idle persistent clients after 30 seconds.
 - **Native GitHub Copilot Integration (`moonchoi.test-context-native`)**:
   - 7 Native VS Code Language Model Tools (`#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeWorkspaces`, `#tctxNativeInvalidate`).
   - Shared MCP Server (`tctx shared-mcp`) for background/CLI agent sessions (`test_run`, `test_affected`, `test_graph`, `test_status`, `test_sync`, `test_workspaces`, `test_invalidate`).
@@ -36,12 +37,12 @@ Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store
 
 | Task | TCTX off (`pytest`) | TCTX on | Speedup [95% CI] |
 |---|---:|---:|---:|
-| Warm suite (`warm_suite`) | 738.01 ms | **0.50 ms** (median 0.41 ms) | **1489.42×** [1190.31, 1755.25] |
-| Post-edit background pre-run (`bg_speculative`) | 741.39 ms | **0.43 ms** (median 0.40 ms) | **1741.14×** [1683.01, 1795.17] |
-| Reverted edit Merkle hit (`merkle_revert`) | 742.74 ms | **0.42 ms** (median 0.40 ms) | **1750.57×** [1686.97, 1814.47] |
-| Immediate 0ms-delay leaf edit (`leaf_delta`) | 735.33 ms | **56.59 ms** (median 53.33 ms) | **12.99×** [12.26, 13.57] |
-| Impact query (`affected_graph`) | 714.43 ms | **0.40 ms** (median 0.38 ms) | **1802.81×** [1678.57, 1921.45] |
-| Fixed mixed suite (`all`, 320 pairs) | 734.38 ms | **11.67 ms** (median 0.42 ms) | **62.95×** [59.18, 66.23] |
+| Warm suite (`warm_suite`) | 752.30 ms | **0.45 ms** (median 0.43 ms) | **1677.18×** [1587.06, 1766.82] |
+| Post-edit background pre-run (`bg_speculative`) | 749.42 ms | **0.45 ms** (median 0.42 ms) | **1669.10×** [1621.66, 1717.55] |
+| Reverted edit Merkle hit (`merkle_revert`) | 743.45 ms | **0.44 ms** (median 0.42 ms) | **1707.88×** [1636.96, 1773.59] |
+| Immediate 0ms-delay leaf edit (`leaf_delta`) | 754.34 ms | **54.64 ms** (median 54.19 ms) | **13.81×** [13.56, 14.08] |
+| Impact query (`affected_graph`) | 720.54 ms | **0.44 ms** (median 0.42 ms) | **1645.73×** [1582.40, 1715.02] |
+| Fixed mixed suite (`all`, 320 pairs) | 744.01 ms | **11.28 ms** (median 0.44 ms) | **65.94×** [64.72, 67.33] |
 
 See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology, cold-start measurements, raw samples, and reproduction instructions.
 

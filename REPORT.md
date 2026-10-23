@@ -336,3 +336,13 @@ The last five rounds found and repaired: success-shaped no-test targets, multili
 32. Replaced stable empty Python runtime identity on inspection failure with a unique unavailable identity, preventing cache reuse.
 
 Post-round validation: strict Clippy passed; 21 Rust unit tests, 2 Rust integration tests, and 11 native extension tests passed. The resource soak completed 500 cache hits, 10 cancellations, and 50 edit/delta cycles with stable FD/thread counts and zero idle CPU ticks. The `aks-store-demo` benchmark completed 8 isolated daemon sessions and 320 paired observations with test parity in every session.
+
+### Rounds 33–37 — Five monitored resource-optimization cycles
+
+33. Confirmed 391 MiB anonymous RSS with zero loaded roots was released-object allocator retention, then invoked glibc `malloc_trim` from the maintenance cycle. A 30-minute replay removed swap growth and reduced final RSS from 469 MiB to 217 MiB under concurrent external root activity.
+34. Added a 192 MiB daemon RSS pressure ceiling that evicts the oldest inactive root. Two intentionally loaded FDAI graphs converged from 186 MiB and two roots to 100 MiB and one root, with no swap or ping failure.
+35. Reduced inactive retention for graphs with at least 5,000 indexed files from 15 minutes to 5 minutes. One 8,440-file graph returned from 97 MiB to an 8–9 MiB baseline before a separate external session loaded another root.
+36. Capped connection workers at eight. Active-root threads fell from 20 to 12 and idle threads from 18 to 10; the 30-minute run ended at 12.7 MiB RSS, five FDs, zero swap, and 0.225% mean CPU.
+37. Expired idle persistent Native/MCP clients after 30 seconds. Twelve deliberately stalled clients raised FDs from 5 to 25, then all FDs returned to 5; subsequent pings all succeeded. A concurrently loaded large root rose to 103 MiB and was reclaimed to a 13.3 MiB baseline.
+
+Final validation after all five cycles: strict Clippy passed; 26 Rust unit tests, 2 Rust integration tests, and 11 native extension tests passed. The resource soak completed 500 cache hits, 10 cancellations, and 50 edit/delta cycles with RSS ending at 7.1 MiB, stable FD/thread counts, and zero idle CPU ticks. The final `aks-store-demo` benchmark completed 8 isolated daemon sessions and 320 paired observations with parity in every session.
