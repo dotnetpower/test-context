@@ -315,9 +315,24 @@ The last five rounds found and repaired: success-shaped no-test targets, multili
 4. Persisted invocation patterns through the checksummed WAL and snapshot format.
 5. Coalesced repeated pending invocation events so cache-hit traffic cannot grow memory linearly.
 6. Bounded learned patterns to 128 entries and re-applied the bound after WAL recovery.
-7. Replaced Linux access-heavy watcher subscriptions with explicit write/change `inotify` masks.
+7. Filtered access-only watcher callbacks before they reach the bounded event queue.
 8. Preserved overflow detection and dynamic directory watch registration.
 9. Removed eager Zygote creation and limited preload discovery to requested tests.
 10. Added idle Zygote reclamation and parent/child RSS diagnostics.
 11. Added a resource soak covering 500 cache hits, 50 edit/delta cycles, repeated cancellation, FD/thread bounds, RSS growth, idle CPU, and idle child reclamation.
 12. Documented that direct shell `pytest` commands are not intercepted and must use `tctx pytest` to participate in learning.
+
+### Rounds 23–32 — Additional stability hardening
+
+23. Drained subprocess stdout and stderr to EOF while retaining only bounded bytes, preventing `SIGPIPE` from changing test outcomes.
+24. Classified externally terminated subprocess groups as cancellation instead of cacheable test failure.
+25. Added a 10-second Zygote readiness-handshake deadline.
+26. Added bounded child-start and final-result protocol deadlines and kill-on-stall recovery.
+27. Added a daemon shutdown gate that rejects queued work and cancels active roots before worker drain.
+28. Retained and joined background-worker handles before final cache persistence and Zygote teardown.
+29. Reloaded and merged durable cache state under the exclusive lock before WAL append or snapshot compaction.
+30. Made watcher creation and initial watch registration fail closed; runtime watcher errors now request a full rescan.
+31. Enforced registered include globs in inventory and watcher filtering while always retaining pytest configuration files.
+32. Replaced stable empty Python runtime identity on inspection failure with a unique unavailable identity, preventing cache reuse.
+
+Post-round validation: strict Clippy passed; 21 Rust unit tests, 2 Rust integration tests, and 11 native extension tests passed. The resource soak completed 500 cache hits, 10 cancellations, and 50 edit/delta cycles with stable FD/thread counts and zero idle CPU ticks. The `aks-store-demo` benchmark completed 8 isolated daemon sessions and 320 paired observations with test parity in every session.
