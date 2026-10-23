@@ -21,6 +21,7 @@ pub const BINARY_MAGIC: &[u8] = b"TCTXB1\n";
 pub const FRAMED_JSON_MAGIC: &[u8] = b"TCTXJ1\n";
 pub const TRACE_ARGUMENT: &str = "_tctx_trace";
 pub const MAX_ACTIVE_CONNECTIONS: usize = 64;
+pub const MAX_CONNECTION_WORKERS: usize = 8;
 pub const MAX_RESIDENT_ROOTS: usize = 8;
 pub const MAX_DAEMON_RSS_BYTES: u64 = 192 * 1024 * 1024;
 pub const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
@@ -56,6 +57,10 @@ fn root_idle_timeout(indexed_files: usize) -> Duration {
     } else {
         IDLE_ROOT_TIMEOUT
     }
+}
+
+fn connection_worker_count(available_parallelism: usize) -> usize {
+    available_parallelism.clamp(4, MAX_CONNECTION_WORKERS)
 }
 
 extern "C" fn request_stop(_: libc::c_int) {
@@ -599,10 +604,11 @@ pub fn serve() -> Result<()> {
 
     let hub = Arc::new(DaemonHub::new());
     let active_connections = Arc::new(AtomicUsize::new(0));
-    let worker_count = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .clamp(4, 16);
+    let worker_count = connection_worker_count(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(4),
+    );
     let (connection_tx, connection_rx) = sync_channel::<ConnectionWork>(MAX_ACTIVE_CONNECTIONS);
     let connection_rx = Arc::new(Mutex::new(connection_rx));
     let mut connection_workers = Vec::new();
@@ -998,5 +1004,12 @@ mod tests {
     fn large_roots_use_shorter_idle_retention() {
         assert_eq!(root_idle_timeout(4_999), IDLE_ROOT_TIMEOUT);
         assert_eq!(root_idle_timeout(5_000), LARGE_ROOT_IDLE_TIMEOUT);
+    }
+
+    #[test]
+    fn connection_workers_are_bounded_for_local_daemon_load() {
+        assert_eq!(connection_worker_count(1), 4);
+        assert_eq!(connection_worker_count(8), 8);
+        assert_eq!(connection_worker_count(64), MAX_CONNECTION_WORKERS);
     }
 }
