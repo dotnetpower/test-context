@@ -22,6 +22,7 @@ pub const FRAMED_JSON_MAGIC: &[u8] = b"TCTXJ1\n";
 pub const TRACE_ARGUMENT: &str = "_tctx_trace";
 pub const MAX_ACTIVE_CONNECTIONS: usize = 64;
 pub const MAX_RESIDENT_ROOTS: usize = 8;
+pub const MAX_DAEMON_RSS_BYTES: u64 = 192 * 1024 * 1024;
 pub const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -33,6 +34,18 @@ fn trim_allocator() -> bool {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn trim_allocator() -> bool {
     false
+}
+
+fn daemon_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let kib = status
+        .lines()
+        .find(|line| line.starts_with("VmRSS:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u64>()
+        .ok()?;
+    kib.checked_mul(1024)
 }
 
 extern "C" fn request_stop(_: libc::c_int) {
@@ -236,6 +249,17 @@ impl DaemonHub {
                 } else {
                     break;
                 }
+            }
+            if guard.len() > 1
+                && daemon_rss_bytes().is_some_and(|rss| rss > MAX_DAEMON_RSS_BYTES)
+                && let Some(oldest_key) = guard
+                    .iter()
+                    .filter(|(_, root)| root.is_evictable())
+                    .max_by_key(|(_, root)| root.last_activity_elapsed())
+                    .map(|(key, _)| key.clone())
+                && let Some(old) = guard.remove(&oldest_key)
+            {
+                evicted.push(old);
             }
         }
         for root in evicted {
@@ -949,5 +973,10 @@ mod tests {
     #[test]
     fn allocator_trim_is_safe_without_loaded_roots() {
         let _ = trim_allocator();
+    }
+
+    #[test]
+    fn daemon_rss_probe_reports_current_process_memory() {
+        assert!(daemon_rss_bytes().is_some_and(|rss| rss > 0));
     }
 }
