@@ -274,61 +274,7 @@ impl ManagedRoot {
         let fs_overflow = Arc::new(AtomicBool::new(false));
         let overflow_for_cb = Arc::clone(&fs_overflow);
 
-        let arc = Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
-            let weak_for_watcher = weak.clone();
-            let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-                let Ok(event) = res else {
-                    return;
-                };
-                // Never let our own file reads or access-time updates trigger an inotify feedback storm
-                if matches!(
-                    event.kind,
-                    notify::EventKind::Access(_)
-                        | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
-                            notify::event::MetadataKind::AccessTime
-                        ))
-                ) {
-                    return;
-                }
-                if !event.need_rescan()
-                    && !event.paths.is_empty()
-                    && event.paths.iter().all(|path| {
-                        if path.is_dir() {
-                            return watcher_filter_for_callback
-                                .lock()
-                                .map(|directories| directories.contains(path))
-                                .unwrap_or(false);
-                        }
-                        path.strip_prefix(&watcher_workspace.root)
-                            .ok()
-                            .is_none_or(|relative| {
-                                !watcher_workspace.is_permitted_rel(relative)
-                                    && !watcher_workspace.is_permitted_data_rel(relative)
-                            })
-                    })
-                {
-                    return;
-                }
-                if event.need_rescan() {
-                    overflow_for_cb.store(true, Ordering::Release);
-                }
-                if let Err(err) = fs_tx.try_send(event)
-                    && matches!(err, TrySendError::Full(_))
-                {
-                    overflow_for_cb.store(true, Ordering::Release);
-                }
-                if let Some(strong) = weak_for_watcher.upgrade() {
-                    strong.condvar.notify_all();
-                }
-            })
-            .ok()
-            .map(|mut w| {
-                for dir in &watch_dirs {
-                    let _ = w.watch(dir, RecursiveMode::NonRecursive);
-                }
-                w
-            });
-
+        let arc = Arc::new({
             let zygote_manager = ZygoteManager::default();
             let active_pgid = zygote_manager.active_handle();
             Self {
@@ -337,7 +283,7 @@ impl ManagedRoot {
                 stopped: AtomicBool::new(false),
                 fs_events_rx: Mutex::new(fs_rx),
                 fs_overflow,
-                watcher: Mutex::new(watcher),
+                watcher: Mutex::new(None),
                 watcher_filter_dirs,
                 background_worker: Mutex::new(None),
                 zygote: Mutex::new(zygote_manager),
@@ -346,6 +292,65 @@ impl ManagedRoot {
                 cancel_requested: AtomicBool::new(false),
             }
         });
+        let weak_for_watcher = Arc::downgrade(&arc);
+        let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+            let event = match res {
+                Ok(event) => event,
+                Err(_) => {
+                    overflow_for_cb.store(true, Ordering::Release);
+                    if let Some(strong) = weak_for_watcher.upgrade() {
+                        strong.condvar.notify_all();
+                    }
+                    return;
+                }
+            };
+            // Never let our own file reads or access-time updates trigger an inotify feedback storm
+            if matches!(
+                event.kind,
+                notify::EventKind::Access(_)
+                    | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
+                        notify::event::MetadataKind::AccessTime
+                    ))
+            ) {
+                return;
+            }
+            if !event.need_rescan()
+                && !event.paths.is_empty()
+                && event.paths.iter().all(|path| {
+                    if path.is_dir() {
+                        return watcher_filter_for_callback
+                            .lock()
+                            .map(|directories| directories.contains(path))
+                            .unwrap_or(false);
+                    }
+                    path.strip_prefix(&watcher_workspace.root)
+                        .ok()
+                        .is_none_or(|relative| {
+                            !watcher_workspace.is_permitted_rel(relative)
+                                && !watcher_workspace.is_permitted_data_rel(relative)
+                        })
+                })
+            {
+                return;
+            }
+            if event.need_rescan() {
+                overflow_for_cb.store(true, Ordering::Release);
+            }
+            if let Err(err) = fs_tx.try_send(event)
+                && matches!(err, TrySendError::Full(_))
+            {
+                overflow_for_cb.store(true, Ordering::Release);
+            }
+            if let Some(strong) = weak_for_watcher.upgrade() {
+                strong.condvar.notify_all();
+            }
+        })?;
+        for dir in &watch_dirs {
+            watcher.watch(dir, RecursiveMode::NonRecursive)?;
+        }
+        *arc.watcher
+            .lock()
+            .map_err(|_| invalid("watcher mutex poisoned"))? = Some(watcher);
 
         if spec.policy.background_enabled {
             Self::spawn_background_worker(&arc)?;
