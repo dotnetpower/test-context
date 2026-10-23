@@ -482,6 +482,55 @@ impl DependencyGraph {
         self.dep_hash_for_test.keys().cloned().collect()
     }
 
+    /// Returns safe 3rd-party packages imported across the workspace that can be pre-imported in the Warm Pytest Zygote
+    /// without touching any workspace-local Python module.
+    pub fn external_preload_modules(&self) -> Vec<String> {
+        let mut local_roots = BTreeSet::new();
+        for path in self.files.keys() {
+            if !path.ends_with(".py") {
+                continue;
+            }
+            for cand in candidate_module_names(path) {
+                if let Some(first) = cand.split('.').next() {
+                    local_roots.insert(first.to_string());
+                }
+            }
+            if let Some(stem) = Path::new(path).file_stem().and_then(|s| s.to_str()) {
+                local_roots.insert(stem.to_string());
+            }
+        }
+        let excluded = [
+            "pytest",
+            "_pytest",
+            "conftest",
+            "anyio",
+            "trio",
+            "hypothesis",
+            "pytest_asyncio",
+            "pytest_trio",
+            "pytest_cov",
+        ];
+        let mut externals = BTreeSet::new();
+        for node in self.files.values() {
+            for spec in &node.parsed.imports {
+                if spec.level > 0 || spec.module.is_empty() {
+                    continue;
+                }
+                let top = spec.module.split('.').next().unwrap_or("");
+                if top.is_empty() || local_roots.contains(top) || excluded.contains(&top) {
+                    continue;
+                }
+                externals.insert(top.to_string());
+                if matches!(top, "fastapi" | "azure" | "openai" | "pydantic" | "httpx" | "starlette")
+                    && spec.module.split('.').count() <= 2
+                {
+                    externals.insert(spec.module.clone());
+                }
+            }
+        }
+        externals.into_iter().take(48).collect()
+    }
+
     /// Computes all transitively affected Python files (both application modules and test files) for a list of modified paths.
     pub fn affected_modules(&self, changed_files: &[String]) -> Vec<String> {
         let mut queue: VecDeque<String> = VecDeque::new();

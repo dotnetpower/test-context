@@ -335,37 +335,73 @@ def render(report, output: Path):
         }
     )
     kinds = (*KINDS, "all")
+    row_labels = [
+        "Warm suite (cache hit)",
+        "Post-edit (bg pre-run)",
+        "Reverted edit (Merkle hit)",
+        "Leaf edit (hybrid delta)",
+        "Impact query (AST affected)",
+        "Mixed suite (all tasks)",
+    ]
     colors = ("#0072B2", "#D55E00")
-    figure, (latency, speed) = plt.subplots(1, 2, figsize=(12.0, 4.6), constrained_layout=True)
+    figure, (latency, speed) = plt.subplots(
+        1,
+        2,
+        figsize=(13.4, 5.6),
+        sharey=True,
+        gridspec_kw={"width_ratios": [1.15, 1.0], "wspace": 0.08},
+    )
+
+    max_lat_ci = max(report["summary"][k]["disabled_ms"]["ci95"][1] for k in kinds)
     for index, (mode, label) in enumerate(
-        (("disabled_ms", "TCTX off (direct pytest)"), ("enabled_ms", "TCTX on (AST + bg cache)"))
+        (("disabled_ms", "TCTX off (direct pytest)"), ("enabled_ms", "TCTX on (AST + Zygote + cache)"))
     ):
         means = [report["summary"][kind][mode]["mean"] for kind in kinds]
         intervals = [report["summary"][kind][mode]["ci95"] for kind in kinds]
-        positions = [i + (index - 0.5) * 0.34 for i in range(len(kinds))]
-        latency.bar(
+        offset = -0.18 if index == 0 else 0.18
+        positions = [i + offset for i in range(len(kinds))]
+        latency.barh(
             positions,
             means,
-            width=0.32,
+            height=0.32,
             color=colors[index],
             label=label,
-            yerr=[
+            xerr=[
                 [m - ci[0] for m, ci in zip(means, intervals)],
                 [ci[1] - m for m, ci in zip(means, intervals)],
             ],
             capsize=3,
             error_kw={"linewidth": 1},
         )
+        for row_idx, (m, ci) in enumerate(zip(means, intervals)):
+            text_x = max(m, ci[1]) + max_lat_ci * 0.018
+            val_str = f"{m:.1f} ms" if m < 100 else f"{m:.0f} ms"
+            latency.text(
+                text_x,
+                row_idx + offset,
+                val_str,
+                va="center",
+                ha="left",
+                fontsize=8.5,
+                color="#222222",
+            )
+
     latency.set(
-        xticks=range(len(kinds)),
-        xticklabels=LABELS,
-        ylabel="Mean wall time per operation (ms)",
-        title="A  Test execution & query latency (lower is better)",
-        ylim=(0, max(report["summary"][k]["disabled_ms"]["ci95"][1] for k in kinds) * 1.22),
+        yticks=range(len(kinds)),
+        yticklabels=row_labels,
+        xlabel="Mean wall time per operation (ms, lower is better)",
+        xlim=(0, max_lat_ci * 1.26),
     )
-    latency.tick_params(axis="x", labelsize=8.5, labelrotation=15)
-    latency.legend(frameon=False, loc="upper right", fontsize=9)
-    latency.grid(axis="y", alpha=0.2)
+    latency.set_title("A  Test execution & query latency", pad=26, fontsize=11, fontweight="bold")
+    latency.legend(
+        frameon=False,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.01),
+        ncol=2,
+        fontsize=9.5,
+    )
+    latency.invert_yaxis()
+    latency.grid(axis="x", alpha=0.25)
     latency.set_axisbelow(True)
 
     ratios = [report["summary"][kind]["speedup"]["ratio"] for kind in kinds]
@@ -379,62 +415,76 @@ def render(report, output: Path):
         ],
         fmt="o",
         color=colors[0],
+        markersize=6,
         capsize=4,
+        elinewidth=1.4,
     )
     speed.axvline(1, color="#666666", linestyle="--", linewidth=1)
     speed.set(
-        yticks=range(len(kinds)),
-        yticklabels=[lbl.replace("\n", " ") for lbl in LABELS],
-        xlabel="Speedup = off / on (log scale)",
-        title="B  Paired-session speedup with 95% CI",
+        xlabel="Speedup = off / on (log scale, higher is better)",
         xscale="log",
     )
-    speed.set_xlim(min(ci[0] for ci in intervals) * 0.5, max(ci[1] for ci in intervals) * 3.8)
-    speed.invert_yaxis()
-    speed.grid(axis="x", which="both", alpha=0.2)
-    for index, value in enumerate(ratios):
-        speed.annotate(
+    speed.set_title("B  Paired-session speedup (95% CI)", pad=26, fontsize=11, fontweight="bold")
+    speed.tick_params(axis="y", labelleft=False)
+    min_ci = min(ci[0] for ci in intervals)
+    max_ci = max(ci[1] for ci in intervals)
+    speed.set_xlim(min(0.6, min_ci * 0.55), max_ci * 5.5)
+    speed.grid(axis="x", which="both", alpha=0.25)
+    for index, (value, ci) in enumerate(zip(ratios, intervals)):
+        label_x = ci[1] * 1.16
+        speed.text(
+            label_x,
+            index,
             f"{value:.1f}×",
-            (value, index),
-            xytext=(0, 8),
-            textcoords="offset points",
-            ha="center",
-            fontsize=9,
+            va="center",
+            ha="left",
+            fontsize=9.5,
+            fontweight="bold",
+            color="#111111",
         )
+
     figure.suptitle(
         f"AKS Store Demo (src/ai-service) · {report['sessions']} independent daemon sessions",
-        fontsize=12,
+        fontsize=12.5,
+        y=1.03,
     )
     output.mkdir(parents=True, exist_ok=True)
     for suffix in ("png", "svg", "pdf"):
         figure.savefig(
             output / ("latency-speedup." + suffix),
             bbox_inches="tight",
-            pad_inches=0.12,
+            pad_inches=0.16,
             metadata={"Creator": "Test Context benchmark"},
         )
     plt.close(figure)
 
-    figure, ax = plt.subplots(1, 1, figsize=(6.2, 4.0), constrained_layout=True)
-    sessions_x = range(1, len(report["cold"]) + 1)
+    figure, ax = plt.subplots(1, 1, figsize=(7.2, 4.2), constrained_layout=True)
+    sessions_x = list(range(1, len(report["cold"]) + 1))
     off_cold = [r["disabled_cold_ms"] for r in report["cold"]]
     on_cold = [r["enabled_cold_ms"] for r in report["cold"]]
-    ax.plot(sessions_x, off_cold, "s-", color=colors[0], label="TCTX off (direct pytest)")
-    ax.plot(sessions_x, on_cold, "o-", color=colors[1], label="TCTX on (cold AST build + initial run)")
+    ax.plot(sessions_x, off_cold, "s-", color=colors[0], linewidth=1.8, label="TCTX off (direct pytest)")
+    ax.plot(
+        sessions_x,
+        on_cold,
+        "o-",
+        color=colors[1],
+        linewidth=1.8,
+        label="TCTX on (cold AST build + initial run)",
+    )
     ax.set(
         xlabel="Independent daemon session",
         ylabel="Wall time (ms)",
         title="Cold initial suite run (no prior cache)",
-        xticks=list(sessions_x),
-        ylim=(0, max(off_cold + on_cold) * 1.2),
+        xticks=sessions_x,
+        ylim=(0, max(off_cold + on_cold) * 1.25),
     )
-    ax.legend(frameon=False)
-    ax.grid(axis="y", alpha=0.2)
+    ax.legend(frameon=False, loc="upper right")
+    ax.grid(axis="y", alpha=0.25)
     for suffix in ("png", "svg", "pdf"):
         figure.savefig(
             output / ("cold-start." + suffix),
             bbox_inches="tight",
-            pad_inches=0.12,
+            pad_inches=0.14,
             metadata={"Creator": "Test Context benchmark"},
         )
     plt.close(figure)

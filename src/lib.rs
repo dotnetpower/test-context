@@ -10,6 +10,7 @@ pub mod registration;
 pub mod runner;
 pub mod shared_mcp;
 pub mod workspace;
+pub mod zygote;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

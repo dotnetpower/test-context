@@ -4,6 +4,7 @@ use crate::ast_graph::{
 use crate::cache::{CachedTestRecord, RootCache, TestOutcome, now_unix_ms};
 use crate::catalog::Spec;
 use crate::workspace::{Workspace, run_command_with_timeout};
+use crate::zygote::PytestZygote;
 use crate::{Result, invalid};
 use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -96,6 +97,7 @@ pub struct ManagedRoot {
     fs_events_rx: Mutex<Receiver<Event>>,
     fs_overflow: Arc<AtomicBool>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    zygote: Mutex<Option<PytestZygote>>,
 }
 
 impl ManagedRoot {
@@ -191,14 +193,40 @@ impl ManagedRoot {
                 fs_events_rx: Mutex::new(fs_rx),
                 fs_overflow,
                 watcher: Mutex::new(watcher),
+                zygote: Mutex::new(None),
             }
         });
 
         if spec.policy.background_enabled {
+            Self::spawn_zygote_warmer(Arc::clone(&arc));
             Self::spawn_background_worker(Arc::clone(&arc));
         }
 
         Ok(arc)
+    }
+
+    fn spawn_zygote_warmer(this: Arc<Self>) {
+        let _ = std::thread::Builder::new()
+            .name("tctx-zygote-warm".to_string())
+            .spawn(move || {
+                let (spec, preload) = {
+                    let Ok(guard) = this.state.lock() else {
+                        return;
+                    };
+                    (
+                        guard.spec.clone(),
+                        guard.graph.external_preload_modules(),
+                    )
+                };
+                let pythonpath = build_pythonpath(&spec.root, std::env::var_os("PYTHONPATH"));
+                if let Ok(mut z_guard) = this.zygote.lock()
+                    && z_guard.is_none()
+                    && !this.stopped.load(Ordering::SeqCst)
+                    && let Ok(spawned) = PytestZygote::spawn(&spec, pythonpath, &preload)
+                {
+                    *z_guard = Some(spawned);
+                }
+            });
     }
 
     pub fn last_activity_elapsed(&self) -> Duration {
@@ -212,6 +240,9 @@ impl ManagedRoot {
         self.stopped.store(true, Ordering::SeqCst);
         if let Ok(mut w) = self.watcher.lock() {
             *w = None;
+        }
+        if let Ok(mut z) = self.zygote.lock() {
+            *z = None;
         }
         self.condvar.notify_all();
     }
@@ -231,6 +262,7 @@ impl ManagedRoot {
             }
             let batch: Vec<(String, String)>;
             let spec: Spec;
+            let preload_modules: Vec<String>;
             {
                 let mut guard = self.state.lock().expect("state lock");
                 self.drain_fs_events_locked(&mut guard);
@@ -278,6 +310,7 @@ impl ManagedRoot {
                 guard.background_running = true;
                 batch = selected;
                 spec = guard.spec.clone();
+                preload_modules = guard.graph.external_preload_modules();
             }
 
             let files_only: Vec<String> = batch.iter().map(|(f, _)| f.clone()).collect();
@@ -290,6 +323,8 @@ impl ManagedRoot {
                 None,
                 &[],
                 "background",
+                Some(&self.zygote),
+                &preload_modules,
             );
 
             {
@@ -758,6 +793,7 @@ impl ManagedRoot {
         let mut joined_bg_count = 0usize;
         let mut saved_ms = 0u64;
         let spec: Spec;
+        let preload_modules: Vec<String>;
         let target_test_files: Vec<String>;
 
         {
@@ -771,6 +807,7 @@ impl ManagedRoot {
             Self::reconcile_live_files_locked(&mut guard, Some(&initial_targets));
             target_test_files = guard.graph.resolve_target_test_files(&req.targets);
             spec = guard.spec.clone();
+            preload_modules = guard.graph.external_preload_modules();
 
             if target_test_files.is_empty() {
                 return Ok(TestRunResponse {
@@ -912,6 +949,8 @@ impl ManagedRoot {
                 req.mark.as_deref(),
                 &req.pytest_args,
                 "on_demand",
+                Some(&self.zygote),
+                &preload_modules,
             );
 
             let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
@@ -942,9 +981,6 @@ impl ManagedRoot {
             guard.cache.total_delta_runs = guard.cache.total_delta_runs.saturating_add(1);
             let _ = guard.cache.save();
             self.condvar.notify_all();
-        } else {
-            let guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
-            let _ = guard.cache.save();
         }
 
         // 5. Aggregate final counts and build pytest-compatible summary
@@ -1102,6 +1138,8 @@ fn execute_pytest_batch(
     mark_expr: Option<&str>,
     extra_args: &[String],
     source_label: &str,
+    zygote_slot: Option<&Mutex<Option<PytestZygote>>>,
+    preload_modules: &[String],
 ) -> Result<(Vec<CachedTestRecord>, String)> {
     let pytest_cmd = spec.effective_pytest_cmd();
     let Some((program, base_args)) = pytest_cmd.split_first() else {
@@ -1110,40 +1148,70 @@ fn execute_pytest_batch(
 
     let tmp_dir = tempfile::tempdir()?;
     let junit_path = tmp_dir.path().join("junit.xml");
+    let pythonpath = build_pythonpath(&spec.root, std::env::var_os("PYTHONPATH"));
 
-    let mut command = Command::new(program);
-    command.current_dir(&spec.root);
-    command.env(
-        "PYTHONPATH",
-        build_pythonpath(&spec.root, std::env::var_os("PYTHONPATH")),
-    );
-    command.args(base_args);
-    command.arg("-q");
-    command.arg("--tb=short");
-    command.arg("--no-header");
-    command.arg("-o");
-    command.arg("junit_family=xunit1");
-    command.arg(format!("--junit-xml={}", junit_path.display()));
-
+    let mut pytest_cli_args: Vec<String> = vec![
+        "-q".to_string(),
+        "--tb=short".to_string(),
+        "--no-header".to_string(),
+        "-p".to_string(),
+        "no:cacheprovider".to_string(),
+        "-o".to_string(),
+        "junit_family=xunit1".to_string(),
+        format!("--junit-xml={}", junit_path.display()),
+    ];
     if let Some(k) = k_expr
         && !k.trim().is_empty()
     {
-        command.arg("-k").arg(k);
+        pytest_cli_args.push("-k".to_string());
+        pytest_cli_args.push(k.to_string());
     }
     if let Some(m) = mark_expr
         && !m.trim().is_empty()
     {
-        command.arg("-m").arg(m);
+        pytest_cli_args.push("-m".to_string());
+        pytest_cli_args.push(m.to_string());
     }
     for arg in extra_args {
-        command.arg(arg);
+        pytest_cli_args.push(arg.clone());
     }
     for target in invocation_targets {
-        command.arg(target);
+        pytest_cli_args.push(target.clone());
     }
 
-    let timeout = Duration::from_secs(spec.policy.pytest_timeout_secs);
-    let output = run_command_with_timeout(&mut command, timeout, 2 * 1024 * 1024)?;
+    let timeout_secs = spec.policy.pytest_timeout_secs;
+    let mut output_opt = None;
+
+    if let Some(slot) = zygote_slot
+        && let Ok(mut z_guard) = slot.lock()
+    {
+        let needs_respawn = z_guard
+            .as_ref()
+            .is_none_or(|z| !z.matches_config(spec, &pythonpath));
+        if needs_respawn {
+            *z_guard = PytestZygote::spawn(spec, pythonpath.clone(), preload_modules).ok();
+        }
+        if let Some(ref mut zygote) = *z_guard {
+            match zygote.run_pytest(&pytest_cli_args, timeout_secs) {
+                Ok(out) => output_opt = Some(out),
+                Err(_) => {
+                    *z_guard = None;
+                }
+            }
+        }
+    }
+
+    let output = if let Some(out) = output_opt {
+        out
+    } else {
+        let mut command = Command::new(program);
+        command.current_dir(&spec.root);
+        command.env("PYTHONPATH", &pythonpath);
+        command.args(base_args);
+        command.args(&pytest_cli_args);
+        let timeout = Duration::from_secs(timeout_secs);
+        run_command_with_timeout(&mut command, timeout, 2 * 1024 * 1024)?
+    };
     if output.timed_out {
         return Err(invalid(format!(
             "pytest execution timed out after {}s",
