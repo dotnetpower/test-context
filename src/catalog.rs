@@ -55,11 +55,29 @@ impl Spec {
 }
 
 pub fn detect_pytest_cmd(root: &Path, managed_parent: Option<&Path>) -> Vec<String> {
+    if let Some(env_bin) = std::env::var_os("TCTX_PYTEST_BIN") {
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            return vec![p.to_string_lossy().into_owned()];
+        }
+    }
     let mut candidates = vec![
         root.join(".venv/bin/pytest"),
         root.join("venv/bin/pytest"),
         root.join(".env/bin/pytest"),
     ];
+    for container in ["src", "services", "packages", "apps"] {
+        let dir = root.join(container);
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let sub = entry.path();
+                if sub.is_dir() {
+                    candidates.push(sub.join(".venv/bin/pytest"));
+                    candidates.push(sub.join("venv/bin/pytest"));
+                }
+            }
+        }
+    }
     if let Some(parent) = managed_parent {
         candidates.push(parent.join(".venv/bin/pytest"));
         candidates.push(parent.join("venv/bin/pytest"));

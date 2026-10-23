@@ -709,6 +709,7 @@ impl ManagedRoot {
             Vec::new()
         };
 
+        let affected_modules = guard.graph.affected_modules(&changed_files);
         let affected_raw: Vec<AffectedTest> = guard.graph.affected_tests(&changed_files);
         let mut items = Vec::with_capacity(affected_raw.len());
         for a in affected_raw {
@@ -738,6 +739,7 @@ impl ManagedRoot {
         Ok(serde_json::json!({
             "root": guard.workspace.root,
             "changed_files": changed_files,
+            "affected_modules": affected_modules,
             "total_affected_test_files": items.len(),
             "affected_tests": items,
         }))
@@ -1058,13 +1060,26 @@ fn build_pythonpath(root: &Path, existing: Option<std::ffi::OsString>) -> std::f
     if src.is_dir() {
         paths.push(src);
     }
-    for container in ["services", "packages"] {
+    for container in ["src", "services", "packages", "apps", "extensions"] {
         let dir = root.join(container);
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
-                let sub_src = entry.path().join("src");
-                if sub_src.is_dir() {
+                let sub = entry.path();
+                if !sub.is_dir() {
+                    continue;
+                }
+                let sub_src = sub.join("src");
+                if sub_src.is_dir() && !paths.contains(&sub_src) {
                     paths.push(sub_src);
+                }
+                if (sub.join("requirements.txt").is_file()
+                    || sub.join("pyproject.toml").is_file()
+                    || sub.join("pytest.ini").is_file()
+                    || sub.join("main.py").is_file()
+                    || sub.join("conftest.py").is_file())
+                    && !paths.contains(&sub)
+                {
+                    paths.push(sub);
                 }
             }
         }

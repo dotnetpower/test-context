@@ -22,6 +22,23 @@ When GitHub Copilot (or a developer) invokes tests:
   - Shared MCP Server (`tctx shared-mcp`) for background/CLI agent sessions (`test_run`, `test_affected`, `test_graph`, `test_status`, `test_sync`, `test_workspaces`, `test_invalidate`).
   - Drop-in CLI (`tctx run`, `tctx pytest`, `tctx affected`, `tctx graph`, `tctx status`, `tctx sync`).
 
+## Measured Performance (`aks-store-demo` Python AI Service)
+
+Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo) (`src/ai-service`):
+
+![Test execution and query latency and paired-session speedup with 95% confidence intervals](benchmarks/results/aks-store-demo/latency-speedup.png)
+
+| Task | TCTX off (`pytest`) | TCTX on | Speedup [95% CI] |
+|---|---:|---:|---:|
+| Warm suite (`warm_suite`) | 940.39 ms | 12.43 ms (median 6.95 ms) | **75.63×** [50.14, 126.56] |
+| Post-edit background pre-run (`bg_speculative`) | 938.13 ms | 10.56 ms (median 6.58 ms) | **88.85×** [64.65, 137.32] |
+| Reverted edit Merkle hit (`merkle_revert`) | 938.37 ms | 11.27 ms (median 7.14 ms) | **83.27×** [58.01, 135.06] |
+| Immediate 0ms-delay leaf edit (`leaf_delta`) | 967.76 ms | 920.48 ms | **1.05×** [1.03, 1.07] |
+| Impact query (`affected_graph`) | 899.91 ms | 0.47 ms (median 0.44 ms) | **1899.28×** [1814.61, 1978.40] |
+| Fixed mixed suite (`all`, 320 pairs) | 936.91 ms | 191.04 ms (median 6.93 ms) | **4.90×** [4.78, 5.02] |
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology, cold-start measurements, raw samples, and reproduction instructions.
+
 ## Quick Start
 
 ```bash

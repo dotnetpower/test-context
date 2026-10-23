@@ -482,6 +482,28 @@ impl DependencyGraph {
         self.dep_hash_for_test.keys().cloned().collect()
     }
 
+    /// Computes all transitively affected Python files (both application modules and test files) for a list of modified paths.
+    pub fn affected_modules(&self, changed_files: &[String]) -> Vec<String> {
+        let mut queue: VecDeque<String> = VecDeque::new();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        for raw in changed_files {
+            let norm = raw.trim().trim_start_matches("./").replace('\\', "/");
+            if !norm.is_empty() && visited.insert(norm.clone()) {
+                queue.push_back(norm);
+            }
+        }
+        while let Some(curr) = queue.pop_front() {
+            if let Some(importers) = self.reverse_imports.get(&curr) {
+                for importer in importers {
+                    if visited.insert(importer.clone()) {
+                        queue.push_back(importer.clone());
+                    }
+                }
+            }
+        }
+        visited.into_iter().collect()
+    }
+
     /// Computes affected test files and shortest dependency chains for a list of modified relative file paths.
     pub fn affected_tests(&self, changed_files: &[String]) -> Vec<AffectedTest> {
         let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -936,7 +958,9 @@ fn service_compartment(rel_path: &str) -> Option<&str> {
     let mut parts = rel_path.split('/');
     let first = parts.next()?;
     let second = parts.next()?;
-    if matches!(first, "services" | "extensions" | "benchmarks" | "apps") {
+    if matches!(first, "services" | "extensions" | "benchmarks" | "apps")
+        || (first == "src" && second.contains('-'))
+    {
         let len = first.len() + 1 + second.len();
         Some(&rel_path[..len])
     } else {
@@ -1016,14 +1040,39 @@ fn candidate_module_names(rel_py_path: &str) -> Vec<String> {
     }
 
     let mut names = BTreeSet::new();
-    // 1. Full path from repo root
-    names.insert(parts.join("."));
+    // 1. Full path from repo root (when all segments are valid Python identifiers)
+    if parts.iter().all(|s| is_valid_dotted_module(s)) {
+        names.insert(parts.join("."));
+    }
 
     // 2. If there is a `src` or `python` segment (e.g. `src/pkg/mod.py`, `services/foo/src/pkg/mod.py`, `packages/bar/src/pkg/mod.py`),
     // register suffix after `src` or `python`.
     for (idx, &seg) in parts.iter().enumerate() {
         if (seg == "src" || seg == "python") && idx + 1 < parts.len() {
-            names.insert(parts[idx + 1..].join("."));
+            let tail = &parts[idx + 1..];
+            if tail.iter().all(|s| is_valid_dotted_module(s)) {
+                names.insert(tail.join("."));
+            }
+        }
+    }
+
+    // 3. Support polyglot service roots like `src/ai-service/routers/description_generator.py` or `services/order-svc/app/main.py`
+    // where a parent directory segment is a hyphenated service folder or a top-level service container (`src/<svc>/...`, `services/<svc>/...`).
+    for (idx, &seg) in parts.iter().enumerate() {
+        if !is_valid_dotted_module(seg) && idx + 1 < parts.len() {
+            let tail = &parts[idx + 1..];
+            if tail.iter().all(|s| is_valid_dotted_module(s)) {
+                names.insert(tail.join("."));
+            }
+        }
+    }
+    if parts.len() >= 2
+        && matches!(parts[0], "src" | "services" | "apps" | "packages" | "extensions")
+        && parts.get(2) != Some(&"src")
+    {
+        let tail = &parts[2..];
+        if !tail.is_empty() && tail.iter().all(|s| is_valid_dotted_module(s)) {
+            names.insert(tail.join("."));
         }
     }
 
@@ -1818,5 +1867,55 @@ def test_with_varargs(first_fx, *args, kw_fx: int = 1, **kwargs):
             graph.dep_hash_for_test["services/svc_b/tests/test_b.py"],
             hash_b_before
         );
+    }
+
+    #[test]
+    fn resolves_aks_store_demo_polyglot_hyphenated_subservice_imports() {
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "src/ai-service/routers/__init__.py",
+            b"",
+        );
+        graph.insert_file_bytes(
+            "src/ai-service/routers/description_generator.py",
+            b"def generate_description(): return 'desc'\n",
+        );
+        graph.insert_file_bytes(
+            "src/ai-service/routers/image_generator.py",
+            b"def generate_image(): return 'img'\n",
+        );
+        graph.insert_file_bytes(
+            "src/ai-service/main.py",
+            b"from routers.description_generator import generate_description\nfrom routers.image_generator import generate_image\n",
+        );
+        graph.insert_file_bytes(
+            "src/ai-service/tests/test_description.py",
+            b"from routers.description_generator import generate_description\ndef test_desc(): assert generate_description() == 'desc'\n",
+        );
+        graph.insert_file_bytes(
+            "src/ai-service/tests/test_image.py",
+            b"from routers.image_generator import generate_image\ndef test_img(): assert generate_image() == 'img'\n",
+        );
+        graph.insert_file_bytes(
+            "src/ai-service/tests/test_main.py",
+            b"from main import generate_description\ndef test_app(): pass\n",
+        );
+        graph.recompute_edges();
+
+        let affected = graph.affected_tests(&[
+            "src/ai-service/routers/description_generator.py".to_string(),
+        ]);
+        let test_files: Vec<String> = affected.into_iter().map(|a| a.test_file).collect();
+        assert_eq!(
+            test_files,
+            vec![
+                "src/ai-service/tests/test_description.py".to_string(),
+                "src/ai-service/tests/test_main.py".to_string(),
+            ]
+        );
+        let modules = graph.affected_modules(&[
+            "src/ai-service/routers/description_generator.py".to_string(),
+        ]);
+        assert!(modules.contains(&"src/ai-service/main.py".to_string()));
     }
 }
