@@ -1,5 +1,5 @@
 use crate::policy::MemoryPolicy;
-use crate::workspace::{PYTEST_CONFIG_FILES, Workspace};
+use crate::workspace::{DATA_FILE_EXTENSIONS, PYTEST_CONFIG_FILES, Workspace};
 use crate::{Result, invalid};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -42,6 +42,7 @@ pub struct ParsedPythonFile {
     pub fixtures_defined: Vec<String>,
     pub fixtures_used: Vec<String>,
     pub defined_symbols: Vec<String>,
+    pub data_refs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,26 +130,76 @@ impl DependencyGraph {
             let rel_str = normalize_rel_str(rel_path);
             graph.insert_file_bytes_with_stamp(&rel_str, &bytes, stamp);
         }
+        graph.discover_referenced_data_files(workspace, policy);
         graph.recompute_edges();
         Ok(graph)
     }
 
-    pub fn insert_file_bytes(&mut self, rel_str: &str, bytes: &[u8]) {
-        self.insert_file_bytes_with_stamp(rel_str, bytes, None);
+    pub fn discover_referenced_data_files(&mut self, workspace: &Workspace, policy: &MemoryPolicy) {
+        let mut candidates = BTreeSet::new();
+        for (py_path, node) in &self.files {
+            if node.parsed.data_refs.is_empty() {
+                continue;
+            }
+            let parent = Path::new(py_path).parent().unwrap_or_else(|| Path::new(""));
+            for data_ref in &node.parsed.data_refs {
+                let root_cand = Path::new(data_ref).to_path_buf();
+                if workspace.is_permitted_data_rel(&root_cand) {
+                    candidates.insert(normalize_rel_str(&root_cand));
+                }
+                if !parent.as_os_str().is_empty() {
+                    let rel_cand = parent.join(data_ref);
+                    if workspace.is_permitted_data_rel(&rel_cand) {
+                        candidates.insert(normalize_rel_str(&rel_cand));
+                    }
+                }
+            }
+        }
+        for rel_str in candidates {
+            if self.files.contains_key(&rel_str) {
+                continue;
+            }
+            let rel_path = Path::new(&rel_str);
+            let full_path = workspace.root.join(rel_path);
+            if let Some(stamp) = file_stamp(&full_path)
+                && let Ok(bytes) = workspace.read_known_with_limit(rel_path, policy.max_file_bytes)
+            {
+                let sha = sha256_hex(&bytes);
+                self.files.insert(
+                    rel_str.clone(),
+                    FileNode {
+                        path: rel_str,
+                        sha256: sha,
+                        stamp: Some(stamp),
+                        is_test: false,
+                        is_conftest: false,
+                        is_config: false,
+                        parsed: ParsedPythonFile::default(),
+                    },
+                );
+            }
+        }
     }
 
+    pub fn insert_file_bytes(&mut self, rel_str: &str, bytes: &[u8]) -> bool {
+        self.insert_file_bytes_with_stamp(rel_str, bytes, None)
+    }
+
+    /// Inserts or updates a file node and returns `true` if the dependency structure (AST imports/fixtures/data_refs) changed,
+    /// or `false` if only the file's content hash changed.
     pub fn insert_file_bytes_with_stamp(
         &mut self,
         rel_str: &str,
         bytes: &[u8],
         stamp: Option<FileStamp>,
-    ) {
+    ) -> bool {
         let sha = sha256_hex(bytes);
         let file_name = Path::new(rel_str)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
         if PYTEST_CONFIG_FILES.contains(&file_name) {
+            let is_new = !self.config_hashes.contains_key(rel_str);
             self.config_hashes.insert(rel_str.to_string(), sha.clone());
             self.files.insert(
                 rel_str.to_string(),
@@ -162,15 +213,36 @@ impl DependencyGraph {
                     parsed: ParsedPythonFile::default(),
                 },
             );
-            return;
+            return is_new;
         }
         if !file_name.ends_with(".py") {
-            return;
+            let is_new = !self.files.contains_key(rel_str);
+            self.files.insert(
+                rel_str.to_string(),
+                FileNode {
+                    path: rel_str.to_string(),
+                    sha256: sha,
+                    stamp,
+                    is_test: false,
+                    is_conftest: false,
+                    is_config: false,
+                    parsed: ParsedPythonFile::default(),
+                },
+            );
+            return is_new;
         }
         let source = String::from_utf8_lossy(bytes);
         let parsed = parse_python_source(&source);
         let is_conftest = file_name == "conftest.py";
         let is_test = !is_conftest && is_test_filename(file_name);
+        let structure_changed = match self.files.get(rel_str) {
+            Some(existing) => {
+                existing.is_test != is_test
+                    || existing.is_conftest != is_conftest
+                    || existing.parsed != parsed
+            }
+            None => true,
+        };
         self.files.insert(
             rel_str.to_string(),
             FileNode {
@@ -183,6 +255,51 @@ impl DependencyGraph {
                 parsed,
             },
         );
+        structure_changed
+    }
+
+    /// Fast O(affected) Merkle hash update when file contents changed but import/fixture structure did not change.
+    pub fn recompute_hashes_for_changed(&mut self, changed_files: &[String]) {
+        if self.file_index_to_path.len() != self.files.len() {
+            self.recompute_edges();
+            return;
+        }
+        let mut cfg_prefix = Vec::new();
+        cfg_prefix.extend_from_slice(b"tctx:merkle:v1\n");
+        for (cfg_path, cfg_sha) in &self.config_hashes {
+            cfg_prefix.extend_from_slice(b"cfg:");
+            cfg_prefix.extend_from_slice(cfg_path.as_bytes());
+            cfg_prefix.extend_from_slice(b":");
+            cfg_prefix.extend_from_slice(cfg_sha.as_bytes());
+            cfg_prefix.extend_from_slice(b"\n");
+        }
+
+        let affected: Vec<String> = self
+            .affected_tests(changed_files)
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+
+        for test_path in affected {
+            let Some(reachable_ids) = self.transitive_dep_ids_for_test.get(&test_path) else {
+                continue;
+            };
+            let mut hasher = Sha256::new();
+            hasher.update(&cfg_prefix);
+            for &dep_id in reachable_ids {
+                if let Some(dep_path) = self.file_index_to_path.get(dep_id as usize)
+                    && let Some(dep_node) = self.files.get(dep_path)
+                {
+                    hasher.update(b"py:");
+                    hasher.update(dep_path.as_bytes());
+                    hasher.update(b":");
+                    hasher.update(dep_node.sha256.as_bytes());
+                    hasher.update(b"\n");
+                }
+            }
+            let dep_hash = hex_encode(&hasher.finalize());
+            self.dep_hash_for_test.insert(test_path, dep_hash);
+        }
     }
 
     pub fn remove_file(&mut self, rel_str: &str) -> bool {
@@ -236,6 +353,20 @@ impl DependencyGraph {
                     for provider in providers {
                         if provider != path && is_provider_applicable(provider, path) {
                             deps.insert(provider.clone());
+                        }
+                    }
+                }
+            }
+            if !node.parsed.data_refs.is_empty() {
+                let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+                for data_ref in &node.parsed.data_refs {
+                    if self.files.contains_key(data_ref) && data_ref != path {
+                        deps.insert(data_ref.clone());
+                    }
+                    if !parent.as_os_str().is_empty() {
+                        let rel_cand = normalize_rel_str(&parent.join(data_ref));
+                        if self.files.contains_key(&rel_cand) && &rel_cand != path {
+                            deps.insert(rel_cand);
                         }
                     }
                 }
@@ -708,6 +839,11 @@ impl ModuleIndex {
                         self.reexports.get(&(target.clone(), sym.clone()))
                     {
                         resolved.extend(reexported_files.iter().cloned());
+                    } else if files
+                        .get(target)
+                        .is_some_and(|n| n.parsed.defined_symbols.contains(sym))
+                    {
+                        resolved.insert(target.clone());
                     } else {
                         // Check if symbol was already resolved as a submodule file of this package
                         let pkg_dir = target.strip_suffix("/__init__.py").unwrap_or("");
@@ -770,7 +906,7 @@ impl ModuleIndex {
             // Absolute import
             if !spec.module.is_empty() {
                 if let Some(matches) = self.module_to_files.get(&spec.module) {
-                    resolved.extend(matches.iter().cloned());
+                    resolved.extend(filter_by_package_locality(importer_path, matches));
                 }
                 // Same-directory fallback (e.g. `import helper` inside `tests/unit/test_foo.py`)
                 if let Some(parent) = Path::new(importer_path).parent() {
@@ -781,7 +917,7 @@ impl ModuleIndex {
                     if sym != "*" {
                         let sub_mod = format!("{}.{}", spec.module, sym);
                         if let Some(matches) = self.module_to_files.get(&sub_mod) {
-                            resolved.extend(matches.iter().cloned());
+                            resolved.extend(filter_by_package_locality(importer_path, matches));
                         }
                         if let Some(parent) = Path::new(importer_path).parent() {
                             let rel_target =
@@ -794,6 +930,49 @@ impl ModuleIndex {
         }
         resolved
     }
+}
+
+fn service_compartment(rel_path: &str) -> Option<&str> {
+    let mut parts = rel_path.split('/');
+    let first = parts.next()?;
+    let second = parts.next()?;
+    if matches!(first, "services" | "extensions" | "benchmarks" | "apps") {
+        let len = first.len() + 1 + second.len();
+        Some(&rel_path[..len])
+    } else {
+        None
+    }
+}
+
+fn filter_by_package_locality(
+    importer_path: &str,
+    candidates: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    if candidates.len() <= 1 {
+        return candidates.clone();
+    }
+    if let Some(importer_comp) = service_compartment(importer_path) {
+        let same_comp: BTreeSet<String> = candidates
+            .iter()
+            .filter(|c| service_compartment(c) == Some(importer_comp))
+            .cloned()
+            .collect();
+        if !same_comp.is_empty() {
+            return same_comp;
+        }
+        let non_foreign_service: BTreeSet<String> = candidates
+            .iter()
+            .filter(|c| match service_compartment(c) {
+                Some(comp) => comp == importer_comp,
+                None => true,
+            })
+            .cloned()
+            .collect();
+        if !non_foreign_service.is_empty() {
+            return non_foreign_service;
+        }
+    }
+    candidates.clone()
 }
 
 fn add_path_candidates(
@@ -950,7 +1129,7 @@ fn tokenize_python(source: &str) -> Vec<PyToken> {
                 i += 1;
             }
             b'\'' | b'"' => {
-                let (lit, next_i) = scan_string_literal(source, i);
+                let (lit, next_i) = scan_string_literal(source, i, false);
                 tokens.push(PyToken::StringLit(lit));
                 i = next_i;
             }
@@ -969,7 +1148,8 @@ fn tokenize_python(source: &str) -> Vec<PyToken> {
                         .bytes()
                         .all(|c| matches!(c, b'r' | b'R' | b'f' | b'F' | b'b' | b'B' | b'u' | b'U'))
                 {
-                    let (lit, next_i) = scan_string_literal(source, i);
+                    let is_fstring = word.bytes().any(|c| c == b'f' || c == b'F');
+                    let (lit, next_i) = scan_string_literal(source, i, is_fstring);
                     tokens.push(PyToken::StringLit(lit));
                     i = next_i;
                 } else {
@@ -985,7 +1165,7 @@ fn tokenize_python(source: &str) -> Vec<PyToken> {
     tokens
 }
 
-fn scan_string_literal(source: &str, start_quote_idx: usize) -> (String, usize) {
+fn scan_string_literal(source: &str, start_quote_idx: usize, is_fstring: bool) -> (String, usize) {
     let bytes = source.as_bytes();
     let len = bytes.len();
     let quote = bytes[start_quote_idx];
@@ -998,19 +1178,44 @@ fn scan_string_literal(source: &str, start_quote_idx: usize) -> (String, usize) 
         start_quote_idx + 1
     };
     let mut i = content_start;
+    let mut brace_depth = 0usize;
     while i < len {
         if bytes[i] == b'\\' {
             i = (i + 2).min(len);
             continue;
         }
+        if is_fstring {
+            if bytes[i] == b'{' {
+                if i + 1 < len && bytes[i + 1] == b'{' {
+                    i += 2;
+                    continue;
+                }
+                brace_depth += 1;
+                i += 1;
+                continue;
+            } else if bytes[i] == b'}' {
+                if i + 1 < len && bytes[i + 1] == b'}' {
+                    i += 2;
+                    continue;
+                }
+                brace_depth = brace_depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+        }
         if is_triple {
-            if i + 2 < len && bytes[i] == quote && bytes[i + 1] == quote && bytes[i + 2] == quote {
+            if brace_depth == 0
+                && i + 2 < len
+                && bytes[i] == quote
+                && bytes[i + 1] == quote
+                && bytes[i + 2] == quote
+            {
                 let lit = source[content_start..i].to_string();
                 return (lit, i + 3);
             }
             i += 1;
         } else {
-            if bytes[i] == quote || bytes[i] == b'\n' {
+            if (brace_depth == 0 && bytes[i] == quote) || bytes[i] == b'\n' {
                 let lit = source[content_start..i].to_string();
                 return (lit, (i + 1).min(len));
             }
@@ -1028,7 +1233,7 @@ fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Parses a Python source file to extract imports, test symbols, and pytest fixtures.
+/// Parses a Python source file to extract imports, test symbols, pytest fixtures, defined symbols, and data file references.
 pub fn parse_python_source(source: &str) -> ParsedPythonFile {
     let tokens = tokenize_python(source);
     let mut imports = BTreeSet::new();
@@ -1036,11 +1241,21 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
     let mut fixtures_defined = BTreeSet::new();
     let mut fixtures_used = BTreeSet::new();
     let mut defined_symbols = BTreeSet::new();
+    let mut data_refs = BTreeSet::new();
+
+    for tok in &tokens {
+        if let PyToken::StringLit(lit) = tok
+            && let Some(clean_ref) = normalize_data_ref(lit)
+        {
+            data_refs.insert(clean_ref);
+        }
+    }
 
     let n = tokens.len();
     let mut i = 0usize;
     let mut at_statement_start = true;
     let mut pending_fixture_decorator = false;
+    let mut pending_fixture_custom_name: Option<String> = None;
 
     while i < n {
         match &tokens[i] {
@@ -1049,7 +1264,7 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                 i += 1;
             }
             PyToken::At if at_statement_start => {
-                // Decorator: check if `@pytest.fixture` or `@fixture`
+                // Decorator: check if `@pytest.fixture` / `@fixture` or `@pytest.mark.usefixtures(...)`
                 i += 1;
                 let mut deco_parts = Vec::new();
                 while i < n {
@@ -1064,10 +1279,12 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                         _ => break,
                     }
                 }
-                if deco_parts.last().copied() == Some("fixture") {
+                let is_fixture_deco = deco_parts.last().copied() == Some("fixture");
+                let is_usefixtures_deco = deco_parts.last().copied() == Some("usefixtures");
+                if is_fixture_deco {
                     pending_fixture_decorator = true;
                 }
-                // Skip rest of decorator line (including balanced parens)
+                // Parse decorator arguments (including balanced parens)
                 let mut paren_depth = 0usize;
                 while i < n {
                     match &tokens[i] {
@@ -1077,6 +1294,25 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                         }
                         PyToken::RParen => {
                             paren_depth = paren_depth.saturating_sub(1);
+                            i += 1;
+                        }
+                        PyToken::Ident(arg_name)
+                            if is_fixture_deco
+                                && paren_depth == 1
+                                && arg_name == "name"
+                                && matches!(tokens.get(i + 1), Some(PyToken::Assign)) =>
+                        {
+                            if let Some(PyToken::StringLit(custom)) = tokens.get(i + 2)
+                                && !custom.is_empty()
+                            {
+                                pending_fixture_custom_name = Some(custom.clone());
+                            }
+                            i += 2;
+                        }
+                        PyToken::StringLit(fx_name)
+                            if is_usefixtures_deco && paren_depth == 1 && !fx_name.is_empty() =>
+                        {
+                            fixtures_used.insert(fx_name.clone());
                             i += 1;
                         }
                         PyToken::Newline if paren_depth == 0 => {
@@ -1126,13 +1362,17 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                             test_symbols.insert(sym_name);
                         }
                         pending_fixture_decorator = false;
+                        pending_fixture_custom_name = None;
                     } else {
-                        let is_test_fn = sym_name.starts_with("test_") || sym_name.ends_with("_test");
+                        let is_test_fn =
+                            sym_name.starts_with("test_") || sym_name.ends_with("_test");
                         if is_test_fn {
                             test_symbols.insert(sym_name.clone());
                         }
                         if pending_fixture_decorator {
-                            fixtures_defined.insert(sym_name);
+                            let fx_name =
+                                pending_fixture_custom_name.take().unwrap_or(sym_name);
+                            fixtures_defined.insert(fx_name);
                         }
                         if (is_test_fn || pending_fixture_decorator)
                             && matches!(tokens.get(i), Some(PyToken::LParen))
@@ -1146,6 +1386,32 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                             i = next_i;
                         }
                         pending_fixture_decorator = false;
+                        pending_fixture_custom_name = None;
+                    }
+                }
+                at_statement_start = false;
+            }
+            PyToken::Ident(ident) if ident == "usefixtures" => {
+                i += 1;
+                if matches!(tokens.get(i), Some(PyToken::LParen)) {
+                    i += 1;
+                    let mut depth = 1usize;
+                    while i < n && depth > 0 {
+                        match &tokens[i] {
+                            PyToken::LParen => {
+                                depth += 1;
+                                i += 1;
+                            }
+                            PyToken::RParen => {
+                                depth -= 1;
+                                i += 1;
+                            }
+                            PyToken::StringLit(fx) if depth == 1 && !fx.is_empty() => {
+                                fixtures_used.insert(fx.clone());
+                                i += 1;
+                            }
+                            _ => i += 1,
+                        }
                     }
                 }
                 at_statement_start = false;
@@ -1218,6 +1484,27 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
         fixtures_defined: fixtures_defined.into_iter().collect(),
         fixtures_used: fixtures_used.into_iter().collect(),
         defined_symbols: defined_symbols.into_iter().collect(),
+        data_refs: data_refs.into_iter().collect(),
+    }
+}
+
+fn normalize_data_ref(lit: &str) -> Option<String> {
+    let trimmed = lit.trim().trim_start_matches("./").replace('\\', "/");
+    if trimmed.len() < 3
+        || trimmed.len() > 160
+        || trimmed.starts_with('/')
+        || trimmed.contains("..")
+        || trimmed.contains(['\n', '\r', '\0', ' ', '{', '}', '*', '?'])
+    {
+        return None;
+    }
+    if DATA_FILE_EXTENSIONS
+        .iter()
+        .any(|ext| trimmed.ends_with(ext))
+    {
+        Some(trimmed)
+    } else {
+        None
     }
 }
 
@@ -1358,6 +1645,7 @@ fn parse_function_params(tokens: &[PyToken], mut i: usize) -> (Vec<String>, usiz
     let mut params = Vec::new();
     let mut depth = 1usize;
     let mut expect_param_name = true;
+    let mut skip_vararg_ident = false;
 
     while i < n && depth > 0 {
         match &tokens[i] {
@@ -1369,17 +1657,26 @@ fn parse_function_params(tokens: &[PyToken], mut i: usize) -> (Vec<String>, usiz
                 depth -= 1;
                 i += 1;
             }
+            PyToken::Star if depth == 1 && expect_param_name => {
+                skip_vararg_ident = true;
+                i += 1;
+            }
             PyToken::Comma if depth == 1 => {
                 expect_param_name = true;
+                skip_vararg_ident = false;
                 i += 1;
             }
             PyToken::Colon | PyToken::Assign if depth == 1 => {
                 expect_param_name = false;
+                skip_vararg_ident = false;
                 i += 1;
             }
             PyToken::Ident(name) if depth == 1 && expect_param_name => {
-                params.push(name.clone());
+                if !skip_vararg_ident {
+                    params.push(name.clone());
+                }
                 expect_param_name = false;
+                skip_vararg_ident = false;
                 i += 1;
             }
             _ => {
@@ -1446,5 +1743,80 @@ async def test_create_user(sample_db, monkeypatch: object = None):
             module: "dynamic.plugin".to_string(),
             symbols: Vec::new(),
         }));
+    }
+
+    #[test]
+    fn parses_named_fixtures_usefixtures_varargs_nested_fstrings_and_data_refs() {
+        let src = r#"
+pytestmark = pytest.mark.usefixtures("global_fx")
+
+@pytest.fixture(scope="session", name="aliased_db")
+def _internal_db_builder(*args, seed_fx, **kwargs):
+    msg = f"nested {inner("import fake_inside_fstring")} done"
+    schema = "config/schema.json"
+    return msg, schema
+
+@pytest.mark.usefixtures("mark_fx1", "mark_fx2")
+def test_with_varargs(first_fx, *args, kw_fx: int = 1, **kwargs):
+    pass
+"#;
+        let parsed = parse_python_source(src);
+        assert_eq!(parsed.fixtures_defined, vec!["aliased_db".to_string()]);
+        assert!(parsed.fixtures_used.contains(&"global_fx".to_string()));
+        assert!(parsed.fixtures_used.contains(&"mark_fx1".to_string()));
+        assert!(parsed.fixtures_used.contains(&"mark_fx2".to_string()));
+        assert!(parsed.fixtures_used.contains(&"seed_fx".to_string()));
+        assert!(parsed.fixtures_used.contains(&"first_fx".to_string()));
+        assert!(parsed.fixtures_used.contains(&"kw_fx".to_string()));
+        assert!(!parsed.fixtures_used.contains(&"args".to_string()));
+        assert!(!parsed.fixtures_used.contains(&"kwargs".to_string()));
+        assert!(parsed.data_refs.contains(&"config/schema.json".to_string()));
+    }
+
+    #[test]
+    fn isolates_monorepo_service_compartments_and_supports_hash_only_updates() {
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "services/svc_a/src/app/config.py",
+            b"VALUE = 1\n",
+        );
+        graph.insert_file_bytes(
+            "services/svc_b/src/app/config.py",
+            b"VALUE = 2\n",
+        );
+        graph.insert_file_bytes(
+            "services/svc_a/tests/test_a.py",
+            b"from app.config import VALUE\ndef test_a(): assert VALUE == 1\n",
+        );
+        graph.insert_file_bytes(
+            "services/svc_b/tests/test_b.py",
+            b"from app.config import VALUE\ndef test_b(): assert VALUE == 2\n",
+        );
+        graph.recompute_edges();
+
+        // Changing svc_a's config must only affect svc_a's test, never svc_b's test!
+        let affected_a = graph.affected_tests(&["services/svc_a/src/app/config.py".to_string()]);
+        assert_eq!(affected_a.len(), 1);
+        assert_eq!(affected_a[0].test_file, "services/svc_a/tests/test_a.py");
+
+        let hash_a_before = graph.dep_hash_for_test["services/svc_a/tests/test_a.py"].clone();
+        let hash_b_before = graph.dep_hash_for_test["services/svc_b/tests/test_b.py"].clone();
+
+        // Body-only change returns structure_changed == false and updates only affected dep_hash
+        let structure_changed = graph.insert_file_bytes(
+            "services/svc_a/src/app/config.py",
+            b"VALUE = 100\n",
+        );
+        assert!(!structure_changed);
+        graph.recompute_hashes_for_changed(&["services/svc_a/src/app/config.py".to_string()]);
+
+        assert_ne!(
+            graph.dep_hash_for_test["services/svc_a/tests/test_a.py"],
+            hash_a_before
+        );
+        assert_eq!(
+            graph.dep_hash_for_test["services/svc_b/tests/test_b.py"],
+            hash_b_before
+        );
     }
 }

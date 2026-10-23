@@ -1,7 +1,8 @@
 use crate::ast_graph::sha256_hex;
 use crate::catalog;
 use crate::policy::MemoryPolicy;
-use crate:: Result;
+use crate::Result;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -133,7 +134,26 @@ impl RootCache {
         Ok(catalog::cache_dir()?.join(format!("{root_hash}.json")))
     }
 
+    fn lock_path(root: &Path) -> Result<PathBuf> {
+        let root_hash = sha256_hex(root.to_string_lossy().as_bytes());
+        Ok(catalog::cache_dir()?.join(format!("{root_hash}.lock")))
+    }
+
     pub fn load_or_new(root: &Path) -> Self {
+        let Ok(lock_path) = Self::lock_path(root) else {
+            return Self::new(root.to_path_buf());
+        };
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .ok();
+        if let Some(ref lf) = lock_file {
+            let _ = lf.lock_shared();
+        }
         let Ok(path) = Self::storage_path(root) else {
             return Self::new(root.to_path_buf());
         };
@@ -148,6 +168,15 @@ impl RootCache {
     }
 
     pub fn save(&self) -> Result<()> {
+        let lock_path = Self::lock_path(&self.root)?;
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)?;
+        lock_file.lock_exclusive()?;
         let path = Self::storage_path(&self.root)?;
         let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
         let bytes = serde_json::to_vec(self)?;

@@ -26,7 +26,7 @@ impl Default for MemoryPolicy {
             max_watch_dirs: 50_000,
             max_cached_results: 50_000,
             pytest_timeout_secs: 180,
-            background_batch_size: 16,
+            background_batch_size: 4,
             background_enabled: true,
         }
     }

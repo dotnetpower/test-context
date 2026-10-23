@@ -1,7 +1,7 @@
 {
   "name": "test-context-native",
   "displayName": "Test Context",
-  "description": "Fast incremental Python AST dependency graph, speculative background pytest runner, and zero-startup test result cache for AI coding agents.",
+  "description": "Fast Python AST dependency graph, speculative background pytest runner, and instant test cache for AI agents.",
   "version": "0.1.0",
   "publisher": "moonchoi",
   "license": "MIT",
@@ -383,6 +383,40 @@
           "additionalProperties": false,
           "properties": {}
         }
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "getting-started",
+        "title": "Get started with Test Context",
+        "description": "Incremental Python AST dependency graph, background pytest runner, and instant test result cache for GitHub Copilot.",
+        "icon": "resources/icon.png",
+        "steps": [
+          {
+            "id": "connection",
+            "title": "1. Configure connection",
+            "description": "Connect to the local tctx daemon over Unix socket or WSL bridge.\n[Configure connection](command:testContextNative.configureConnection)",
+            "completionEvents": [
+              "onCommand:testContextNative.configureConnection"
+            ]
+          },
+          {
+            "id": "check",
+            "title": "2. Run self-test",
+            "description": "Verify that the 7 native Test Context tools are registered and callable.\n[Run native self-test](command:testContextNative.selfTest)",
+            "completionEvents": [
+              "onContext:testContextNative.selfTestPassed"
+            ]
+          },
+          {
+            "id": "status",
+            "title": "3. View AST & Cache Status",
+            "description": "Inspect indexed Python files, cached test results, and cumulative time saved.\n[Show status](command:testContextNative.showStatus)",
+            "completionEvents": [
+              "onCommand:testContextNative.showStatus"
+            ]
+          }
+        ]
       }
     ]
   },

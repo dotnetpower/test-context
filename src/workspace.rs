@@ -4,6 +4,7 @@ use crate::{Result, invalid};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::BTreeSet;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,6 +17,10 @@ pub const PYTEST_CONFIG_FILES: &[&str] = &[
     "uv.lock",
     "poetry.lock",
     "requirements.txt",
+];
+
+pub const DATA_FILE_EXTENSIONS: &[&str] = &[
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".sql", ".rego", ".csv",
 ];
 
 #[derive(Clone, Debug)]
@@ -126,6 +131,29 @@ impl Workspace {
             return false;
         };
         file_name.ends_with(".py") || PYTEST_CONFIG_FILES.contains(&file_name)
+    }
+
+    pub fn is_permitted_data_rel(&self, rel: &Path) -> bool {
+        if rel.as_os_str().is_empty()
+            || rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return false;
+        }
+        if self.default_excludes && is_excluded_rel_path(rel) {
+            return false;
+        }
+        if self.exclude_matcher.is_match(rel) {
+            return false;
+        }
+        let Some(file_name) = rel.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        DATA_FILE_EXTENSIONS
+            .iter()
+            .any(|ext| file_name.ends_with(ext))
     }
 
     pub fn files_limited(&self, policy: &MemoryPolicy) -> Result<Inventory> {
@@ -284,7 +312,9 @@ pub fn run_command_with_timeout(
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    command.process_group(0);
     let mut child = command.spawn()?;
+    let pid = child.id();
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let stderr_pipe = child.stderr.take().expect("piped stderr");
 
@@ -310,6 +340,13 @@ pub fn run_command_with_timeout(
         }
         if started.elapsed() >= timeout {
             timed_out = true;
+            if let Ok(pgid) = i32::try_from(pid)
+                && pgid > 0
+            {
+                unsafe {
+                    let _ = libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
             let _ = child.kill();
             break child.wait()?;
         }

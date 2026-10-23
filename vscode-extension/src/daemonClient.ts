@@ -340,6 +340,11 @@ export class DaemonClient {
       this.disconnect(new Error('Test Context daemon sent an unsolicited response.'));
       return;
     }
+    if (this.receiveBuffer.byteLength > 0) {
+      pending.reject(new Error('Test Context daemon sent multiple responses.'));
+      this.disconnect(new Error('Test Context protocol desynchronized.'));
+      return;
+    }
     try {
       const response = JSON.parse(frame.toString('utf8')) as {
         result?: JsonValue;

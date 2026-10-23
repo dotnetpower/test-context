@@ -72,8 +72,10 @@ export function activate(context: vscode.ExtensionContext): void {
     bridge,
     client,
     vscode.commands.registerCommand('testContextNative.gettingStarted', async () => {
-      await vscode.window.showInformationMessage(
-        'Test Context Native is active. Use #tctxNativeRun or #tctxNativeAffected in GitHub Copilot chat.',
+      await vscode.commands.executeCommand(
+        'workbench.action.openWalkthrough',
+        'moonchoi.test-context-native#getting-started',
+        false,
       );
     }),
     vscode.commands.registerCommand('testContextNative.configureConnection', async () => {
@@ -203,6 +205,7 @@ async function runSelfTest(
 ): Promise<void> {
   const source = new vscode.CancellationTokenSource();
   try {
+    await vscode.commands.executeCommand('setContext', 'testContextNative.selfTestPassed', false);
     const root = await bridge.resolveRoot(explicitRoot, source.token, true);
     const registered = registeredNativeTools();
     if (registered.length !== NATIVE_TOOL_NAMES.length) {
@@ -221,6 +224,7 @@ async function runSelfTest(
     const statusText = toolResultText(toolResult);
     const daemonStatus = JSON.parse(statusText) as JsonValue;
     validateDaemonStatus(daemonStatus);
+    await vscode.commands.executeCommand('setContext', 'testContextNative.selfTestPassed', true);
     output.appendLine(JSON.stringify(daemonStatus, null, 2));
     output.show(true);
     await vscode.window.showInformationMessage(`Test Context self-test passed: ${root}`);
@@ -241,17 +245,40 @@ async function runStartupProbe(
   const source = new vscode.CancellationTokenSource();
   try {
     const registered = registeredNativeTools();
-    const workspaces = await bridge.listWorkspaces(source.token);
+    if (registered.length !== NATIVE_TOOL_NAMES.length) {
+      throw new Error(
+        `Language Model Tool registry contains ${registered.length}/${NATIVE_TOOL_NAMES.length} Test Context tools.`,
+      );
+    }
+    const workspaceResult = await vscode.lm.invokeTool(
+      'test-context-native_testWorkspaces',
+      {
+        input: {},
+        toolInvocationToken: undefined,
+      },
+      source.token,
+    );
+    const workspaces = JSON.parse(toolResultText(workspaceResult)) as JsonValue;
+    if (!Array.isArray(workspaces)) {
+      throw new Error('Native workspace probe returned a non-array result.');
+    }
+    const root = await bridge.resolveRoot(undefined, source.token, false);
     statusBar.text = '$(beaker) TCTX Available';
-    statusBar.tooltip = `${registered.length} Test Context native tools registered (${workspaces.length} workspace(s))`;
+    statusBar.tooltip = `${registered.length} Test Context native tools registered and callable for ${root}`;
     output.appendLine(
-      `EXTENSION_CALLABLE tools=${registered.join(',')} workspaces=${workspaces.length}`,
+      `EXTENSION_CALLABLE tools=${registered.join(',')} workspaces=${workspaces.length} root=${root}`,
     );
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    statusBar.text = '$(warning) TCTX Native';
-    statusBar.tooltip = message;
-    output.appendLine(`NATIVE_NOT_READY ${message}`);
+    if (error instanceof RootResolutionError) {
+      statusBar.text = '$(add) TCTX Register';
+      statusBar.tooltip = 'Workspace will be registered on first Test Context tool call; click for status';
+      output.appendLine(`NATIVE_UNREGISTERED_DEFERRED ${message}`);
+    } else {
+      statusBar.text = '$(warning) TCTX Native';
+      statusBar.tooltip = message;
+      output.appendLine(`NATIVE_NOT_READY ${message}`);
+    }
   } finally {
     source.dispose();
   }

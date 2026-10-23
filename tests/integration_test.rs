@@ -43,8 +43,13 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     );
     write_file(
         &repo,
+        "config/settings.json",
+        "{\"greeting\": \"hello\"}\n",
+    );
+    write_file(
+        &repo,
         "src/pkg/isolated.py",
-        "def greet(name: str) -> str:\n    return f'hello {name}'\n",
+        "import json\nfrom pathlib import Path\n\ndef greet(name: str) -> str:\n    cfg = json.loads(Path('config/settings.json').read_text())\n    return f\"{cfg['greeting']} {name}\"\n",
     );
     write_file(
         &repo,
@@ -156,7 +161,24 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     assert_eq!(run3.cached_files_count, 3);
     assert_eq!(run3.executed_files_count, 0);
 
-    // 6. Verify MCP JSON-RPC dispatch
+    // 6. Modify referenced JSON data file `config/settings.json` -> must invalidate `tests/test_isolated.py`!
+    write_file(
+        &repo,
+        "config/settings.json",
+        "{\"greeting\": \"hello\"}\n\n",
+    );
+    let affected_by_json = managed
+        .affected(&["config/settings.json".to_string()], false)
+        .unwrap();
+    let json_affected_files: Vec<String> = affected_by_json["affected_tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["test_file"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(json_affected_files, vec!["tests/test_isolated.py".to_string()]);
+
+    // 7. Verify MCP JSON-RPC dispatch
     let mcp_tools = shared_mcp::dispatch_with_root(
         json!({
             "jsonrpc": "2.0",

@@ -325,6 +325,17 @@ fn run_pytest_dropin(root: PathBuf, raw_args: &[String]) -> Result<i32> {
             "-q" | "--quiet" | "-v" | "--verbose" => {
                 // Handled by tctx runner summary
             }
+            "-c" | "-o" | "-p" | "-W" | "-n" | "--maxfail" | "--tb" | "--rootdir"
+            | "--confcutdir" | "--import-mode" | "--basetemp" | "--durations"
+            | "--durations-min" | "--cov" | "--cov-report" | "--cov-config" | "--log-level"
+            | "--log-format" | "--log-cli-level" | "--color" | "--capture" => {
+                extra_args.push(arg.clone());
+                if i + 1 < raw_args.len() {
+                    extra_args.push(raw_args[i + 1].clone());
+                    i += 2;
+                    continue;
+                }
+            }
             _ if arg.starts_with('-') => {
                 extra_args.push(arg.clone());
             }

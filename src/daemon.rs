@@ -7,9 +7,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,70 @@ pub const MAX_WIRE: usize = 4 * 1024 * 1024;
 pub const BINARY_MAGIC: &[u8] = b"TCTXB1\n";
 pub const FRAMED_JSON_MAGIC: &[u8] = b"TCTXJ1\n";
 pub const TRACE_ARGUMENT: &str = "_tctx_trace";
+pub const MAX_ACTIVE_CONNECTIONS: usize = 64;
+pub const MAX_RESIDENT_ROOTS: usize = 8;
+pub const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
+
+struct ActiveConnection(Arc<AtomicUsize>);
+
+impl Drop for ActiveConnection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct RuntimeIdentity {
+    paths: [PathBuf; 3],
+    identities: [(u64, u64); 3],
+}
+
+impl RuntimeIdentity {
+    fn capture(dir: &Path, sock: &Path, lock: &std::fs::File) -> Result<Self> {
+        let paths = [dir.to_path_buf(), sock.to_path_buf(), dir.join("daemon.lock")];
+        let dir_meta = std::fs::symlink_metadata(&paths[0])?;
+        let sock_meta = std::fs::symlink_metadata(&paths[1])?;
+        let lock_meta = lock.metadata()?;
+        let identity = Self {
+            paths,
+            identities: [
+                (dir_meta.dev(), dir_meta.ino()),
+                (sock_meta.dev(), sock_meta.ino()),
+                (lock_meta.dev(), lock_meta.ino()),
+            ],
+        };
+        identity.check()?;
+        Ok(identity)
+    }
+
+    fn check(&self) -> Result<()> {
+        let euid = unsafe { libc::geteuid() };
+        for (idx, path) in self.paths.iter().enumerate() {
+            let meta = std::fs::symlink_metadata(path).map_err(|e| {
+                invalid(format!(
+                    "RUNTIME_UNAVAILABLE path={}: {e}; daemon stopping",
+                    path.display()
+                ))
+            })?;
+            let valid_kind = match idx {
+                0 => meta.is_dir() && meta.mode() & 0o077 == 0,
+                1 => meta.file_type().is_socket() && meta.mode() & 0o777 == 0o600,
+                _ => meta.is_file() && meta.mode() & 0o077 == 0,
+            };
+            if !valid_kind
+                || meta.file_type().is_symlink()
+                || meta.uid() != euid
+                || (meta.dev(), meta.ino()) != self.identities[idx]
+            {
+                return Err(invalid(format!(
+                    "RUNTIME_REPLACED_OR_UNSAFE path={}; daemon stopping",
+                    path.display()
+                ))
+                .into());
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct ApplicationError(pub String);
@@ -60,37 +125,110 @@ pub struct Request {
 
 struct DaemonHub {
     roots: Mutex<BTreeMap<PathBuf, Arc<ManagedRoot>>>,
+    load_gate: Mutex<()>,
     traces: Mutex<VecDeque<Value>>,
     started_at: Instant,
+    local_oneshot: bool,
 }
 
 impl DaemonHub {
     fn new() -> Self {
+        Self::with_mode(false)
+    }
+
+    fn with_mode(local_oneshot: bool) -> Self {
         Self {
             roots: Mutex::new(BTreeMap::new()),
+            load_gate: Mutex::new(()),
             traces: Mutex::new(VecDeque::new()),
             started_at: Instant::now(),
+            local_oneshot,
+        }
+    }
+
+    fn shutdown_all(&self) {
+        if let Ok(mut guard) = self.roots.lock() {
+            for (_, root) in guard.iter() {
+                root.shutdown();
+            }
+            guard.clear();
+        }
+    }
+
+    fn evict_idle_or_excess_roots(&self) {
+        let mut evicted = Vec::new();
+        if let Ok(mut guard) = self.roots.lock() {
+            let idle_keys: Vec<PathBuf> = guard
+                .iter()
+                .filter(|(_, r)| r.last_activity_elapsed() >= IDLE_ROOT_TIMEOUT)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in idle_keys {
+                if let Some(old) = guard.remove(&k) {
+                    evicted.push(old);
+                }
+            }
+            while guard.len() >= MAX_RESIDENT_ROOTS {
+                let oldest_key = guard
+                    .iter()
+                    .max_by_key(|(_, r)| r.last_activity_elapsed())
+                    .map(|(k, _)| k.clone());
+                if let Some(k) = oldest_key
+                    && let Some(old) = guard.remove(&k)
+                {
+                    evicted.push(old);
+                } else {
+                    break;
+                }
+            }
+        }
+        for root in evicted {
+            root.shutdown();
         }
     }
 
     fn get_or_load_root(&self, requested_root: &Path) -> Result<Arc<ManagedRoot>> {
-        let spec = registration::prepare_or_resolve_spec(requested_root)?;
+        let mut spec = registration::prepare_or_resolve_spec(requested_root)?;
+        if self.local_oneshot {
+            spec.policy.background_enabled = false;
+        }
         {
             let guard = self.roots.lock().map_err(|_| invalid("hub mutex poisoned"))?;
             if let Some(existing) = guard.get(&spec.root) {
                 return Ok(Arc::clone(existing));
             }
         }
+        // Serialize cold loads so concurrent callers do not duplicate work or leak background worker threads
+        let _load_guard = self
+            .load_gate
+            .lock()
+            .map_err(|_| invalid("load gate poisoned"))?;
+        {
+            let guard = self.roots.lock().map_err(|_| invalid("hub mutex poisoned"))?;
+            if let Some(existing) = guard.get(&spec.root) {
+                return Ok(Arc::clone(existing));
+            }
+        }
+        if !self.local_oneshot {
+            self.evict_idle_or_excess_roots();
+        }
         let loaded = ManagedRoot::load(spec.clone())?;
         let mut guard = self.roots.lock().map_err(|_| invalid("hub mutex poisoned"))?;
-        let entry = guard
-            .entry(spec.root)
-            .or_insert_with(|| Arc::clone(&loaded));
-        Ok(Arc::clone(entry))
+        if let Some(old) = guard.insert(spec.root, Arc::clone(&loaded)) {
+            old.shutdown();
+        }
+        Ok(loaded)
     }
 
     fn reload_root(&self, requested_root: &Path) -> Result<Arc<ManagedRoot>> {
-        let spec = registration::prepare_or_resolve_spec(requested_root)?;
+        let _load_guard = self
+            .load_gate
+            .lock()
+            .map_err(|_| invalid("load gate poisoned"))?;
+        let mut spec = registration::prepare_or_resolve_spec(requested_root)?;
+        if self.local_oneshot {
+            spec.policy.background_enabled = false;
+        }
         let loaded = ManagedRoot::load(spec.clone())?;
         let mut guard = self.roots.lock().map_err(|_| invalid("hub mutex poisoned"))?;
         if let Some(old) = guard.insert(spec.root, Arc::clone(&loaded)) {
@@ -288,7 +426,16 @@ impl DaemonHub {
 fn extract_trace_id(arguments: &mut Value) -> Option<String> {
     let obj = arguments.as_object_mut()?;
     let val = obj.remove(TRACE_ARGUMENT)?;
-    val.as_str().map(ToOwned::to_owned)
+    let s = val.as_str()?;
+    if s.is_empty()
+        || s.len() > 96
+        || !s
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return None;
+    }
+    Some(s.to_owned())
 }
 
 pub fn serve() -> Result<()> {
@@ -311,15 +458,43 @@ pub fn serve() -> Result<()> {
     }
     let listener = UnixListener::bind(&sock_path)?;
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
+    let runtime_identity = Arc::new(RuntimeIdentity::capture(&dir, &sock_path, &lock_file)?);
 
     let hub = Arc::new(DaemonHub::new());
+    let active_connections = Arc::new(AtomicUsize::new(0));
+
+    // Background maintenance loop for RuntimeIdentity verification and idle root eviction
+    {
+        let hub_maint = Arc::clone(&hub);
+        let id_maint = Arc::clone(&runtime_identity);
+        std::thread::Builder::new()
+            .name("tctx-maint".to_string())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    if let Err(err) = id_maint.check() {
+                        eprintln!("{err}");
+                        hub_maint.shutdown_all();
+                        std::process::exit(1);
+                    }
+                    hub_maint.evict_idle_or_excess_roots();
+                }
+            })?;
+    }
 
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else {
             continue;
         };
+        let current = active_connections.fetch_add(1, Ordering::AcqRel);
+        if current >= MAX_ACTIVE_CONNECTIONS {
+            active_connections.fetch_sub(1, Ordering::AcqRel);
+            continue;
+        }
+        let conn_guard = ActiveConnection(Arc::clone(&active_connections));
         let hub_clone = Arc::clone(&hub);
         std::thread::spawn(move || {
+            let _guard = conn_guard;
             let _ = handle_connection(stream, &hub_clone);
         });
     }
@@ -484,10 +659,19 @@ pub fn request_or_local(req: &Request) -> Result<Value> {
     if let Ok(val) = request(req) {
         return Ok(val);
     }
-    // Fallback to direct in-process execution if the background daemon is not running yet
-    let hub = DaemonHub::new();
-    hub.execute(req.clone())
-        .map_err(|e| Box::new(ApplicationError(e)) as Box<dyn std::error::Error + Send + Sync>)
+    // Attempt best-effort user service start before falling back to local oneshot execution
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "start", "test-context.service"])
+        .status();
+    std::thread::sleep(Duration::from_millis(100));
+    if let Ok(val) = request(req) {
+        return Ok(val);
+    }
+    // Fallback to direct oneshot execution (with background worker disabled and explicit shutdown)
+    let hub = DaemonHub::with_mode(true);
+    let res = hub.execute(req.clone());
+    hub.shutdown_all();
+    res.map_err(|e| Box::new(ApplicationError(e)) as Box<dyn std::error::Error + Send + Sync>)
 }
 
 pub fn native_bridge(mut input: impl Read, mut output: impl Write) -> Result<()> {

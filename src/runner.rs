@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -82,6 +83,7 @@ struct RootState {
     cache: RootCache,
     pending_queue: VecDeque<String>,
     in_flight: BTreeSet<String>,
+    watched_dirs: BTreeSet<PathBuf>,
     last_activity: Instant,
     background_running: bool,
     last_background_error: Option<String>,
@@ -91,7 +93,9 @@ pub struct ManagedRoot {
     state: Mutex<RootState>,
     condvar: Condvar,
     stopped: AtomicBool,
-    _watcher: Option<notify::RecommendedWatcher>,
+    fs_events_rx: Mutex<Receiver<Event>>,
+    fs_overflow: Arc<AtomicBool>,
+    watcher: Mutex<Option<notify::RecommendedWatcher>>,
 }
 
 impl ManagedRoot {
@@ -125,26 +129,51 @@ impl ManagedRoot {
             graph.files.keys().map(Path::new),
             &spec.policy,
         )?;
+        let watched_dirs_set: BTreeSet<PathBuf> = watch_dirs.iter().cloned().collect();
 
-        let state =RootState {
+        let state = RootState {
             spec: spec.clone(),
             workspace,
             graph,
             cache,
             pending_queue,
             in_flight: BTreeSet::new(),
+            watched_dirs: watched_dirs_set,
             last_activity: Instant::now(),
             background_running: false,
             last_background_error: None,
         };
 
+        let (fs_tx, fs_rx) = sync_channel(4096);
+        let fs_overflow = Arc::new(AtomicBool::new(false));
+        let overflow_for_cb = Arc::clone(&fs_overflow);
+
         let arc = Arc::new_cyclic(|weak: &std::sync::Weak<Self>| {
             let weak_for_watcher = weak.clone();
             let watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-                if let Ok(event) = res
-                    && let Some(strong) = weak_for_watcher.upgrade()
+                let Ok(event) = res else {
+                    return;
+                };
+                // Never let our own file reads or access-time updates trigger an inotify feedback storm
+                if matches!(
+                    event.kind,
+                    notify::EventKind::Access(_)
+                        | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
+                            notify::event::MetadataKind::AccessTime
+                        ))
+                ) {
+                    return;
+                }
+                if event.need_rescan() {
+                    overflow_for_cb.store(true, Ordering::Release);
+                }
+                if let Err(err) = fs_tx.try_send(event)
+                    && matches!(err, TrySendError::Full(_))
                 {
-                    strong.handle_fs_event(event);
+                    overflow_for_cb.store(true, Ordering::Release);
+                }
+                if let Some(strong) = weak_for_watcher.upgrade() {
+                    strong.condvar.notify_all();
                 }
             })
             .ok()
@@ -159,7 +188,9 @@ impl ManagedRoot {
                 state: Mutex::new(state),
                 condvar: Condvar::new(),
                 stopped: AtomicBool::new(false),
-                _watcher: watcher,
+                fs_events_rx: Mutex::new(fs_rx),
+                fs_overflow,
+                watcher: Mutex::new(watcher),
             }
         });
 
@@ -170,8 +201,18 @@ impl ManagedRoot {
         Ok(arc)
     }
 
+    pub fn last_activity_elapsed(&self) -> Duration {
+        self.state
+            .lock()
+            .map(|g| g.last_activity.elapsed())
+            .unwrap_or_default()
+    }
+
     pub fn shutdown(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        if let Ok(mut w) = self.watcher.lock() {
+            *w = None;
+        }
         self.condvar.notify_all();
     }
 
@@ -192,6 +233,7 @@ impl ManagedRoot {
             let spec: Spec;
             {
                 let mut guard = self.state.lock().expect("state lock");
+                self.drain_fs_events_locked(&mut guard);
                 while guard.pending_queue.is_empty() && !self.stopped.load(Ordering::SeqCst) {
                     guard.background_running = false;
                     let (next_guard, _) = self
@@ -199,6 +241,13 @@ impl ManagedRoot {
                         .wait_timeout(guard, Duration::from_secs(2))
                         .expect("condvar wait");
                     guard = next_guard;
+                    if !self.stopped.load(Ordering::SeqCst) {
+                        // Coalesce burst file saves over a 40ms debounce window before recomputing graph
+                        drop(guard);
+                        std::thread::sleep(Duration::from_millis(40));
+                        guard = self.state.lock().expect("state lock");
+                        self.drain_fs_events_locked(&mut guard);
+                    }
                 }
                 if self.stopped.load(Ordering::SeqCst) {
                     return;
@@ -270,40 +319,70 @@ impl ManagedRoot {
         }
     }
 
-    pub fn handle_fs_event(&self, event: Event) {
-        // Ignore read/open/access-time events so our own file reads never trigger an inotify feedback loop!
-        if matches!(
-            event.kind,
-            notify::EventKind::Access(_)
-                | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
-                    notify::event::MetadataKind::AccessTime
-                ))
-        ) {
+    fn drain_fs_events_locked(&self, guard: &mut RootState) {
+        let mut raw_paths = BTreeSet::new();
+        let mut overflowed = self.fs_overflow.swap(false, Ordering::AcqRel);
+        if let Ok(rx) = self.fs_events_rx.lock() {
+            while let Ok(event) = rx.try_recv() {
+                if event.need_rescan() {
+                    overflowed = true;
+                }
+                for p in event.paths {
+                    raw_paths.insert(p);
+                }
+            }
+        }
+        if overflowed {
+            Self::reconcile_live_files_locked(guard, None);
             return;
         }
-        let mut guard = match self.state.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-        let mut changed_rels = Vec::new();
-        let mut graph_dirty = false;
+        if raw_paths.is_empty() {
+            return;
+        }
 
-        for path in &event.paths {
+        let mut changed_rels = Vec::new();
+        let mut structure_changed = false;
+        let mut new_watch_dirs = Vec::new();
+
+        for path in raw_paths {
+            if path.is_dir() {
+                if path.starts_with(&guard.workspace.root)
+                    && guard.watched_dirs.len() < guard.spec.policy.max_watch_dirs
+                    && guard.watched_dirs.insert(path.clone())
+                {
+                    new_watch_dirs.push(path);
+                }
+                continue;
+            }
             let Ok(rel) = path.strip_prefix(&guard.workspace.root) else {
                 continue;
             };
-            if !guard.workspace.is_permitted_rel(rel) {
+            let rel_str = normalize_rel_str(rel);
+            let is_known_data = guard.graph.files.contains_key(&rel_str);
+            if !guard.workspace.is_permitted_rel(rel) && !is_known_data {
                 continue;
             }
-            let rel_str = normalize_rel_str(rel);
             let full = guard.workspace.root.join(rel);
-            if let Some(live_stamp) = file_stamp(&full) {
+            let mut live_stamp = file_stamp(&full);
+            if live_stamp.is_none() && guard.graph.files.contains_key(&rel_str) {
+                // Brief 25ms retry window for atomic editor rename saves
+                std::thread::sleep(Duration::from_millis(25));
+                live_stamp = file_stamp(&full);
+            }
+            if let Some(stamp) = live_stamp {
+                if let Some(parent) = full.parent()
+                    && parent.starts_with(&guard.workspace.root)
+                    && guard.watched_dirs.len() < guard.spec.policy.max_watch_dirs
+                    && guard.watched_dirs.insert(parent.to_path_buf())
+                {
+                    new_watch_dirs.push(parent.to_path_buf());
+                }
                 if guard
                     .graph
                     .files
                     .get(&rel_str)
                     .and_then(|n| n.stamp)
-                    .is_some_and(|s| s == live_stamp)
+                    .is_some_and(|s| s == stamp)
                 {
                     continue;
                 }
@@ -318,23 +397,42 @@ impl ManagedRoot {
                         .get(&rel_str)
                         .is_some_and(|node| node.sha256 == new_sha);
                     if !unchanged {
-                        guard
-                            .graph
-                            .insert_file_bytes_with_stamp(&rel_str, &bytes, Some(live_stamp));
+                        if guard.graph.insert_file_bytes_with_stamp(
+                            &rel_str,
+                            &bytes,
+                            Some(stamp),
+                        ) {
+                            structure_changed = true;
+                        }
                         changed_rels.push(rel_str);
-                        graph_dirty = true;
                     } else if let Some(node) = guard.graph.files.get_mut(&rel_str) {
-                        node.stamp = Some(live_stamp);
+                        node.stamp = Some(stamp);
                     }
                 }
             } else if !full.exists() && guard.graph.remove_file(&rel_str) {
                 changed_rels.push(rel_str);
-                graph_dirty = true;
+                structure_changed = true;
             }
         }
 
-        if graph_dirty {
-            guard.graph.recompute_edges();
+        if !new_watch_dirs.is_empty()
+            && let Ok(mut w_opt) = self.watcher.lock()
+            && let Some(ref mut w) = *w_opt
+        {
+            for dir in new_watch_dirs {
+                let _ = w.watch(&dir, RecursiveMode::NonRecursive);
+            }
+        }
+
+        if !changed_rels.is_empty() {
+            if structure_changed {
+                guard
+                    .graph
+                    .discover_referenced_data_files(&guard.workspace, &guard.spec.policy);
+                guard.graph.recompute_edges();
+            } else {
+                guard.graph.recompute_hashes_for_changed(&changed_rels);
+            }
             if guard.spec.policy.background_enabled {
                 let affected = guard.graph.affected_tests(&changed_rels);
                 for item in affected.into_iter().rev() {
@@ -349,6 +447,44 @@ impl ManagedRoot {
                 }
                 self.condvar.notify_all();
             }
+        }
+    }
+
+    fn ingest_explicit_paths_locked(guard: &mut RootState, raw_paths: &[String]) {
+        let mut added_any = false;
+        for raw in raw_paths {
+            let file_part = raw.split("::").next().unwrap_or(raw);
+            let norm = file_part
+                .trim()
+                .trim_start_matches("./")
+                .trim_end_matches('/')
+                .replace('\\', "/");
+            if norm.is_empty() || norm == "." || guard.graph.files.contains_key(&norm) {
+                continue;
+            }
+            let rel_path = Path::new(&norm);
+            if !guard.workspace.is_permitted_rel(rel_path)
+                && !guard.workspace.is_permitted_data_rel(rel_path)
+            {
+                continue;
+            }
+            let full = guard.workspace.root.join(rel_path);
+            if let Some(stamp) = file_stamp(&full)
+                && let Ok(bytes) = guard
+                    .workspace
+                    .read_known_with_limit(rel_path, guard.spec.policy.max_file_bytes)
+            {
+                guard
+                    .graph
+                    .insert_file_bytes_with_stamp(&norm, &bytes, Some(stamp));
+                added_any = true;
+            }
+        }
+        if added_any {
+            guard
+                .graph
+                .discover_referenced_data_files(&guard.workspace, &guard.spec.policy);
+            guard.graph.recompute_edges();
         }
     }
 
@@ -371,6 +507,7 @@ impl ManagedRoot {
         };
 
         let mut changed = Vec::new();
+        let mut structure_changed = false;
         for rel_str in files_to_check {
             let rel_path = Path::new(&rel_str);
             let full = guard.workspace.root.join(rel_path);
@@ -392,9 +529,13 @@ impl ManagedRoot {
                     let live_sha = sha256_hex(&bytes);
                     let indexed_sha = guard.graph.files.get(&rel_str).map(|n| n.sha256.as_str());
                     if indexed_sha != Some(live_sha.as_str()) {
-                        guard
-                            .graph
-                            .insert_file_bytes_with_stamp(&rel_str, &bytes, Some(live_stamp));
+                        if guard.graph.insert_file_bytes_with_stamp(
+                            &rel_str,
+                            &bytes,
+                            Some(live_stamp),
+                        ) {
+                            structure_changed = true;
+                        }
                         changed.push(rel_str);
                     } else if let Some(node) = guard.graph.files.get_mut(&rel_str) {
                         node.stamp = Some(live_stamp);
@@ -402,11 +543,19 @@ impl ManagedRoot {
                 }
             } else if !full.exists() && guard.graph.remove_file(&rel_str) {
                 changed.push(rel_str);
+                structure_changed = true;
             }
         }
 
         if !changed.is_empty() {
-            guard.graph.recompute_edges();
+            if structure_changed {
+                guard
+                    .graph
+                    .discover_referenced_data_files(&guard.workspace, &guard.spec.policy);
+                guard.graph.recompute_edges();
+            } else {
+                guard.graph.recompute_hashes_for_changed(&changed);
+            }
             if guard.spec.policy.background_enabled {
                 for item in guard.graph.affected_tests(&changed).into_iter().rev() {
                     if guard
@@ -499,7 +648,8 @@ impl ManagedRoot {
     }
 
     pub fn status(&self) -> serde_json::Value {
-        let guard = self.state.lock().expect("state lock");
+        let mut guard = self.state.lock().expect("state lock");
+        self.drain_fs_events_locked(&mut guard);
         let total_tests = guard.graph.dep_hash_for_test.len();
         let mut cached_passed = 0usize;
         let mut cached_failed = 0usize;
@@ -533,6 +683,8 @@ impl ManagedRoot {
     pub fn graph_info(&self, file: &str) -> Result<FileGraphInfo> {
         let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
         guard.last_activity = Instant::now();
+        self.drain_fs_events_locked(&mut guard);
+        Self::ingest_explicit_paths_locked(&mut guard, &[file.to_string()]);
         Self::reconcile_live_files_locked(&mut guard, None);
         guard.graph.file_graph_info(file).ok_or_else(|| {
             invalid(format!(
@@ -545,6 +697,8 @@ impl ManagedRoot {
     pub fn affected(&self, files: &[String], use_git_diff: bool) -> Result<serde_json::Value> {
         let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
         guard.last_activity = Instant::now();
+        self.drain_fs_events_locked(&mut guard);
+        Self::ingest_explicit_paths_locked(&mut guard, files);
         Self::reconcile_live_files_locked(&mut guard, None);
 
         let changed_files = if !files.is_empty() {
@@ -596,6 +750,7 @@ impl ManagedRoot {
             || req.targets.iter().any(|t| t.contains("::"));
 
         let mut cached_summaries = Vec::new();
+        let mut cached_failure_outputs = Vec::new();
         let mut to_execute = Vec::new();
         let mut dep_hashes_for_exec = BTreeMap::new();
         let mut joined_bg_count = 0usize;
@@ -606,6 +761,8 @@ impl ManagedRoot {
         {
             let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
             guard.last_activity = Instant::now();
+            self.drain_fs_events_locked(&mut guard);
+            Self::ingest_explicit_paths_locked(&mut guard, &req.targets);
 
             // 1. Resolve target test files (and reconcile live files on disk)
             let initial_targets = guard.graph.resolve_target_test_files(&req.targets);
@@ -664,11 +821,39 @@ impl ManagedRoot {
                 let Some(dep_hash) = guard.graph.dep_hash_for_test.get(tf).cloned() else {
                     continue;
                 };
-                if !req.no_cache
+                // Verify that any explicit `file.py::symbol` selector matches a known test symbol in `tf`
+                let nodeid_symbol_verified = req
+                    .targets
+                    .iter()
+                    .filter_map(|t| {
+                        let (file_part, sym_part) = t.split_once("::")?;
+                        let norm = file_part.trim().trim_start_matches("./").replace('\\', "/");
+                        if &norm == tf {
+                            Some(sym_part.split("::").next().unwrap_or(sym_part))
+                        } else {
+                            None
+                        }
+                    })
+                    .all(|sym| {
+                        guard
+                            .graph
+                            .files
+                            .get(tf)
+                            .is_some_and(|n| n.parsed.test_symbols.iter().any(|s| s == sym))
+                    });
+                let can_use_cache = !req.no_cache
+                    && req.k.is_none()
+                    && req.mark.is_none()
+                    && nodeid_symbol_verified;
+
+                if can_use_cache
                     && let Some(rec) = guard.cache.get_matching(tf, &dep_hash)
                     && (rec.outcome.is_green() || (!req.rerun_failed && !has_subfile_filter))
                 {
                     saved_ms = saved_ms.saturating_add(rec.duration_ms);
+                    if !rec.outcome.is_green() && !rec.output_snippet.trim().is_empty() {
+                        cached_failure_outputs.push(rec.output_snippet.clone());
+                    }
                     cached_summaries.push(FileRunSummary {
                         test_file: tf.clone(),
                         dep_hash: rec.dep_hash.clone(),
@@ -808,11 +993,17 @@ impl ManagedRoot {
             executed_summaries.len(),
             saved_ms as f64 / 1000.0
         );
-        let stdout_summary = if delta_stdout.trim().is_empty() {
-            summary_line
-        } else {
-            format!("{}\n{}", delta_stdout.trim(), summary_line)
-        };
+        let mut output_parts = Vec::new();
+        for cached_out in cached_failure_outputs {
+            if !cached_out.trim().is_empty() {
+                output_parts.push(cached_out.trim().to_string());
+            }
+        }
+        if !delta_stdout.trim().is_empty() {
+            output_parts.push(delta_stdout.trim().to_string());
+        }
+        output_parts.push(summary_line);
+        let stdout_summary = output_parts.join("\n");
 
         Ok(TestRunResponse {
             root: spec.root,
@@ -1000,6 +1191,14 @@ fn execute_pytest_batch(
             });
         } else {
             // Fallback when JUnit XML had no testcase entry for this file (e.g., collection error or single file)
+            // If this was a multi-file batch that failed due to a collection error in one file,
+            // only record a failure for files explicitly mentioned in the error output; leave unmentioned sibling files uncached rather than poisoning them.
+            if !overall_success
+                && dep_hashes.len() > 1
+                && !combined_out.contains(test_file.as_str())
+            {
+                continue;
+            }
             let per_file_dur = (output.duration_ms / (dep_hashes.len().max(1) as u64)).max(1);
             let outcome = if overall_success {
                 TestOutcome::Passed
@@ -1055,6 +1254,26 @@ struct FileXmlStats {
     failed_nodeids: Vec<String>,
 }
 
+fn find_xml_tag_end(xml: &str, start_idx: usize) -> Option<usize> {
+    let bytes = xml.as_bytes();
+    let mut i = start_idx;
+    let mut in_quote: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_quote {
+            if b == q {
+                in_quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+        } else if b == b'>' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 fn parse_junit_xml_per_file(
     xml: &str,
     known_files: &BTreeMap<String, String>,
@@ -1067,10 +1286,9 @@ fn parse_junit_xml_per_file(
     let mut pos = 0usize;
     while let Some(rel_start) = xml[pos..].find("<testcase ") {
         let start = pos + rel_start;
-        let Some(rel_tag_end) = xml[start..].find('>') else {
+        let Some(tag_end) = find_xml_tag_end(xml, start) else {
             break;
         };
-        let tag_end = start + rel_tag_end;
         let self_closing = xml[..tag_end].ends_with('/');
         let header = &xml[start..=tag_end];
 
@@ -1131,9 +1349,17 @@ fn parse_junit_xml_per_file(
 
 fn extract_xml_attr(tag: &str, attr_name: &str) -> Option<String> {
     let pattern = format!("{attr_name}=\"");
-    let start = tag.find(&pattern)? + pattern.len();
-    let end = tag[start..].find('"')? + start;
-    Some(tag[start..end].replace('\\', "/"))
+    let mut search_from = 0usize;
+    while let Some(rel_idx) = tag[search_from..].find(&pattern) {
+        let idx = search_from + rel_idx;
+        if idx == 0 || tag.as_bytes()[idx - 1].is_ascii_whitespace() {
+            let val_start = idx + pattern.len();
+            let val_end = tag[val_start..].find('"')? + val_start;
+            return Some(tag[val_start..val_end].replace('\\', "/"));
+        }
+        search_from = idx + pattern.len();
+    }
+    None
 }
 
 fn match_testcase_to_file(
@@ -1170,4 +1396,29 @@ fn match_testcase_to_file(
         return known_files.keys().next().cloned();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn junit_xml_parser_handles_angle_brackets_inside_quoted_attributes() {
+        let mut known = BTreeMap::new();
+        known.insert("tests/test_cmp.py".to_string(), "hash1".to_string());
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" errors="0" failures="1" skipped="0" tests="2">
+    <testcase classname="tests.test_cmp" name="test_gt[a &gt; b -> c > d]" file="tests/test_cmp.py" time="0.012" />
+    <testcase classname="tests.test_cmp" name="test_fail[x > y]" file="tests/test_cmp.py" time="0.005">
+      <failure message="assert 1 > 2">AssertionError</failure>
+    </testcase>
+  </testsuite>
+</testsuites>"#;
+        let parsed = parse_junit_xml_per_file(xml, &known);
+        let st = parsed.get("tests/test_cmp.py").expect("stats for test_cmp.py");
+        assert_eq!(st.passed, 1);
+        assert_eq!(st.failed, 1);
+        assert_eq!(st.failed_nodeids, vec!["tests/test_cmp.py::test_fail[x > y]"]);
+    }
 }
