@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -145,6 +145,7 @@ struct DaemonHub {
     traces: Mutex<VecDeque<Value>>,
     started_at: Instant,
     local_oneshot: bool,
+    shutting_down: AtomicBool,
 }
 
 impl DaemonHub {
@@ -159,6 +160,19 @@ impl DaemonHub {
             traces: Mutex::new(VecDeque::new()),
             started_at: Instant::now(),
             local_oneshot,
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        let roots = self
+            .roots
+            .lock()
+            .map(|guard| guard.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for root in roots {
+            root.cancel_active();
         }
     }
 
@@ -301,6 +315,9 @@ impl DaemonHub {
     }
 
     fn execute(&self, mut req: Request) -> std::result::Result<Value, String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("daemon is shutting down".to_string());
+        }
         let started = Instant::now();
         let trace_id = extract_trace_id(&mut req.arguments);
         let outcome = self.execute_inner(&req);
@@ -629,6 +646,7 @@ pub fn serve() -> Result<()> {
             Err(TrySendError::Disconnected(_)) => break,
         }
     }
+    hub.begin_shutdown();
     drop(connection_tx);
     let deadline = Instant::now() + Duration::from_secs(10);
     while active_connections.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
@@ -900,5 +918,20 @@ mod tests {
             assert_eq!(count.load(Ordering::Acquire), 1);
         }
         assert_eq!(count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn shutdown_gate_rejects_queued_requests() {
+        let hub = DaemonHub::new();
+        hub.begin_shutdown();
+        let error = hub
+            .execute(Request {
+                root: None,
+                name: "ping".to_string(),
+                arguments: json!({}),
+                compact: false,
+            })
+            .unwrap_err();
+        assert_eq!(error, "daemon is shutting down");
     }
 }
