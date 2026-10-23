@@ -198,6 +198,7 @@ pub struct ManagedRoot {
     fs_overflow: Arc<AtomicBool>,
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
     watcher_filter_dirs: Arc<Mutex<BTreeSet<PathBuf>>>,
+    background_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     zygote: Mutex<ZygoteManager>,
     active_pgid: Arc<AtomicI32>,
     active_pgids: Mutex<BTreeSet<i32>>,
@@ -338,6 +339,7 @@ impl ManagedRoot {
                 fs_overflow,
                 watcher: Mutex::new(watcher),
                 watcher_filter_dirs,
+                background_worker: Mutex::new(None),
                 zygote: Mutex::new(zygote_manager),
                 active_pgid,
                 active_pgids: Mutex::new(BTreeSet::new()),
@@ -346,7 +348,7 @@ impl ManagedRoot {
         });
 
         if spec.policy.background_enabled {
-            Self::spawn_background_worker(Arc::clone(&arc));
+            Self::spawn_background_worker(&arc)?;
         }
 
         Ok(arc)
@@ -402,18 +404,24 @@ impl ManagedRoot {
 
     pub fn shutdown(&self) {
         self.stopped.store(true, Ordering::SeqCst);
+        self.cancel_active();
+        self.condvar.notify_all();
+        if let Ok(mut w) = self.watcher.lock() {
+            *w = None;
+        }
+        if let Ok(mut worker) = self.background_worker.lock()
+            && let Some(handle) = worker.take()
+        {
+            let _ = handle.join();
+        }
         if let Ok(mut guard) = self.state.lock()
             && let Err(error) = guard.cache.save()
         {
             guard.cache.persistence_error = Some(error.to_string());
         }
-        if let Ok(mut w) = self.watcher.lock() {
-            *w = None;
-        }
         if let Ok(mut z) = self.zygote.lock() {
             *z = ZygoteManager::default();
         }
-        self.condvar.notify_all();
     }
 
     fn enqueue_affected_locked(guard: &mut RootState, affected: Vec<AffectedTest>) {
@@ -456,12 +464,19 @@ impl ManagedRoot {
         cancelled
     }
 
-    fn spawn_background_worker(this: Arc<Self>) {
-        let _ = std::thread::Builder::new()
+    fn spawn_background_worker(this: &Arc<Self>) -> Result<()> {
+        let worker_root = Arc::clone(this);
+        let handle = std::thread::Builder::new()
             .name("tctx-bg-runner".to_string())
             .spawn(move || {
-                this.background_loop();
-            });
+                worker_root.background_loop();
+            })?;
+        let mut slot = this
+            .background_worker
+            .lock()
+            .map_err(|_| invalid("background worker mutex poisoned"))?;
+        *slot = Some(handle);
+        Ok(())
     }
 
     fn background_loop(&self) {
