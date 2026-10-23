@@ -22,6 +22,7 @@ pub const FRAMED_JSON_MAGIC: &[u8] = b"TCTXJ1\n";
 pub const TRACE_ARGUMENT: &str = "_tctx_trace";
 pub const MAX_ACTIVE_CONNECTIONS: usize = 64;
 pub const MAX_CONNECTION_WORKERS: usize = 8;
+pub const PERSISTENT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_RESIDENT_ROOTS: usize = 8;
 pub const MAX_DAEMON_RSS_BYTES: u64 = 192 * 1024 * 1024;
 pub const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
@@ -61,6 +62,10 @@ fn root_idle_timeout(indexed_files: usize) -> Duration {
 
 fn connection_worker_count(available_parallelism: usize) -> usize {
     available_parallelism.clamp(4, MAX_CONNECTION_WORKERS)
+}
+
+fn persistent_connection_expired(last_activity: Instant) -> bool {
+    last_activity.elapsed() >= PERSISTENT_CONNECTION_IDLE_TIMEOUT
 }
 
 extern "C" fn request_stop(_: libc::c_int) {
@@ -730,6 +735,7 @@ fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
 
     if peek.starts_with(BINARY_MAGIC) {
         reader.consume(BINARY_MAGIC.len());
+        let mut last_activity = Instant::now();
         loop {
             let mut len_buf = [0u8; 4];
             match reader.read_exact(&mut len_buf) {
@@ -749,6 +755,9 @@ fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
+                    if persistent_connection_expired(last_activity) {
+                        return Ok(());
+                    }
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -785,9 +794,11 @@ fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
             stream.write_all(&u32::try_from(encoded.len())?.to_be_bytes())?;
             stream.write_all(&encoded)?;
             stream.flush()?;
+            last_activity = Instant::now();
         }
     } else if peek.starts_with(FRAMED_JSON_MAGIC) {
         reader.consume(FRAMED_JSON_MAGIC.len());
+        let mut last_activity = Instant::now();
         loop {
             let mut len_buf = [0u8; 4];
             match reader.read_exact(&mut len_buf) {
@@ -807,6 +818,9 @@ fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
+                    if persistent_connection_expired(last_activity) {
+                        return Ok(());
+                    }
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -826,6 +840,7 @@ fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
             stream.write_all(&u32::try_from(bytes.len())?.to_be_bytes())?;
             stream.write_all(&bytes)?;
             stream.flush()?;
+            last_activity = Instant::now();
         }
     } else {
         // One-shot JSON line protocol
@@ -1011,5 +1026,13 @@ mod tests {
         assert_eq!(connection_worker_count(1), 4);
         assert_eq!(connection_worker_count(8), 8);
         assert_eq!(connection_worker_count(64), MAX_CONNECTION_WORKERS);
+    }
+
+    #[test]
+    fn persistent_connections_expire_after_idle_deadline() {
+        let recent = Instant::now();
+        assert!(!persistent_connection_expired(recent));
+        let stale = Instant::now() - PERSISTENT_CONNECTION_IDLE_TIMEOUT;
+        assert!(persistent_connection_expired(stale));
     }
 }
