@@ -25,6 +25,16 @@ pub const MAX_RESIDENT_ROOTS: usize = 8;
 pub const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_allocator() -> bool {
+    unsafe { libc::malloc_trim(0) != 0 }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_allocator() -> bool {
+    false
+}
+
 extern "C" fn request_stop(_: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::Release);
 }
@@ -231,6 +241,7 @@ impl DaemonHub {
         for root in evicted {
             root.shutdown();
         }
+        trim_allocator();
     }
 
     fn get_or_load_root(&self, requested_root: &Path) -> Result<Arc<ManagedRoot>> {
@@ -933,5 +944,10 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error, "daemon is shutting down");
+    }
+
+    #[test]
+    fn allocator_trim_is_safe_without_loaded_roots() {
+        let _ = trim_allocator();
     }
 }
