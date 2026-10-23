@@ -5,6 +5,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -505,6 +506,10 @@ pub fn run_command_with_timeout_tracked(
     let stdout = stdout_handle.join().unwrap_or_default();
     let stderr = stderr_handle.join().unwrap_or_default();
     let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let cancelled = !timed_out
+        && status
+            .signal()
+            .is_some_and(|signal| matches!(signal, libc::SIGKILL | libc::SIGTERM));
     Ok(BoundedOutput {
         status,
         stdout,
@@ -512,7 +517,7 @@ pub fn run_command_with_timeout_tracked(
         duration_ms,
         timed_out,
         structured: None,
-        cancelled: false,
+        cancelled,
     })
 }
 
@@ -527,5 +532,36 @@ mod tests {
         let output = run_command_with_timeout(&mut command, Duration::from_secs(5), 1024).unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 1024);
+    }
+
+    #[test]
+    fn tracked_process_group_kill_is_reported_as_cancellation() {
+        let active_pgid = std::sync::Arc::new(AtomicI32::new(0));
+        let worker_pgid = std::sync::Arc::clone(&active_pgid);
+        let handle = std::thread::spawn(move || {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", "sleep 30"]);
+            run_command_with_timeout_tracked(
+                &mut command,
+                Duration::from_secs(35),
+                1024,
+                Some(&worker_pgid),
+                None,
+            )
+            .unwrap()
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while active_pgid.load(Ordering::Acquire) <= 0 {
+            assert!(
+                Instant::now() < deadline,
+                "child process group was not published"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pgid = active_pgid.load(Ordering::Acquire);
+        assert_eq!(unsafe { libc::kill(-pgid, libc::SIGKILL) }, 0);
+        let output = handle.join().unwrap();
+        assert!(output.cancelled);
+        assert!(!output.timed_out);
     }
 }
