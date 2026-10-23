@@ -1,4 +1,6 @@
-use crate::ast_graph::{AffectedTest, DependencyGraph, FileGraphInfo, normalize_rel_str, sha256_hex};
+use crate::ast_graph::{
+    AffectedTest, DependencyGraph, FileGraphInfo, file_stamp, normalize_rel_str, sha256_hex,
+};
 use crate::cache::{CachedTestRecord, RootCache, TestOutcome, now_unix_ms};
 use crate::catalog::Spec;
 use crate::workspace::{Workspace, run_command_with_timeout};
@@ -269,6 +271,16 @@ impl ManagedRoot {
     }
 
     pub fn handle_fs_event(&self, event: Event) {
+        // Ignore read/open/access-time events so our own file reads never trigger an inotify feedback loop!
+        if matches!(
+            event.kind,
+            notify::EventKind::Access(_)
+                | notify::EventKind::Modify(notify::event::ModifyKind::Metadata(
+                    notify::event::MetadataKind::AccessTime
+                ))
+        ) {
+            return;
+        }
         let mut guard = match self.state.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -285,7 +297,16 @@ impl ManagedRoot {
             }
             let rel_str = normalize_rel_str(rel);
             let full = guard.workspace.root.join(rel);
-            if full.is_file() {
+            if let Some(live_stamp) = file_stamp(&full) {
+                if guard
+                    .graph
+                    .files
+                    .get(&rel_str)
+                    .and_then(|n| n.stamp)
+                    .is_some_and(|s| s == live_stamp)
+                {
+                    continue;
+                }
                 if let Ok(bytes) = guard
                     .workspace
                     .read_known_with_limit(rel, guard.spec.policy.max_file_bytes)
@@ -297,9 +318,13 @@ impl ManagedRoot {
                         .get(&rel_str)
                         .is_some_and(|node| node.sha256 == new_sha);
                     if !unchanged {
-                        guard.graph.insert_file_bytes(&rel_str, &bytes);
+                        guard
+                            .graph
+                            .insert_file_bytes_with_stamp(&rel_str, &bytes, Some(live_stamp));
                         changed_rels.push(rel_str);
                         graph_dirty = true;
+                    } else if let Some(node) = guard.graph.files.get_mut(&rel_str) {
+                        node.stamp = Some(live_stamp);
                     }
                 }
             } else if !full.exists() && guard.graph.remove_file(&rel_str) {
@@ -312,14 +337,14 @@ impl ManagedRoot {
             guard.graph.recompute_edges();
             if guard.spec.policy.background_enabled {
                 let affected = guard.graph.affected_tests(&changed_rels);
-                for item in affected {
+                for item in affected.into_iter().rev() {
                     if guard
                         .cache
                         .get_matching(&item.test_file, &item.dep_hash)
                         .is_none()
-                        && !guard.pending_queue.contains(&item.test_file)
                     {
-                        guard.pending_queue.push_back(item.test_file);
+                        guard.pending_queue.retain(|p| p != &item.test_file);
+                        guard.pending_queue.push_front(item.test_file);
                     }
                 }
                 self.condvar.notify_all();
@@ -333,8 +358,8 @@ impl ManagedRoot {
             let mut set = BTreeSet::new();
             for t in tests {
                 set.insert(t.clone());
-                if let Some(deps) = guard.graph.transitive_deps_for_test.get(t) {
-                    set.extend(deps.iter().cloned());
+                for dep in guard.graph.transitive_deps_for(t) {
+                    set.insert(dep);
                 }
             }
             for cfg in guard.graph.config_hashes.keys() {
@@ -349,7 +374,17 @@ impl ManagedRoot {
         for rel_str in files_to_check {
             let rel_path = Path::new(&rel_str);
             let full = guard.workspace.root.join(rel_path);
-            if full.is_file() {
+            if let Some(live_stamp) = file_stamp(&full) {
+                // Fast metadata stamp check avoids reading file bytes when mtime/size/inode are unchanged
+                if guard
+                    .graph
+                    .files
+                    .get(&rel_str)
+                    .and_then(|n| n.stamp)
+                    .is_some_and(|s| s == live_stamp)
+                {
+                    continue;
+                }
                 if let Ok(bytes) = guard
                     .workspace
                     .read_known_with_limit(rel_path, guard.spec.policy.max_file_bytes)
@@ -357,8 +392,12 @@ impl ManagedRoot {
                     let live_sha = sha256_hex(&bytes);
                     let indexed_sha = guard.graph.files.get(&rel_str).map(|n| n.sha256.as_str());
                     if indexed_sha != Some(live_sha.as_str()) {
-                        guard.graph.insert_file_bytes(&rel_str, &bytes);
+                        guard
+                            .graph
+                            .insert_file_bytes_with_stamp(&rel_str, &bytes, Some(live_stamp));
                         changed.push(rel_str);
+                    } else if let Some(node) = guard.graph.files.get_mut(&rel_str) {
+                        node.stamp = Some(live_stamp);
                     }
                 }
             } else if !full.exists() && guard.graph.remove_file(&rel_str) {
@@ -369,14 +408,14 @@ impl ManagedRoot {
         if !changed.is_empty() {
             guard.graph.recompute_edges();
             if guard.spec.policy.background_enabled {
-                for item in guard.graph.affected_tests(&changed) {
+                for item in guard.graph.affected_tests(&changed).into_iter().rev() {
                     if guard
                         .cache
                         .get_matching(&item.test_file, &item.dep_hash)
                         .is_none()
-                        && !guard.pending_queue.contains(&item.test_file)
                     {
-                        guard.pending_queue.push_back(item.test_file);
+                        guard.pending_queue.retain(|p| p != &item.test_file);
+                        guard.pending_queue.push_front(item.test_file);
                     }
                 }
             }

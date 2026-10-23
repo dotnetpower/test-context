@@ -4,7 +4,29 @@ use crate::{Result, invalid};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileStamp {
+    pub mtime_sec: i64,
+    pub mtime_nsec: i64,
+    pub size: u64,
+    pub ino: u64,
+}
+
+pub fn file_stamp(full_path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::symlink_metadata(full_path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    Some(FileStamp {
+        mtime_sec: meta.mtime(),
+        mtime_nsec: meta.mtime_nsec(),
+        size: meta.len(),
+        ino: meta.ino(),
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ImportSpec {
@@ -19,12 +41,14 @@ pub struct ParsedPythonFile {
     pub test_symbols: Vec<String>,
     pub fixtures_defined: Vec<String>,
     pub fixtures_used: Vec<String>,
+    pub defined_symbols: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileNode {
     pub path: String,
     pub sha256: String,
+    pub stamp: Option<FileStamp>,
     pub is_test: bool,
     pub is_conftest: bool,
     pub is_config: bool,
@@ -61,7 +85,8 @@ pub struct DependencyGraph {
     pub direct_imports: BTreeMap<String, BTreeSet<String>>,
     pub reverse_imports: BTreeMap<String, BTreeSet<String>>,
     pub conftest_for_test: BTreeMap<String, Vec<String>>,
-    pub transitive_deps_for_test: BTreeMap<String, BTreeSet<String>>,
+    pub file_index_to_path: Vec<String>,
+    pub transitive_dep_ids_for_test: BTreeMap<String, Vec<u32>>,
     pub dep_hash_for_test: BTreeMap<String, String>,
     pub config_hashes: BTreeMap<String, String>,
 }
@@ -79,7 +104,8 @@ impl DependencyGraph {
             direct_imports: BTreeMap::new(),
             reverse_imports: BTreeMap::new(),
             conftest_for_test: BTreeMap::new(),
-            transitive_deps_for_test: BTreeMap::new(),
+            file_index_to_path: Vec::new(),
+            transitive_dep_ids_for_test: BTreeMap::new(),
             dep_hash_for_test: BTreeMap::new(),
             config_hashes: BTreeMap::new(),
         }
@@ -90,6 +116,8 @@ impl DependencyGraph {
         let mut graph = Self::new();
         let mut total_bytes = 0usize;
         for rel_path in &inventory.files {
+            let full_path = workspace.root.join(rel_path);
+            let stamp = file_stamp(&full_path);
             let bytes = match workspace.read_known_with_limit(rel_path, policy.max_file_bytes) {
                 Ok(b) => b,
                 Err(_) => continue,
@@ -99,13 +127,22 @@ impl DependencyGraph {
                 return Err(invalid("workspace exceeds max_source_bytes policy limit").into());
             }
             let rel_str = normalize_rel_str(rel_path);
-            graph.insert_file_bytes(&rel_str, &bytes);
+            graph.insert_file_bytes_with_stamp(&rel_str, &bytes, stamp);
         }
         graph.recompute_edges();
         Ok(graph)
     }
 
     pub fn insert_file_bytes(&mut self, rel_str: &str, bytes: &[u8]) {
+        self.insert_file_bytes_with_stamp(rel_str, bytes, None);
+    }
+
+    pub fn insert_file_bytes_with_stamp(
+        &mut self,
+        rel_str: &str,
+        bytes: &[u8],
+        stamp: Option<FileStamp>,
+    ) {
         let sha = sha256_hex(bytes);
         let file_name = Path::new(rel_str)
             .file_name()
@@ -118,6 +155,7 @@ impl DependencyGraph {
                 FileNode {
                     path: rel_str.to_string(),
                     sha256: sha,
+                    stamp,
                     is_test: false,
                     is_conftest: false,
                     is_config: true,
@@ -138,6 +176,7 @@ impl DependencyGraph {
             FileNode {
                 path: rel_str.to_string(),
                 sha256: sha,
+                stamp,
                 is_test,
                 is_conftest,
                 is_config: false,
@@ -152,13 +191,30 @@ impl DependencyGraph {
         removed_cfg || removed_file
     }
 
+    pub fn transitive_deps_for(&self, test_file: &str) -> Vec<String> {
+        let Some(ids) = self.transitive_dep_ids_for_test.get(test_file) else {
+            return Vec::new();
+        };
+        ids.iter()
+            .filter_map(|&id| self.file_index_to_path.get(id as usize).cloned())
+            .collect()
+    }
+
     /// Recomputes module resolution, forward/reverse import edges, conftest chains, and Merkle dep_hashes.
     pub fn recompute_edges(&mut self) {
         self.direct_imports.clear();
         self.reverse_imports.clear();
         self.conftest_for_test.clear();
-        self.transitive_deps_for_test.clear();
+        self.file_index_to_path.clear();
+        self.transitive_dep_ids_for_test.clear();
         self.dep_hash_for_test.clear();
+
+        let mut path_to_id: BTreeMap<String, u32> = BTreeMap::new();
+        for (idx, path) in self.files.keys().enumerate() {
+            let id = u32::try_from(idx).unwrap_or(u32::MAX);
+            self.file_index_to_path.push(path.clone());
+            path_to_id.insert(path.clone(), id);
+        }
 
         let module_index = ModuleIndex::build(&self.files);
         let fixture_providers = build_fixture_provider_index(&self.files);
@@ -175,7 +231,6 @@ impl DependencyGraph {
                     }
                 }
             }
-            // If this file uses fixtures defined in a conftest.py or fixture module, link matching providers
             for fixture_name in &node.parsed.fixtures_used {
                 if let Some(providers) = fixture_providers.get(fixture_name) {
                     for provider in providers {
@@ -194,7 +249,18 @@ impl DependencyGraph {
             self.direct_imports.insert(path.clone(), deps);
         }
 
-        // Collect all conftest.py paths
+        // Build compact adjacency list in terms of u32 file IDs
+        let num_files = self.file_index_to_path.len();
+        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); num_files];
+        for (src, targets) in &self.direct_imports {
+            if let Some(&src_id) = path_to_id.get(src) {
+                adj[src_id as usize] = targets
+                    .iter()
+                    .filter_map(|t| path_to_id.get(t).copied())
+                    .collect();
+            }
+        }
+
         let conftests: BTreeSet<String> = self
             .files
             .values()
@@ -202,7 +268,6 @@ impl DependencyGraph {
             .map(|n| n.path.clone())
             .collect();
 
-        // Compute transitive closure & Merkle dep_hash for every test file
         let test_files: Vec<String> = self
             .files
             .values()
@@ -210,40 +275,61 @@ impl DependencyGraph {
             .map(|n| n.path.clone())
             .collect();
 
+        let mut cfg_prefix = Vec::new();
+        cfg_prefix.extend_from_slice(b"tctx:merkle:v1\n");
+        for (cfg_path, cfg_sha) in &self.config_hashes {
+            cfg_prefix.extend_from_slice(b"cfg:");
+            cfg_prefix.extend_from_slice(cfg_path.as_bytes());
+            cfg_prefix.extend_from_slice(b":");
+            cfg_prefix.extend_from_slice(cfg_sha.as_bytes());
+            cfg_prefix.extend_from_slice(b"\n");
+        }
+
+        let mut visited_stamp = vec![0u32; num_files];
+        let mut epoch = 0u32;
+        let mut queue = VecDeque::new();
+
         for test_path in test_files {
+            epoch = epoch.wrapping_add(1);
+            if epoch == 0 {
+                visited_stamp.fill(0);
+                epoch = 1;
+            }
             let ancestor_conftests = ancestor_conftests_for(&test_path, &conftests);
-            let mut reachable = BTreeSet::new();
-            let mut queue = VecDeque::new();
+            let mut reachable_ids = Vec::new();
+            queue.clear();
 
-            reachable.insert(test_path.clone());
-            queue.push_back(test_path.clone());
-
+            if let Some(&test_id) = path_to_id.get(&test_path) {
+                visited_stamp[test_id as usize] = epoch;
+                reachable_ids.push(test_id);
+                queue.push_back(test_id);
+            }
             for cf in &ancestor_conftests {
-                if reachable.insert(cf.clone()) {
-                    queue.push_back(cf.clone());
+                if let Some(&cf_id) = path_to_id.get(cf)
+                    && visited_stamp[cf_id as usize] != epoch
+                {
+                    visited_stamp[cf_id as usize] = epoch;
+                    reachable_ids.push(cf_id);
+                    queue.push_back(cf_id);
                 }
             }
 
-            while let Some(curr) = queue.pop_front() {
-                if let Some(imports) = self.direct_imports.get(&curr) {
-                    for next in imports {
-                        if reachable.insert(next.clone()) {
-                            queue.push_back(next.clone());
-                        }
+            while let Some(curr_id) = queue.pop_front() {
+                for &next_id in &adj[curr_id as usize] {
+                    if visited_stamp[next_id as usize] != epoch {
+                        visited_stamp[next_id as usize] = epoch;
+                        reachable_ids.push(next_id);
+                        queue.push_back(next_id);
                     }
                 }
             }
 
+            reachable_ids.sort_unstable();
+
             let mut hasher = Sha256::new();
-            hasher.update(b"tctx:merkle:v1\n");
-            for (cfg_path, cfg_sha) in &self.config_hashes {
-                hasher.update(b"cfg:");
-                hasher.update(cfg_path.as_bytes());
-                hasher.update(b":");
-                hasher.update(cfg_sha.as_bytes());
-                hasher.update(b"\n");
-            }
-            for dep_path in &reachable {
+            hasher.update(&cfg_prefix);
+            for &dep_id in &reachable_ids {
+                let dep_path = &self.file_index_to_path[dep_id as usize];
                 if let Some(dep_node) = self.files.get(dep_path) {
                     hasher.update(b"py:");
                     hasher.update(dep_path.as_bytes());
@@ -255,8 +341,8 @@ impl DependencyGraph {
             let dep_hash = hex_encode(&hasher.finalize());
             self.conftest_for_test
                 .insert(test_path.clone(), ancestor_conftests);
-            self.transitive_deps_for_test
-                .insert(test_path.clone(), reachable);
+            self.transitive_dep_ids_for_test
+                .insert(test_path.clone(), reachable_ids);
             self.dep_hash_for_test.insert(test_path, dep_hash);
         }
     }
@@ -380,11 +466,7 @@ impl DependencyGraph {
             .get(&norm)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
-        let transitive_dependencies = self
-            .transitive_deps_for_test
-            .get(&norm)
-            .map(|s| s.iter().cloned().collect())
-            .unwrap_or_default();
+        let transitive_dependencies = self.transitive_deps_for(&norm);
         let conftest_chain = self
             .conftest_for_test
             .get(&norm)
@@ -953,6 +1035,7 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
     let mut test_symbols = BTreeSet::new();
     let mut fixtures_defined = BTreeSet::new();
     let mut fixtures_used = BTreeSet::new();
+    let mut defined_symbols = BTreeSet::new();
 
     let n = tokens.len();
     let mut i = 0usize;
@@ -1036,6 +1119,7 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                 i += 1;
                 if let Some(PyToken::Ident(name)) = tokens.get(i) {
                     let sym_name = name.clone();
+                    defined_symbols.insert(sym_name.clone());
                     i += 1;
                     if is_class {
                         if sym_name.starts_with("Test") {
@@ -1114,6 +1198,13 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                 at_statement_start = false;
                 i += 1;
             }
+            PyToken::Ident(ident) if at_statement_start => {
+                if matches!(tokens.get(i + 1), Some(PyToken::Assign | PyToken::Colon)) {
+                    defined_symbols.insert(ident.clone());
+                }
+                at_statement_start = false;
+                i += 1;
+            }
             _ => {
                 at_statement_start = false;
                 i += 1;
@@ -1126,6 +1217,7 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
         test_symbols: test_symbols.into_iter().collect(),
         fixtures_defined: fixtures_defined.into_iter().collect(),
         fixtures_used: fixtures_used.into_iter().collect(),
+        defined_symbols: defined_symbols.into_iter().collect(),
     }
 }
 

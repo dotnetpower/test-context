@@ -8,7 +8,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-pub const PYTEST_CONFIG_FILES: &[&str] = &["pyproject.toml", "pytest.ini", "setup.cfg", "tox.ini"];
+pub const PYTEST_CONFIG_FILES: &[&str] = &[
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "tox.ini",
+    "uv.lock",
+    "poetry.lock",
+    "requirements.txt",
+];
 
 #[derive(Clone, Debug)]
 pub struct Workspace {

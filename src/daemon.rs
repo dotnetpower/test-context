@@ -313,17 +313,6 @@ pub fn serve() -> Result<()> {
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
 
     let hub = Arc::new(DaemonHub::new());
-    // Pre-load registered roots asynchronously so background workers start warming up
-    if let Ok(specs) = catalog::load() {
-        let hub_init = Arc::clone(&hub);
-        std::thread::spawn(move || {
-            for spec in specs {
-                if spec.root.is_dir() {
-                    let _ = hub_init.get_or_load_root(&spec.root);
-                }
-            }
-        });
-    }
 
     for incoming in listener.incoming() {
         let Ok(stream) = incoming else {
