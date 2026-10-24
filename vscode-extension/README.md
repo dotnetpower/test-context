@@ -2,6 +2,8 @@
 
 Native VS Code Language Model Tools for **Test Context (`tctx`)** — incremental Python AST dependency analysis, speculative background `pytest` execution, and zero-startup cached test results for GitHub Copilot.
 
+These Native tools are the default Test Context surface in VS Code. Use the optional MCP server only when Native extension dispatch is unavailable, such as an unattended background agent session.
+
 ## Contributed Language Model Tools
 
 - `#tctxNativeRun` (`test-context-native_testRun`): Run `pytest` incrementally with instant cache hits for tests already verified in the background.

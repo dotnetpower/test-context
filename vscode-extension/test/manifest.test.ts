@@ -78,6 +78,12 @@ void test('manifest metadata, branding PNGs, walkthrough, and 7 native tools are
       'tctxNativeWorkspaces',
     ],
   );
+  const instructions = await readFile(
+    resolve(__dirname, '../../prompts/test-context.instructions.md'),
+    'utf8',
+  );
+  assert.match(instructions, /MUST use `#tctxNativeRun` FIRST/);
+  assert.match(instructions, /Do not choose MCP when the matching Native tool is callable/);
 
   const walkthrough = manifest.contributes?.walkthroughs?.[0];
   assert.equal(walkthrough?.id, 'getting-started');

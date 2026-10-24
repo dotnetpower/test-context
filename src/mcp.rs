@@ -7,7 +7,7 @@ pub fn tools() -> Value {
         "tools": [
             {
                 "name": "test_run",
-                "description": "Use this FIRST instead of running shell pytest directly in a registered Python workspace. Resolves target test files (or expands modified source files via the Rust AST reverse dependency graph), checks live SHA-256 Merkle dependency hashes (dep_hash), skips tests that already passed in the background or prior runs, joins in-flight background runs, and executes only the uncached delta. Returns instant results (< 5ms) when all targeted tests are already cached green.",
+                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Use this before shell pytest in a registered Python workspace. Resolves target test files (or expands modified source files via the Rust AST reverse dependency graph), checks live SHA-256 Merkle dependency hashes (dep_hash), skips tests that already passed in the background or prior runs, joins in-flight background runs, and executes only the uncached delta. Returns instant results (< 5ms) when all targeted tests are already cached green.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -56,7 +56,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "test_affected",
-                "description": "Use this FIRST to find which pytest test files are impacted by changed Python source files or git working-tree edits via the Rust AST reverse dependency graph, along with each test file's dependency chain and live background cache state (cached_passed, cached_failed, running_in_background, queued_in_background, uncached).",
+                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Find which pytest test files are impacted by changed Python source files or git working-tree edits via the Rust AST reverse dependency graph, along with each test file's dependency chain and live background cache state (cached_passed, cached_failed, running_in_background, queued_in_background, uncached).",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -193,4 +193,28 @@ pub fn tools() -> Value {
             }
         ]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_tools_are_described_as_native_unavailable_fallbacks() {
+        let tools = tools();
+        let entries = tools["tools"].as_array().expect("MCP tools array");
+        for name in ["test_run", "test_affected"] {
+            let description = entries
+                .iter()
+                .find(|tool| tool["name"].as_str() == Some(name))
+                .and_then(|tool| tool["description"].as_str())
+                .expect("MCP tool description");
+            assert!(
+                description.starts_with(
+                    "MCP fallback for sessions where the matching Native tool is unavailable."
+                ),
+                "{name} did not preserve Native-first routing: {description}"
+            );
+        }
+    }
 }
