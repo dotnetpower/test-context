@@ -4,6 +4,11 @@ Native VS Code Language Model Tools for **Test Context (`tctx`)** — incrementa
 
 These Native tools are the default Test Context surface in VS Code. Use the optional MCP server only when Native extension dispatch is unavailable, such as an unattended background agent session.
 
+For a Windows Agents window backed by WSL, install the VSIX in both the Windows FDAI profile and
+the WSL extension host. The installer performs both installations and configures the Windows
+extension to use `wsl.exe --exec tctx native-bridge`; it does not route Native tools through MCP or
+a network port.
+
 ## Contributed Language Model Tools
 
 - `#tctxNativeRun` (`test-context-native_testRun`): Run `pytest` incrementally with instant cache hits for tests already verified in the background.

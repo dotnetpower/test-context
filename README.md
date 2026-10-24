@@ -23,6 +23,7 @@ When GitHub Copilot (or a developer) invokes tests:
 - **Native GitHub Copilot Integration (`moonchoi.test-context-native`)**:
   - 7 Native VS Code Language Model Tools (`#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeWorkspaces`, `#tctxNativeInvalidate`).
   - Native tools are the default in VS Code foreground sessions.
+  - From WSL, the installer deploys the VSIX to both the WSL remote host and the Windows Agents profile, then configures direct `wsl.exe --exec tctx native-bridge` IPC.
   - Optional Shared MCP Server (`tctx shared-mcp`) is a fallback for background/CLI agent sessions where Native dispatch is unavailable (`test_run`, `test_affected`, `test_graph`, `test_status`, `test_sync`, `test_workspaces`, `test_invalidate`).
   - The VS Code installer installs Native only by default. Set `TCTX_INSTALL_MCP=1` to additionally register the MCP fallback while preserving existing servers.
   - Drop-in CLI (`tctx run`, `tctx pytest`, `tctx affected`, `tctx graph`, `tctx status`, `tctx sync`).
