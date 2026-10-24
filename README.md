@@ -23,6 +23,7 @@ When GitHub Copilot (or a developer) invokes tests:
 - **Native GitHub Copilot Integration (`moonchoi.test-context-native`)**:
   - 7 Native VS Code Language Model Tools (`#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeWorkspaces`, `#tctxNativeInvalidate`).
   - Shared MCP Server (`tctx shared-mcp`) for background/CLI agent sessions (`test_run`, `test_affected`, `test_graph`, `test_status`, `test_sync`, `test_workspaces`, `test_invalidate`).
+  - The VS Code installer registers the shared MCP server in the remote WSL user configuration while preserving existing servers.
   - Drop-in CLI (`tctx run`, `tctx pytest`, `tctx affected`, `tctx graph`, `tctx status`, `tctx sync`).
 
 `tctx` can learn only invocations routed through its Native, MCP, or CLI surfaces. A direct shell
