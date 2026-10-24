@@ -29,6 +29,10 @@ interface RootInput {
   root?: string;
 }
 
+interface TestStatusInput extends RootInput {
+  load?: boolean;
+}
+
 interface TestRunInput extends RootInput {
   targets?: string[];
   k?: string;
@@ -319,12 +323,12 @@ const testGraphDefinition: ToolDefinition<TestGraphInput> = {
   }),
 };
 
-const testStatusDefinition: ToolDefinition<RootInput> = {
+const testStatusDefinition: ToolDefinition<TestStatusInput> = {
   name: 'test-context-native_testStatus',
   operation: 'test_status',
   needsRoot: true,
   invocationMessage: () => 'Reading Test Context status and background cache statistics',
-  arguments: () => ({}),
+  arguments: (input) => ({ load: input.load ?? false }),
 };
 
 const testSyncDefinition: ToolDefinition<TestSyncInput> = {

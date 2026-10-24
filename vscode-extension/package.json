@@ -286,7 +286,7 @@
         "name": "test-context-native_testStatus",
         "toolReferenceName": "tctxNativeStatus",
         "displayName": "Test Context: Status",
-        "modelDescription": "Show test-context daemon health, AST graph file counts, cached pass/fail counts, background worker queue status, and cumulative time saved.",
+        "modelDescription": "Show test-context daemon health and workspace residency immediately. Set load=true to load an inactive graph for detailed AST, cache, queue, and saved-time counts.",
         "userDescription": "Show test-context daemon and background cache status.",
         "tags": [
           "status",
@@ -301,6 +301,11 @@
             "root": {
               "type": "string",
               "description": "Optional absolute registered workspace root."
+            },
+            "load": {
+              "type": "boolean",
+              "default": false,
+              "description": "Load an inactive workspace graph for detailed counts. False returns registered/unloaded state immediately."
             }
           }
         }

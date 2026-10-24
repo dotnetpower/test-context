@@ -212,7 +212,7 @@ fn run() -> Result<i32> {
             let _ = daemon::request(&daemon::Request {
                 root: Some(registered.root),
                 name: "test_status".to_string(),
-                arguments: json!({}),
+                arguments: json!({"load": true}),
                 compact: false,
             });
             print_json(&json!({ "registered": true, "plan": plan }))?;
@@ -228,7 +228,7 @@ fn run() -> Result<i32> {
             let res = daemon::request_or_local(&daemon::Request {
                 root: Some(root),
                 name: "test_status".to_string(),
-                arguments: json!({}),
+                arguments: json!({"load": true}),
                 compact: false,
             })?;
             print_json(&res)?;

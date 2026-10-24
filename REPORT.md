@@ -359,3 +359,9 @@ The Windows and WSL output logs identified six actionable issues:
 6. Status, self-test, sync, and workspace output used JSON dumps rather than operator-readable text.
 
 The bridge now exits on transport disconnect so the extension's bounded reconnect path creates a fresh bridge. Startup waits up to two seconds for the native tool registry and reports Windows multi-root mode as ready. System-error traces are not reported back over a failed transport. Output records now use stable `[ready]`, `[success]`, `[info]`, `[warning]`, `[error]`, and `[trace]` lines; status and workspace objects have bounded text summaries. Nested daemon trace payloads and request arguments are excluded from Output logs.
+
+### Current-session Native feedback review
+
+The current session selected `tctxNativeStatus` after Native installation and did not return to the Test Context MCP surface. The first status request still took 3.34 seconds: 3.02 seconds were daemon IPC while an inactive 8,440-file FDAI graph was loaded only to report status. `test_status` now returns registered/unloaded state without loading the graph by default. Agents can request `load=true` for detailed counts, while the interactive CLI and explicit **Show Native Tool Status** command retain detailed loading. This preserves the 5-minute large-root memory policy and removes unnecessary cold-load latency from routine agent health checks.
+
+Installed-session verification reduced the same Native status request from **3,340.16 ms to 2.09 ms** (about **1,596×**) and left the target graph unloaded. An explicit `load=true` request still loaded all 8,440 Python files and returned detailed graph/cache/Zygote counts in 3,602.94 ms.

@@ -426,8 +426,24 @@ impl DaemonHub {
                     .map(|g| g.keys().cloned().collect())
                     .unwrap_or_default();
                 let root_status = if let Some(root_path) = &req.root {
-                    let managed = self.get_or_load_root(root_path)?;
-                    Some(managed.status())
+                    if let Some(managed) = self.loaded_root(root_path)? {
+                        Some(managed.status())
+                    } else if req
+                        .arguments
+                        .get("load")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        Some(self.get_or_load_root(root_path)?.status())
+                    } else {
+                        let spec = catalog::resolve_spec(root_path)?;
+                        Some(json!({
+                            "root": spec.root,
+                            "loaded": false,
+                            "pytest_cmd": spec.effective_pytest_cmd(),
+                            "state": "registered_unloaded",
+                        }))
+                    }
                 } else {
                     None
                 };
@@ -1069,5 +1085,21 @@ mod tests {
         }
         let application_error = ApplicationError("test failed".to_string());
         assert!(!is_transport_disconnect(&application_error));
+    }
+
+    #[test]
+    fn status_loading_is_explicit() {
+        assert!(
+            !json!({})
+                .get("load")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        );
+        assert!(
+            json!({"load": true})
+                .get("load")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        );
     }
 }

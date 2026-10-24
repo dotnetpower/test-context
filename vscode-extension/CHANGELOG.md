@@ -11,3 +11,4 @@
 - Reconnect the WSL native bridge after daemon idle expiry instead of repeating broken-pipe errors.
 - Render status, workspace, operation, and trace logs as concise text rather than JSON dumps.
 - Treat Windows multi-root selection as a ready state and wait briefly for the Language Model Tool registry during startup.
+- Return registered/unloaded workspace status without cold-loading a large graph; detailed status is opt-in with `load=true`.

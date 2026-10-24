@@ -111,7 +111,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "test_status",
-                "description": "Show test-context daemon health, AST graph file counts, cached pass/fail counts, background worker queue status, and total execution time saved.",
+                "description": "Show test-context daemon health and workspace residency immediately. Set load=true to load an inactive graph and include detailed AST, cache, queue, and saved-time counts.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -119,6 +119,11 @@ pub fn tools() -> Value {
                         "root": {
                             "type": "string",
                             "description": "Optional absolute registered workspace root."
+                        },
+                        "load": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Load an inactive workspace graph to include detailed file and cache counts. False returns registered/unloaded state immediately."
                         }
                     }
                 },

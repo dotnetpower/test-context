@@ -143,6 +143,12 @@ function formatStatus(value: JsonValue): string {
   ];
   if (status.workspace && typeof status.workspace === 'object' && !Array.isArray(status.workspace)) {
     const workspace = status.workspace;
+    if (workspace.loaded === false) {
+      lines.push(
+        `workspace root=${logScalar(workspace.root)} state=${logScalar(workspace.state)} pytest=${stringList(workspace.pytest_cmd)}`,
+      );
+      return lines.join('\n');
+    }
     const cache =
       workspace.cache_storage &&
       typeof workspace.cache_storage === 'object' &&

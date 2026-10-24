@@ -2,6 +2,7 @@ use serde_json::json;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use test_context::catalog::{self, Spec};
+use test_context::daemon::{self, Request};
 use test_context::policy::MemoryPolicy;
 use test_context::runner::{ManagedRoot, TestRunRequest};
 use test_context::shared_mcp;
@@ -86,6 +87,18 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         managed_parent: None,
     })
     .unwrap();
+
+    let lightweight_status = daemon::request_or_local(&Request {
+        root: Some(repo.clone()),
+        name: "test_status".to_string(),
+        arguments: json!({"load": false}),
+        compact: false,
+    })
+    .unwrap();
+    assert_eq!(
+        lightweight_status["workspace"]["state"].as_str(),
+        Some("registered_unloaded")
+    );
 
     let managed = ManagedRoot::load(spec).unwrap();
     managed.invalidate(&[]).unwrap();

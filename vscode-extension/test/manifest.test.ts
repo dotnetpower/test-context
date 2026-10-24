@@ -66,6 +66,11 @@ void test('manifest metadata, branding PNGs, walkthrough, and 7 native tools are
       'test-context-native_testWorkspaces',
     ],
   );
+  const statusTool = tools.find((tool) => tool.name === 'test-context-native_testStatus');
+  const statusSchema = statusTool?.inputSchema as {
+    properties?: { load?: { default?: boolean } };
+  };
+  assert.equal(statusSchema.properties?.load?.default, false);
   assert.deepEqual(
     tools.map((t) => t.toolReferenceName).sort(),
     [

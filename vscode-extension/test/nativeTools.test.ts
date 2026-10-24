@@ -93,6 +93,26 @@ void test('status and workspace logs are readable text rather than JSON', () => 
   assert.match(workspaces, /^workspaces count=1/mu);
   assert.match(workspaces, /^workspace root=\/repo/mu);
   assert.doesNotMatch(workspaces, /[{}"]/u);
+
+  const unloaded = formatToolResult('test_status', {
+    daemon: {
+      ok: true,
+      version: '0.1.0',
+      pid: 42,
+      uptime_secs: 9,
+      registered_roots: 2,
+      loaded_roots: [],
+    },
+    capabilities: {},
+    workspace: {
+      root: '/repo',
+      loaded: false,
+      state: 'registered_unloaded',
+      pytest_cmd: ['python', '-m', 'pytest'],
+    },
+  });
+  assert.match(unloaded, /workspace root=\/repo state=registered_unloaded/u);
+  assert.doesNotMatch(unloaded, /python_files=/u);
 });
 
 void test('trace logs are concise and exclude nested daemon payloads', () => {
