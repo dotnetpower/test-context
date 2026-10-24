@@ -129,12 +129,6 @@ export function activate(context: vscode.ExtensionContext): void {
       if (event.affectsConfiguration('testContextNative')) {
         client?.reset();
         bridge.invalidateRegistry();
-
-        if (!context.globalState.get<boolean>(OUTPUT_DISCOVERED_STATE_KEY, false)) {
-          output.show(true);
-          void context.globalState.update(OUTPUT_DISCOVERED_STATE_KEY, true);
-        }
-
         void probe();
       }
     }),
@@ -148,6 +142,11 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
   );
+
+  if (!context.globalState.get<boolean>(OUTPUT_DISCOVERED_STATE_KEY, false)) {
+    output.show(true);
+    void context.globalState.update(OUTPUT_DISCOVERED_STATE_KEY, true);
+  }
 
   output.appendLine(`Activated Test Context native tools; endpoint=${client.endpoint}`);
   if (vscode.workspace.isTrusted) {

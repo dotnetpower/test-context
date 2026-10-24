@@ -93,6 +93,13 @@ void test('manifest metadata, branding PNGs, walkthrough, and 7 native tools are
 
 void test('extension makes the Test Context output channel discoverable once', async () => {
   const source = await readFile(resolve(__dirname, '../../src/extension.ts'), 'utf8');
-  assert.match(source, /testContextNative\.outputDiscovered/);
-  assert.match(source, /output\.show\(true\)/);
+  const subscriptionsEnd = source.indexOf('\n  );\n\n');
+  const discovery = source.indexOf(
+    'if (!context.globalState.get<boolean>(OUTPUT_DISCOVERED_STATE_KEY, false))',
+  );
+  const activationLog = source.indexOf('output.appendLine(`Activated Test Context native tools');
+  assert.ok(subscriptionsEnd >= 0);
+  assert.ok(discovery > subscriptionsEnd);
+  assert.ok(activationLog > discovery);
+  assert.equal(source.match(/OUTPUT_DISCOVERED_STATE_KEY/g)?.length, 3);
 });
