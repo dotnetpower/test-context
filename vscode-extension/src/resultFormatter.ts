@@ -1,4 +1,5 @@
 import type { JsonValue } from './types.js';
+import type { ClientTrace } from './daemonClient.js';
 
 export function formatToolResult(operation: string, value: JsonValue): string {
   switch (operation) {
@@ -43,9 +44,46 @@ export function formatToolResult(operation: string, value: JsonValue): string {
       }
       return lines.join('\n');
     }
+    case 'test_status':
+      return formatStatus(value);
+    case 'test_workspaces':
+      return formatWorkspaces(value);
+    case 'test_graph':
+    case 'test_sync':
+    case 'test_invalidate':
+      return formatReadableValue(value);
     default:
-      return JSON.stringify(value, null, 2);
+      return formatReadableValue(value);
   }
+}
+
+export function formatTraceLog(trace: ClientTrace): string {
+  const outcome =
+    typeof trace.outcome === 'string'
+      ? trace.outcome
+      : trace.success
+        ? 'success'
+        : 'error';
+  return [
+    '[trace]',
+    `operation=${trace.operation}`,
+    `outcome=${outcome}`,
+    `duration=${trace.total_ms.toFixed(3)}ms`,
+    `queue=${trace.queue_ms.toFixed(3)}ms`,
+    `prepare=${trace.prepare_ms.toFixed(3)}ms`,
+    `ipc=${trace.ipc_ms.toFixed(3)}ms`,
+    `serialize=${trace.serialize_ms.toFixed(3)}ms`,
+    `root=${trace.root ?? '-'}`,
+    `id=${trace.trace_id}`,
+  ].join(' ');
+}
+
+export function shouldReportTrace(trace: ClientTrace): boolean {
+  return trace.available === true && trace.outcome !== 'system_error';
+}
+
+export function formatReadableValue(value: JsonValue): string {
+  return readableLines(value, 0).join('\n');
 }
 
 export function validateDaemonStatus(value: JsonValue): void {
@@ -95,4 +133,92 @@ function integerValue(value: JsonValue | undefined, label: string, minimum = 0):
     );
   }
   return value;
+}
+
+function formatStatus(value: JsonValue): string {
+  const status = recordValue(value, 'daemon status');
+  const daemon = recordValue(status.daemon, 'daemon');
+  const lines = [
+    `daemon status=${daemon.ok === true ? 'ready' : 'unavailable'} version=${logScalar(daemon.version)} pid=${logScalar(daemon.pid)} uptime=${logScalar(daemon.uptime_secs)}s registered_roots=${logScalar(daemon.registered_roots)} loaded_roots=${arrayValue(daemon.loaded_roots, 'loaded_roots').length}`,
+  ];
+  if (status.workspace && typeof status.workspace === 'object' && !Array.isArray(status.workspace)) {
+    const workspace = status.workspace;
+    const cache =
+      workspace.cache_storage &&
+      typeof workspace.cache_storage === 'object' &&
+      !Array.isArray(workspace.cache_storage)
+        ? workspace.cache_storage
+        : undefined;
+    const zygote =
+      workspace.zygote && typeof workspace.zygote === 'object' && !Array.isArray(workspace.zygote)
+        ? workspace.zygote
+        : undefined;
+    lines.push(
+      `workspace root=${logScalar(workspace.root)} python_files=${logScalar(workspace.indexed_python_files)} test_files=${logScalar(workspace.total_test_files)} cached_passed=${logScalar(workspace.cached_passed_files)} stale=${logScalar(workspace.uncached_or_stale_files)} queue=${logScalar(workspace.background_pending_queue)} in_flight=${logScalar(workspace.background_in_flight)}`,
+    );
+    if (cache) {
+      lines.push(
+        `cache history=${logScalar(cache.history_records)} latest=${logScalar(cache.latest_records)} memory=${logScalar(cache.estimated_memory_bytes)}B wal=${logScalar(cache.wal_bytes)}B patterns=${logScalar(cache.invocation_patterns)}`,
+      );
+    }
+    if (zygote) {
+      lines.push(
+        `zygote ready=${logScalar(zygote.ready, 'false')} pid=${logScalar(zygote.pid)} rss=${logScalar(zygote.rss_bytes)}B runs=${logScalar(zygote.runs, '0')} active_pgid=${logScalar(zygote.active_pgid, '0')}`,
+      );
+    }
+  }
+  return lines.join('\n');
+}
+
+function formatWorkspaces(value: JsonValue): string {
+  const workspaces = arrayValue(value, 'workspaces');
+  const lines = [`workspaces count=${workspaces.length}`];
+  for (const [index, raw] of workspaces.entries()) {
+    const workspace = recordValue(raw, `workspace ${index}`);
+    lines.push(
+      `workspace root=${logScalar(workspace.root)} scopes=${stringList(workspace.scopes)} pytest=${stringList(workspace.pytest_cmd)}`,
+    );
+  }
+  return lines.join('\n');
+}
+
+function stringList(value: JsonValue | undefined): string {
+  if (!Array.isArray(value)) {
+    return '-';
+  }
+  return value.map(String).join(',');
+}
+
+function logScalar(value: JsonValue | undefined, fallback = '-'): string {
+  return value === null || value === undefined || typeof value === 'object'
+    ? fallback
+    : String(value);
+}
+
+function readableLines(value: JsonValue, depth: number, label?: string): string[] {
+  const indent = '  '.repeat(depth);
+  const prefix = label ? `${label}: ` : '';
+  if (value === null || typeof value !== 'object') {
+    return [`${indent}${prefix}${String(value)}`];
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      return [`${indent}${prefix}(none)`];
+    }
+    const lines = label ? [`${indent}${label}:`] : [];
+    for (const item of value) {
+      if (item !== null && typeof item === 'object') {
+        lines.push(`${indent}-`);
+        lines.push(...readableLines(item, depth + 1));
+      } else {
+        lines.push(`${indent}- ${String(item)}`);
+      }
+    }
+    return lines;
+  }
+  const lines = label ? [`${indent}${label}:`] : [];
+  for (const [key, item] of Object.entries(value)) {
+    lines.push(...readableLines(item, label ? depth + 1 : depth, key));
+  }
+  return lines;
 }

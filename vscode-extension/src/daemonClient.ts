@@ -30,6 +30,8 @@ interface PendingResponse {
 export interface ClientTrace {
   [key: string]: JsonValue;
   trace_id: string;
+  operation: string;
+  root: string | null;
   queue_ms: number;
   prepare_ms: number;
   ipc_ms: number;
@@ -39,6 +41,7 @@ export interface ClientTrace {
   completed_unix_ms: number;
   success: boolean;
   available: boolean;
+  outcome?: string;
 }
 
 export class DaemonResponseError extends Error {

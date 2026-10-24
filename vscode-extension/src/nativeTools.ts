@@ -4,7 +4,11 @@ import { resolve } from 'node:path';
 import * as vscode from 'vscode';
 
 import { TracedRequestError, type ClientTrace, type DaemonClient } from './daemonClient.js';
-import { formatToolResult } from './resultFormatter.js';
+import {
+  formatToolResult,
+  formatTraceLog,
+  shouldReportTrace,
+} from './resultFormatter.js';
 import { resolveRegisteredRootAfterRefresh, resolveWslRoot } from './rootResolver.js';
 import type { DaemonRequest, JsonValue, WorkspaceSpec } from './types.js';
 import { classifyOutcome, type UsageEvent } from './usage.js';
@@ -159,7 +163,7 @@ export class NativeToolBridge implements vscode.Disposable {
       result.trace.outcome = 'success';
       this.onUsage?.({ operation: definition.operation, root });
       this.output.appendLine(
-        `${definition.operation} root=${root ?? '-'} ${result.trace.total_ms.toFixed(3)}ms trace=${traceId}`,
+        `[success] operation=${definition.operation} root=${root ?? '-'} duration=${result.trace.total_ms.toFixed(3)}ms trace=${traceId}`,
       );
       if (definition.operation === 'test_sync') {
         this.registry.invalidate();
@@ -174,7 +178,9 @@ export class NativeToolBridge implements vscode.Disposable {
         error.trace.completed_unix_ms = Date.now();
         this.recordTrace(error.trace, token);
       }
-      this.output.appendLine(`${definition.operation} failed trace=${traceId}: ${message}`);
+      this.output.appendLine(
+        `[error] operation=${definition.operation} trace=${traceId} message=${message}`,
+      );
       throw new Error(
         message.includes(`[tctx_trace=${traceId}]`)
           ? message
@@ -185,12 +191,14 @@ export class NativeToolBridge implements vscode.Disposable {
   }
 
   public recordTrace(trace: ClientTrace, token: vscode.CancellationToken): void {
-    this.output.appendLine(`TCTX_CLIENT_TRACE ${JSON.stringify(trace)}`);
-    if (trace.available !== true) {
+    this.output.appendLine(formatTraceLog(trace));
+    if (!shouldReportTrace(trace)) {
       return;
     }
     void this.client.request(request(null, 'test_trace', trace), token).catch((error: unknown) => {
-      this.output.appendLine(`TCTX_TRACE_REPORT_FAILED trace=${trace.trace_id}: ${String(error)}`);
+      this.output.appendLine(
+        `[warning] trace_report_failed id=${trace.trace_id} message=${String(error)}`,
+      );
     });
   }
 
@@ -250,7 +258,7 @@ class NativeTool<T> implements vscode.LanguageModelTool<T> {
     this.bridge.recordTrace(result.trace, token);
     return new vscode.LanguageModelToolResult([
       new vscode.LanguageModelTextPart(text),
-      new vscode.LanguageModelTextPart(`TCTX_TRACE ${JSON.stringify(result.trace)}`),
+      new vscode.LanguageModelTextPart(`TCTX_TRACE ${formatTraceLog(result.trace)}`),
     ]);
   }
 

@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { formatToolResult, validateDaemonStatus } from '../src/resultFormatter.js';
+import {
+  formatToolResult,
+  formatTraceLog,
+  shouldReportTrace,
+  validateDaemonStatus,
+} from '../src/resultFormatter.js';
 import { resolveRegisteredRoot } from '../src/rootResolver.js';
 import { classifyOutcome, UsageSummary } from '../src/usage.js';
 
@@ -40,6 +45,81 @@ void test('formatToolResult formats test_affected output', () => {
   assert.match(
     text,
     /tests\/test_service\.py state=cached_passed chain=\[src\/pkg\/math\.py -> src\/pkg\/service\.py -> tests\/test_service\.py\]/,
+  );
+});
+
+void test('status and workspace logs are readable text rather than JSON', () => {
+  const status = formatToolResult('test_status', {
+    daemon: {
+      ok: true,
+      version: '0.1.0',
+      pid: 42,
+      uptime_secs: 9,
+      registered_roots: 2,
+      loaded_roots: ['/repo'],
+    },
+    capabilities: {},
+    workspace: {
+      root: '/repo',
+      indexed_python_files: 20,
+      total_test_files: 4,
+      cached_passed_files: 3,
+      uncached_or_stale_files: 1,
+      background_pending_queue: 0,
+      background_in_flight: 0,
+      cache_storage: {
+        history_records: 4,
+        latest_records: 4,
+        estimated_memory_bytes: 1024,
+        wal_bytes: 128,
+        invocation_patterns: 1,
+      },
+      zygote: {
+        ready: false,
+        pid: null,
+        rss_bytes: null,
+        runs: 0,
+        active_pgid: 0,
+      },
+    },
+  });
+  assert.match(status, /^daemon status=ready/mu);
+  assert.match(status, /^workspace root=\/repo/mu);
+  assert.doesNotMatch(status, /[{}"]/u);
+
+  const workspaces = formatToolResult('test_workspaces', [
+    { root: '/repo', scopes: ['.'], pytest_cmd: ['python', '-m', 'pytest'] },
+  ]);
+  assert.match(workspaces, /^workspaces count=1/mu);
+  assert.match(workspaces, /^workspace root=\/repo/mu);
+  assert.doesNotMatch(workspaces, /[{}"]/u);
+});
+
+void test('trace logs are concise and exclude nested daemon payloads', () => {
+  const trace = {
+    trace_id: 'trace-1',
+    operation: 'test_run',
+    root: '/repo',
+    queue_ms: 1,
+    prepare_ms: 2,
+    ipc_ms: 3,
+    serialize_ms: 4,
+    total_ms: 10,
+    started_unix_ms: 1,
+    completed_unix_ms: 2,
+    success: true,
+    available: true,
+    outcome: 'success',
+    daemon: { secret: 'must-not-be-logged' },
+  };
+  const line = formatTraceLog(trace);
+  assert.match(line, /^\[trace\] operation=test_run outcome=success/u);
+  assert.match(line, /duration=10\.000ms/u);
+  assert.doesNotMatch(line, /secret|must-not-be-logged|[{}"]/u);
+  assert.equal(shouldReportTrace(trace), true);
+  assert.equal(
+    shouldReportTrace({ ...trace, success: false, outcome: 'system_error' }),
+    false,
   );
 });
 

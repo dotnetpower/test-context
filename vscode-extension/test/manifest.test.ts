@@ -97,7 +97,7 @@ void test('extension makes the Test Context output channel discoverable once', a
   const discovery = source.indexOf(
     'if (!context.globalState.get<boolean>(OUTPUT_DISCOVERED_STATE_KEY, false))',
   );
-  const activationLog = source.indexOf('output.appendLine(`Activated Test Context native tools');
+  const activationLog = source.indexOf('output.appendLine(`[ready] native endpoint=');
   assert.ok(subscriptionsEnd >= 0);
   assert.ok(discovery > subscriptionsEnd);
   assert.ok(activationLog > discovery);

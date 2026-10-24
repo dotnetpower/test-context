@@ -24,6 +24,7 @@ When GitHub Copilot (or a developer) invokes tests:
   - 7 Native VS Code Language Model Tools (`#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeWorkspaces`, `#tctxNativeInvalidate`).
   - Native tools are the default in VS Code foreground sessions.
   - From WSL, the installer deploys the VSIX to both the WSL remote host and the Windows Agents profile, then configures direct `wsl.exe --exec tctx native-bridge` IPC.
+  - The `Test Context Native` Output channel uses concise human-readable records; protocol JSON stays internal to IPC.
   - Optional Shared MCP Server (`tctx shared-mcp`) is a fallback for background/CLI agent sessions where Native dispatch is unavailable (`test_run`, `test_affected`, `test_graph`, `test_status`, `test_sync`, `test_workspaces`, `test_invalidate`).
   - The VS Code installer installs Native only by default. Set `TCTX_INSTALL_MCP=1` to additionally register the MCP fallback while preserving existing servers.
   - Drop-in CLI (`tctx run`, `tctx pytest`, `tctx affected`, `tctx graph`, `tctx status`, `tctx sync`).
@@ -40,12 +41,12 @@ Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store
 
 | Task | TCTX off (`pytest`) | TCTX on | Speedup [95% CI] |
 |---|---:|---:|---:|
-| Warm suite (`warm_suite`) | 752.30 ms | **0.45 ms** (median 0.43 ms) | **1677.18×** [1587.06, 1766.82] |
-| Post-edit background pre-run (`bg_speculative`) | 749.42 ms | **0.45 ms** (median 0.42 ms) | **1669.10×** [1621.66, 1717.55] |
-| Reverted edit Merkle hit (`merkle_revert`) | 743.45 ms | **0.44 ms** (median 0.42 ms) | **1707.88×** [1636.96, 1773.59] |
-| Immediate 0ms-delay leaf edit (`leaf_delta`) | 754.34 ms | **54.64 ms** (median 54.19 ms) | **13.81×** [13.56, 14.08] |
-| Impact query (`affected_graph`) | 720.54 ms | **0.44 ms** (median 0.42 ms) | **1645.73×** [1582.40, 1715.02] |
-| Fixed mixed suite (`all`, 320 pairs) | 744.01 ms | **11.28 ms** (median 0.44 ms) | **65.94×** [64.72, 67.33] |
+| Warm suite (`warm_suite`) | 723.97 ms | **0.43 ms** (median 0.42 ms) | **1677.00×** [1591.30, 1759.58] |
+| Post-edit background pre-run (`bg_speculative`) | 728.55 ms | **0.43 ms** (median 0.42 ms) | **1712.74×** [1630.81, 1802.29] |
+| Reverted edit Merkle hit (`merkle_revert`) | 725.51 ms | **0.43 ms** (median 0.42 ms) | **1702.89×** [1618.66, 1797.86] |
+| Immediate 0ms-delay leaf edit (`leaf_delta`) | 738.12 ms | **54.88 ms** (median 53.13 ms) | **13.45×** [13.03, 13.93] |
+| Impact query (`affected_graph`) | 689.88 ms | **0.39 ms** (median 0.38 ms) | **1777.89×** [1699.82, 1873.27] |
+| Fixed mixed suite (`all`, 320 pairs) | 721.20 ms | **11.31 ms** (median 0.43 ms) | **63.76×** [61.85, 65.82] |
 
 See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology, cold-start measurements, raw samples, and reproduction instructions.
 

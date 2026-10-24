@@ -7,9 +7,9 @@ import * as vscode from 'vscode';
 
 import { DaemonClient } from './daemonClient.js';
 import { NATIVE_TOOL_NAMES, NativeToolBridge } from './nativeTools.js';
-import { validateDaemonStatus } from './resultFormatter.js';
+import { formatToolResult, validateDaemonStatus } from './resultFormatter.js';
 import { RootResolutionError } from './rootResolver.js';
-import type { ClientSettings, JsonValue } from './types.js';
+import type { ClientSettings } from './types.js';
 import { UsageSummary } from './usage.js';
 
 const execFileAsync = promisify(execFile);
@@ -119,7 +119,7 @@ export function activate(context: vscode.ExtensionContext): void {
           { root },
           source.token,
         );
-        output.appendLine(JSON.stringify(value, null, 2));
+        output.appendLine(formatToolResult('test_sync', value));
         output.show(true);
       } finally {
         source.dispose();
@@ -148,7 +148,7 @@ export function activate(context: vscode.ExtensionContext): void {
     void context.globalState.update(OUTPUT_DISCOVERED_STATE_KEY, true);
   }
 
-  output.appendLine(`Activated Test Context native tools; endpoint=${client.endpoint}`);
+  output.appendLine(`[ready] native endpoint=${client.endpoint}`);
   if (vscode.workspace.isTrusted) {
     void probe();
   } else {
@@ -165,10 +165,10 @@ export function deactivate(): void {
 async function registerRootWithCli(rootPath: string, output: vscode.OutputChannel): Promise<void> {
   const exe = executablePath();
   const resolved = resolve(rootPath);
-  const { stdout } = await execFileAsync(exe, ['--root', resolved, 'register'], {
+  await execFileAsync(exe, ['--root', resolved, 'register'], {
     timeout: 15_000,
   });
-  output.appendLine(`TCTX_REGISTERED root=${resolved} ${stdout.trim()}`);
+  output.appendLine(`[success] workspace_registered root=${resolved}`);
 }
 
 async function showStatus(
@@ -191,13 +191,13 @@ async function showStatus(
       { root },
       source.token,
     );
-    output.appendLine(JSON.stringify(value, null, 2));
+    output.appendLine(formatToolResult('test_status', value));
     output.show(true);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     statusBar.text = '$(warning) TCTX Native';
     statusBar.tooltip = message;
-    output.appendLine(`STATUS_ERROR ${message}`);
+    output.appendLine(`[error] status message=${message}`);
     output.show(true);
   } finally {
     source.dispose();
@@ -219,24 +219,25 @@ async function runSelfTest(
         `Expected ${NATIVE_TOOL_NAMES.length} native tools, found ${registered.length}.`,
       );
     }
-    const toolResult = await vscode.lm.invokeTool(
-      'test-context-native_testStatus',
+    const daemonStatus = await bridge.invoke(
       {
-        input: { root },
-        toolInvocationToken: undefined,
+        name: 'self_test_status',
+        operation: 'test_status',
+        needsRoot: true,
+        invocationMessage: () => 'Running Test Context self-test',
+        arguments: () => ({}),
       },
+      { root },
       source.token,
     );
-    const statusText = toolResultText(toolResult);
-    const daemonStatus = JSON.parse(statusText) as JsonValue;
     validateDaemonStatus(daemonStatus);
     await vscode.commands.executeCommand('setContext', 'testContextNative.selfTestPassed', true);
-    output.appendLine(JSON.stringify(daemonStatus, null, 2));
+    output.appendLine(formatToolResult('test_status', daemonStatus));
     output.show(true);
     await vscode.window.showInformationMessage(`Test Context self-test passed: ${root}`);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    output.appendLine(`SELF_TEST_FAILED ${message}`);
+    output.appendLine(`[error] self_test message=${message}`);
     await vscode.window.showErrorMessage(`Test Context self-test failed: ${message}`);
   } finally {
     source.dispose();
@@ -250,60 +251,56 @@ async function runStartupProbe(
 ): Promise<void> {
   const source = new vscode.CancellationTokenSource();
   try {
-    const registered = registeredNativeTools();
+    const registered = await waitForNativeTools();
     if (registered.length !== NATIVE_TOOL_NAMES.length) {
       throw new Error(
         `Language Model Tool registry contains ${registered.length}/${NATIVE_TOOL_NAMES.length} Test Context tools.`,
       );
     }
-    const workspaceResult = await vscode.lm.invokeTool(
-      'test-context-native_testWorkspaces',
-      {
-        input: {},
-        toolInvocationToken: undefined,
-      },
-      source.token,
-    );
-    const workspaces = JSON.parse(toolResultText(workspaceResult)) as JsonValue;
-    if (!Array.isArray(workspaces)) {
-      throw new Error('Native workspace probe returned a non-array result.');
+    const workspaces = await bridge.listWorkspaces(source.token);
+    if (client?.usesWslBridge) {
+      statusBar.text = '$(beaker) TCTX Available';
+      statusBar.tooltip = `${registered.length} Test Context native tools registered through the WSL bridge; pass an explicit Linux root when multiple roots are registered`;
+      output.appendLine(
+        `[ready] tools=${registered.length} workspaces=${workspaces.length} transport=wsl-native-bridge root=explicit-when-ambiguous`,
+      );
+      return;
     }
     const root = await bridge.resolveRoot(undefined, source.token, false);
     statusBar.text = '$(beaker) TCTX Available';
     statusBar.tooltip = `${registered.length} Test Context native tools registered and callable for ${root}`;
     output.appendLine(
-      `EXTENSION_CALLABLE tools=${registered.join(',')} workspaces=${workspaces.length} root=${root}`,
+      `[ready] tools=${registered.length} workspaces=${workspaces.length} transport=unix-socket root=${root}`,
     );
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     if (error instanceof RootResolutionError) {
       statusBar.text = '$(add) TCTX Register';
       statusBar.tooltip = 'Workspace will be registered on first Test Context tool call; click for status';
-      output.appendLine(`NATIVE_UNREGISTERED_DEFERRED ${message}`);
+      output.appendLine(`[info] workspace_registration_deferred message=${message}`);
     } else {
       statusBar.text = '$(warning) TCTX Native';
       statusBar.tooltip = message;
-      output.appendLine(`NATIVE_NOT_READY ${message}`);
+      output.appendLine(`[error] native_not_ready message=${message}`);
     }
   } finally {
     source.dispose();
   }
 }
 
-function toolResultText(result: vscode.LanguageModelToolResult): string {
-  return result.content
-    .filter(
-      (part): part is vscode.LanguageModelTextPart =>
-        part instanceof vscode.LanguageModelTextPart,
-    )
-    .map((part) => part.value)
-    .filter((text) => !text.startsWith('TCTX_TRACE '))
-    .join('');
-}
-
 function registeredNativeTools(): string[] {
   const available = new Set(vscode.lm.tools.map((tool) => tool.name));
   return NATIVE_TOOL_NAMES.filter((name) => available.has(name));
+}
+
+async function waitForNativeTools(): Promise<string[]> {
+  const deadline = performance.now() + 2_000;
+  let registered = registeredNativeTools();
+  while (registered.length !== NATIVE_TOOL_NAMES.length && performance.now() < deadline) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+    registered = registeredNativeTools();
+  }
+  return registered;
 }
 
 function readSettings(): ClientSettings {

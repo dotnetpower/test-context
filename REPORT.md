@@ -346,3 +346,16 @@ Post-round validation: strict Clippy passed; 21 Rust unit tests, 2 Rust integrat
 37. Expired idle persistent Native/MCP clients after 30 seconds. Twelve deliberately stalled clients raised FDs from 5 to 25, then all FDs returned to 5; subsequent pings all succeeded. A concurrently loaded large root rose to 103 MiB and was reclaimed to a 13.3 MiB baseline.
 
 Final validation after all five cycles: strict Clippy passed; 26 Rust unit tests, 2 Rust integration tests, and 11 native extension tests passed. The resource soak completed 500 cache hits, 10 cancellations, and 50 edit/delta cycles with RSS ending at 7.1 MiB, stable FD/thread counts, and zero idle CPU ticks. The final `aks-store-demo` benchmark completed 8 isolated daemon sessions and 320 paired observations with parity in every session.
+
+### Log-driven Native bridge and readability hardening
+
+The Windows and WSL output logs identified six actionable issues:
+
+1. Daemon idle expiry left the long-lived WSL bridge holding a dead binary connection, producing 127 `Broken pipe` messages.
+2. The startup probe classified transport failures as `NATIVE_NOT_READY` 43 times.
+3. Windows multi-root sessions logged four expected explicit-root selections as deferred registration warnings.
+4. The Output channel emitted 46 raw `TCTX_CLIENT_TRACE` JSON records.
+5. Failed transport traces attempted 42 redundant reports over the same disconnected path.
+6. Status, self-test, sync, and workspace output used JSON dumps rather than operator-readable text.
+
+The bridge now exits on transport disconnect so the extension's bounded reconnect path creates a fresh bridge. Startup waits up to two seconds for the native tool registry and reports Windows multi-root mode as ready. System-error traces are not reported back over a failed transport. Output records now use stable `[ready]`, `[success]`, `[info]`, `[warning]`, `[error]`, and `[trace]` lines; status and workspace objects have bounded text summaries. Nested daemon trace payloads and request arguments are excluded from Output logs.

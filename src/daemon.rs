@@ -967,6 +967,7 @@ pub fn native_bridge(mut input: impl Read, mut output: impl Write) -> Result<()>
         let req: Request = serde_json::from_slice(&payload)?;
         let response_json = match client.call(&req) {
             Ok(val) => json!({ "result": val }),
+            Err(err) if is_transport_disconnect(err.as_ref()) => return Err(err),
             Err(err) => json!({ "error": err.to_string() }),
         };
         let bytes = serde_json::to_vec(&response_json)?;
@@ -974,6 +975,26 @@ pub fn native_bridge(mut input: impl Read, mut output: impl Write) -> Result<()>
         output.write_all(&bytes)?;
         output.flush()?;
     }
+}
+
+fn is_transport_disconnect(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(candidate) = current {
+        if let Some(io_error) = candidate.downcast_ref::<std::io::Error>()
+            && matches!(
+                io_error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            )
+        {
+            return true;
+        }
+        current = candidate.source();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1034,5 +1055,19 @@ mod tests {
         assert!(!persistent_connection_expired(recent));
         let stale = Instant::now() - PERSISTENT_CONNECTION_IDLE_TIMEOUT;
         assert!(persistent_connection_expired(stale));
+    }
+
+    #[test]
+    fn native_bridge_classifies_transport_disconnects() {
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            let error = std::io::Error::new(kind, "transport closed");
+            assert!(is_transport_disconnect(&error));
+        }
+        let application_error = ApplicationError("test failed".to_string());
+        assert!(!is_transport_disconnect(&application_error));
     }
 }

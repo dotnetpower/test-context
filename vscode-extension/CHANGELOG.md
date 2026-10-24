@@ -8,3 +8,6 @@
 - Native-first routing; MCP registration is an explicit fallback opt-in.
 - Show the Test Context Native output channel once after first activation so it is discoverable in the Output picker.
 - Install into the Windows FDAI profile from WSL and configure the direct `tctx native-bridge` transport for Agents windows.
+- Reconnect the WSL native bridge after daemon idle expiry instead of repeating broken-pipe errors.
+- Render status, workspace, operation, and trace logs as concise text rather than JSON dumps.
+- Treat Windows multi-root selection as a ready state and wait briefly for the Language Model Tool registry during startup.
