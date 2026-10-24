@@ -13,6 +13,7 @@ import type { ClientSettings, JsonValue } from './types.js';
 import { UsageSummary } from './usage.js';
 
 const execFileAsync = promisify(execFile);
+const OUTPUT_DISCOVERED_STATE_KEY = 'testContextNative.outputDiscovered';
 
 let client: DaemonClient | undefined;
 
@@ -128,6 +129,12 @@ export function activate(context: vscode.ExtensionContext): void {
       if (event.affectsConfiguration('testContextNative')) {
         client?.reset();
         bridge.invalidateRegistry();
+
+        if (!context.globalState.get<boolean>(OUTPUT_DISCOVERED_STATE_KEY, false)) {
+          output.show(true);
+          void context.globalState.update(OUTPUT_DISCOVERED_STATE_KEY, true);
+        }
+
         void probe();
       }
     }),

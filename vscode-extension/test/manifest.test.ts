@@ -90,3 +90,9 @@ void test('manifest metadata, branding PNGs, walkthrough, and 7 native tools are
   const checkStep = walkthrough?.steps.find((s) => s.id === 'check');
   assert.deepEqual(checkStep?.completionEvents, ['onContext:testContextNative.selfTestPassed']);
 });
+
+void test('extension makes the Test Context output channel discoverable once', async () => {
+  const source = await readFile(resolve(__dirname, '../../src/extension.ts'), 'utf8');
+  assert.match(source, /testContextNative\.outputDiscovered/);
+  assert.match(source, /output\.show\(true\)/);
+});
