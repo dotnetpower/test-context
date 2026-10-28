@@ -294,8 +294,39 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         "src/pkg/slow.py",
         "def value() -> int:\n    return 2\n",
     );
-    let error = handle.join().unwrap().unwrap_err().to_string();
+    // A single mid-run edit is absorbed by the automatic stability retry and yields a current result.
+    let retried = handle.join().unwrap().unwrap();
+    assert_eq!(retried.status, "passed");
+
+    // Continuous edits defeat every retry; the discarded result is reported instead of cached.
+    let churn_root = std::sync::Arc::clone(&unstable_root);
+    let churn_repo = repo.clone();
+    let stop_churn = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn_flag = std::sync::Arc::clone(&stop_churn);
+    let churn = std::thread::spawn(move || {
+        let mut value = 10;
+        while !churn_flag.load(std::sync::atomic::Ordering::Acquire) {
+            write_file(
+                &churn_repo,
+                "src/pkg/slow.py",
+                &format!("def value() -> int:\n    return {}\n", value),
+            );
+            value += 1;
+            std::thread::sleep(Duration::from_millis(60));
+        }
+    });
+    let error = churn_root
+        .run_tests(&TestRunRequest {
+            targets: vec!["tests/test_slow.py".to_string()],
+            no_cache: true,
+            ..TestRunRequest::default()
+        })
+        .unwrap_err()
+        .to_string();
+    stop_churn.store(true, std::sync::atomic::Ordering::Release);
+    churn.join().unwrap();
     assert!(error.contains("SOURCE_CHANGED_DURING_TEST"), "{error}");
+    assert!(error.contains("retry once edits settle"), "{error}");
 
     // 10. A client cancellation terminates the active child process group and never caches a failure.
     let cancelling_root = std::sync::Arc::clone(&unstable_root);

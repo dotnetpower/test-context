@@ -1207,7 +1207,30 @@ impl ManagedRoot {
         }))
     }
 
+    /// Re-runs once or twice when sources were edited mid-run, so the caller receives a result for the
+    /// current content instead of a discarded one. Long attempts are not repeated.
     pub fn run_tests(&self, req: &TestRunRequest) -> Result<TestRunResponse> {
+        const MAX_STABILITY_RETRIES: u32 = 2;
+        const MAX_RETRYABLE_ATTEMPT: Duration = Duration::from_secs(60);
+        let mut attempt = 0;
+        loop {
+            let attempt_started = Instant::now();
+            match self.run_tests_once(req) {
+                Err(error)
+                    if is_source_changed_error(error.as_ref())
+                        && attempt < MAX_STABILITY_RETRIES
+                        && attempt_started.elapsed() < MAX_RETRYABLE_ATTEMPT
+                        && !self.stopped.load(Ordering::Acquire) =>
+                {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(250 * u64::from(attempt)));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn run_tests_once(&self, req: &TestRunRequest) -> Result<TestRunResponse> {
         let started = Instant::now();
         let has_subfile_filter =
             req.k.is_some() || req.mark.is_some() || req.targets.iter().any(|t| t.contains("::"));
@@ -1537,15 +1560,17 @@ impl ManagedRoot {
                 .map(|(test_file, _)| test_file.clone())
                 .collect();
             if !unstable.is_empty() {
+                let mut requeued = 0usize;
                 for test_file in unstable.iter().rev() {
                     if background_eligible_with_cache(&guard, test_file) {
                         guard.pending_queue.retain(|queued| queued != test_file);
                         guard.pending_queue.push_front(test_file.clone());
+                        requeued += 1;
                     }
                 }
                 self.condvar.notify_all();
                 return Err(invalid(format!(
-                    "SOURCE_CHANGED_DURING_TEST files={}; result discarded and requeued",
+                    "SOURCE_CHANGED_DURING_TEST files={}; result discarded ({requeued} requeued for background); the file was edited while tests ran, retry once edits settle",
                     unstable.join(",")
                 ))
                 .into());
@@ -1687,6 +1712,10 @@ impl ManagedRoot {
 
 fn flight_key(test_file: &str, dep_hash: &str) -> String {
     format!("{test_file}@{dep_hash}")
+}
+
+fn is_source_changed_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.to_string().starts_with("SOURCE_CHANGED_DURING_TEST")
 }
 
 fn environment_fingerprint(spec: &Spec) -> String {
