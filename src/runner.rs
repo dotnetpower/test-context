@@ -1685,6 +1685,17 @@ impl ManagedRoot {
         if !delta_stdout.trim().is_empty() {
             output_parts.push(delta_stdout.trim().to_string());
         }
+        if skipped > 0 {
+            output_parts.push(format!(
+                "[test-context] {skipped} skipped tests are never cached or treated as verified. TCTX runs pytest in the daemon environment, so tests that skip for a missing variable or service (see the SKIPPED lines above) must be run directly with the project's own wrapper."
+            ));
+        }
+        if cached_summaries.iter().any(|item| !item.outcome.is_green()) {
+            output_parts.push(
+                "[test-context] A failure above was replayed from the cache. Pass rerun_failed (or no_cache) to re-execute it if it may depend on environment."
+                    .to_string(),
+            );
+        }
         output_parts.push(summary_line);
         let stdout_summary = output_parts.join("\n");
 
@@ -1722,7 +1733,7 @@ fn environment_fingerprint(spec: &Spec) -> String {
     let pytest_cmd = spec.effective_pytest_cmd();
     let (runtime_identity, plugins) = python_runtime_identity(spec);
     let mut evidence = Vec::new();
-    evidence.extend_from_slice(b"tctx-env-v2\n");
+    evidence.extend_from_slice(b"tctx-env-v3\n");
     evidence.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
     evidence.push(b'\n');
     evidence.extend_from_slice(spec.root.to_string_lossy().as_bytes());
@@ -2190,8 +2201,10 @@ fn execute_pytest_batch(
                 continue;
             }
             let per_file_dur = (output.duration_ms / (dep_hashes.len().max(1) as u64)).max(1);
+            // Without a per-file report a clean exit is not evidence that this file passed (all of its
+            // tests may have been skipped), so it is reported but never cached as a pass.
             let outcome = if overall_success {
-                TestOutcome::Passed
+                TestOutcome::Skipped
             } else {
                 TestOutcome::Failed
             };
@@ -2199,7 +2212,7 @@ fn execute_pytest_batch(
                 test_file: test_file.clone(),
                 dep_hash: dep_hash.clone(),
                 outcome,
-                passed: usize::from(overall_success),
+                passed: 0,
                 failed: usize::from(!overall_success),
                 skipped: 0,
                 errors: 0,

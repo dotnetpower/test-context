@@ -364,6 +364,31 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         .unwrap();
     assert_eq!(noisy.status, "passed");
     assert!(noisy.stdout_summary.len() < 12_000);
+
+    // 12. A test skipped during fixture setup (for example a missing service variable) is reported as
+    // skipped and never cached as a pass, so it cannot mask a run in a fully provisioned environment.
+    write_file(
+        &repo,
+        "tests/test_needs_service.py",
+        "import pytest\n\n@pytest.fixture\ndef service():\n    pytest.skip('SERVICE_URL is not set')\n\ndef test_service(service):\n    assert service\n",
+    );
+    for _ in 0..2 {
+        let skipped = unstable_root
+            .run_tests(&TestRunRequest {
+                targets: vec!["tests/test_needs_service.py".to_string()],
+                ..TestRunRequest::default()
+            })
+            .unwrap();
+        assert_eq!(skipped.mode, "full_run", "{skipped:?}");
+        assert_eq!(skipped.executed_files_count, 1, "{skipped:?}");
+        assert_eq!((skipped.passed, skipped.skipped), (0, 1), "{skipped:?}");
+        assert_eq!(skipped.executed_files[0].outcome.as_str(), "skipped");
+        assert!(
+            skipped
+                .stdout_summary
+                .contains("skipped tests are never cached")
+        );
+    }
     unstable_root.shutdown();
 }
 

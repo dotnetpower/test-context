@@ -223,7 +223,7 @@ class TctxReporter:
         return str(getattr(report, "fspath", "")).replace("\\", "/")
 
     def pytest_runtest_logreport(self, report):
-        if report.when == "call" or (report.failed and report.when in ("setup", "teardown")):
+        if report.when == "call" or (report.failed and report.when in ("setup", "teardown")) or (report.skipped and report.when == "setup"):
             self.reports.append({
                 "nodeid": report.nodeid,
                 "path": self._path(report),
