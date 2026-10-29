@@ -1733,7 +1733,7 @@ fn environment_fingerprint(spec: &Spec) -> String {
     let pytest_cmd = spec.effective_pytest_cmd();
     let (runtime_identity, plugins) = python_runtime_identity(spec);
     let mut evidence = Vec::new();
-    evidence.extend_from_slice(b"tctx-env-v3\n");
+    evidence.extend_from_slice(b"tctx-env-v4\n");
     evidence.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
     evidence.push(b'\n');
     evidence.extend_from_slice(spec.root.to_string_lossy().as_bytes());
@@ -2059,20 +2059,13 @@ fn execute_pytest_batch(
 
     let timeout_secs = spec.policy.pytest_timeout_secs;
     let mut output_opt = None;
-    let mut zygote_args = pytest_cli_args.clone();
-    if !capture_dynamic_dependencies {
-        zygote_args.push("-o".to_string());
-        zygote_args.push("junit_family=xunit1".to_string());
-        zygote_args.push(format!("--junit-xml={}", junit_path.display()));
-    }
-
     if let Some(slot) = zygote_slot
         && let Ok(mut manager) = slot.lock()
         && manager
             .ensure(spec, pythonpath.clone(), preload_modules, pytest_plugins)
             .is_ok()
         && let Ok(out) = manager.run(
-            &zygote_args,
+            &pytest_cli_args,
             timeout_secs,
             capture_dynamic_dependencies,
             active_pgids,

@@ -19,6 +19,8 @@ When GitHub Copilot (or a developer) invokes tests:
   - Learns bounded, successful whole-file `test_run` invocation patterns and prioritizes those affected tests on later edits; filtered, node-level, failed, and arbitrary-argument runs are not learned.
   - Persists content-addressed test results (`dep_hash -> pass/fail/counts/duration/output`) per workspace root.
   - Creates the warm pytest Zygote lazily, preloads only imports needed by the requested tests, and reclaims it after 60 seconds of inactivity.
+  - Reuses an existing Zygote when it already contains every requested preload; narrowing a test selection no longer restarts Python. Each run still forks a fresh isolated child.
+  - Collects structured pytest reports directly, without an internal JUnit file round trip. Explicit user-requested JUnit output and the subprocess fallback remain supported.
   - Returns released allocator arenas to the OS, evicts inactive large graphs and roots under RSS pressure, and expires idle persistent clients after 30 seconds.
 - **Native GitHub Copilot Integration (`moonchoi.test-context-native`)**:
   - 7 Native VS Code Language Model Tools (`#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeWorkspaces`, `#tctxNativeInvalidate`).
@@ -41,14 +43,19 @@ Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store
 
 | Task | TCTX off (`pytest`) | TCTX on | Speedup [95% CI] |
 |---|---:|---:|---:|
-| Warm suite (`warm_suite`) | 867.57 ms | **0.93 ms** (median 0.46 ms) | **933.90×** [634.80, 1551.61] |
-| Post-edit background pre-run (`bg_speculative`) | 872.84 ms | **0.54 ms** (median 0.46 ms) | **1616.17×** [1275.73, 1963.22] |
-| Reverted edit Merkle hit (`merkle_revert`) | 875.33 ms | **0.47 ms** (median 0.46 ms) | **1856.14×** [1782.80, 1931.41] |
-| Immediate 0ms-delay leaf edit (`leaf_delta`) | 862.82 ms | **66.83 ms** (median 64.42 ms) | **12.91×** [12.47, 13.39] |
-| Impact query (`affected_graph`) | 842.05 ms | **0.53 ms** (median 0.42 ms) | **1585.86×** [1182.40, 1998.65] |
-| Fixed mixed suite (`all`, 320 pairs) | 864.12 ms | **13.86 ms** (median 0.47 ms) | **62.35×** [60.00, 64.79] |
+| Warm suite (`warm_suite`) | 911.38 ms | **0.47 ms** (median 0.46 ms) | **1948.53×** [1897.96, 2005.05] |
+| Post-edit background pre-run (`bg_speculative`) | 920.08 ms | **0.46 ms** (median 0.46 ms) | **1983.64×** [1924.26, 2052.37] |
+| Reverted edit Merkle hit (`merkle_revert`) | 907.72 ms | **0.48 ms** (median 0.48 ms) | **1873.61×** [1800.33, 1943.23] |
+| Immediate 0ms-delay leaf edit (`leaf_delta`) | 915.21 ms | **62.52 ms** (median 61.77 ms) | **14.64×** [14.24, 14.96] |
+| Impact query (`affected_graph`) | 883.79 ms | **0.44 ms** (median 0.43 ms) | **2019.97×** [1962.72, 2092.94] |
+| Fixed mixed suite (`all`, 320 pairs) | 907.64 ms | **12.87 ms** (median 0.47 ms) | **70.50×** [69.04, 71.75] |
 
 See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology, cold-start measurements, raw samples, and reproduction instructions.
+
+Cache-disabled execution was measured separately against the previous build. Alternating broad and
+narrow selections improved from **267/230 ms to 57/55 ms median** in a local two-file
+Pydantic/HTTPX fixture. These are execution-overhead measurements, not cached results or a claim that
+test bodies, database operations, or network calls become faster.
 
 ## Quick Start
 

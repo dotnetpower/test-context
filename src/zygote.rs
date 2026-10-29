@@ -281,7 +281,6 @@ while True:
 
     args = req.get("args", [])
     capture_dynamic_deps = bool(req.get("capture_dynamic_deps", False))
-    direct_reporter = bool(req.get("direct_reporter", False))
     timeout_secs = float(req.get("timeout_secs", 180.0))
     started = time.perf_counter()
 
@@ -327,13 +326,12 @@ while True:
             close_unneeded_fds(keep)
             sys.stdout = io.TextIOWrapper(os.fdopen(1, "wb", closefd=False), encoding="utf-8", errors="replace", write_through=True)
             sys.stderr = io.TextIOWrapper(os.fdopen(2, "wb", closefd=False), encoding="utf-8", errors="replace", write_through=True)
-            reporter = TctxReporter() if direct_reporter else None
+            reporter = TctxReporter()
             audit_paths = set() if capture_dynamic_deps else None
             audit_by_node = {}
             audit_current_node = None
             try:
-                run_plugins = [*plugins, reporter] if reporter is not None else plugins
-                code = int(pytest.main(args, plugins=run_plugins))
+                code = int(pytest.main(args, plugins=[*plugins, reporter]))
             except SystemExit as exc:
                 code = int(exc.code) if isinstance(exc.code, int) else 1
             except Exception as exc:
@@ -343,10 +341,11 @@ while True:
             sys.stderr.flush()
             payload = json.dumps({
                 "exit_code": code,
-                "reports": reporter.reports if reporter is not None else [],
+                "reports": reporter.reports,
                 "dynamic_deps": sorted(audit_paths or ()),
             }, separators=(",", ":")).encode("utf-8")
-            payload = payload[:MAX_FRAME]
+            if len(payload) > MAX_FRAME:
+                payload = json.dumps({"error": "zygote result frame too large"}).encode("utf-8")
             offset = 0
             while offset < len(payload):
                 offset += os.write(w_fd, payload[offset:])
@@ -368,6 +367,7 @@ while True:
         result_chunks = []
         stdout_chunks = []
         stderr_chunks = []
+        retained = {r_fd: 0, out_r: 0, err_r: 0}
         result_done = False
         open_fds = {r_fd: result_chunks, out_r: stdout_chunks, err_r: stderr_chunks}
         deadline = time.monotonic() + timeout_secs
@@ -381,6 +381,8 @@ while True:
                 except BlockingIOError:
                     continue
                 if not chunk:
+                    if fd == r_fd:
+                        result_done = True
                     open_fds.pop(fd, None)
                     try:
                         os.close(fd)
@@ -388,11 +390,12 @@ while True:
                         pass
                     continue
                 target = open_fds[fd]
-                current = sum(map(len, target))
-                if current < 2 * 1024 * 1024:
-                    target.append(chunk[: 2 * 1024 * 1024 - current])
-                if fd == r_fd:
-                    result_done = True
+                limit = MAX_FRAME if fd == r_fd else 2 * 1024 * 1024
+                available = limit - retained[fd]
+                if available > 0:
+                    saved = chunk[:available]
+                    target.append(saved)
+                    retained[fd] += len(saved)
         wait_status = 0
         waited = False
         if not result_done:
@@ -416,8 +419,8 @@ while True:
         else:
             try:
                 child_result = json.loads(b"".join(result_chunks).decode("utf-8"))
-            except Exception:
-                child_result = {"exit_code": 1, "reports": [], "dynamic_deps": []}
+            except Exception as exc:
+                child_result = {"error": f"invalid zygote result: {exc}"}
         if not waited:
             try:
                 _, wait_status = os.waitpid(pid, 0)
@@ -432,9 +435,11 @@ while True:
                     break
                 if not chunk:
                     break
-                current = sum(map(len, target))
-                if current < 2 * 1024 * 1024:
-                    target.append(chunk[: 2 * 1024 * 1024 - current])
+                available = 2 * 1024 * 1024 - retained[fd]
+                if available > 0:
+                    saved = chunk[:available]
+                    target.append(saved)
+                    retained[fd] += len(saved)
             try:
                 os.close(fd)
             except OSError:
@@ -454,6 +459,7 @@ while True:
             "timed_out": timed_out,
             "cancelled": cancelled and not timed_out,
             "plugin_errors": plugin_errors,
+            "error": child_result.get("error") if not cancelled else None,
         })
 "#;
 
@@ -462,7 +468,6 @@ struct ZygoteRequest<'a> {
     args: &'a [String],
     timeout_secs: u64,
     capture_dynamic_deps: bool,
-    direct_reporter: bool,
 }
 
 #[derive(Deserialize)]
@@ -485,7 +490,7 @@ pub struct PytestZygote {
     stdout: BufReader<ChildStdout>,
     python_bin: PathBuf,
     pythonpath: std::ffi::OsString,
-    preload_modules: String,
+    preload_modules: BTreeSet<String>,
     pytest_plugins: String,
     root: PathBuf,
     plugin_errors: Vec<String>,
@@ -561,7 +566,7 @@ impl PytestZygote {
             stdout,
             python_bin,
             pythonpath,
-            preload_modules: preload_str,
+            preload_modules: preload_modules.iter().cloned().collect(),
             pytest_plugins: plugin_str,
             root: spec.root.clone(),
             plugin_errors: Vec::new(),
@@ -581,7 +586,9 @@ impl PytestZygote {
             && self.root == spec.root
             && self.pythonpath == pythonpath
             && self.python_bin == resolve_python_bin(&spec.effective_pytest_cmd())
-            && self.preload_modules == preload_modules.join(",")
+            && preload_modules
+                .iter()
+                .all(|module| self.preload_modules.contains(module))
             && self.pytest_plugins == pytest_plugins.join(",")
     }
 
@@ -599,7 +606,6 @@ impl PytestZygote {
             args,
             timeout_secs,
             capture_dynamic_deps,
-            direct_reporter: capture_dynamic_deps,
         };
         let payload = serde_json::to_vec(&req)?;
         if payload.len() > MAX_ZYGOTE_FRAME {
@@ -668,15 +674,10 @@ impl PytestZygote {
                 .unwrap_or(1)
                 .max(1)
         });
-        let structured = capture_dynamic_deps
-            .then(|| {
-                serde_json::to_vec(&serde_json::json!({
-                    "reports": reply.reports.unwrap_or_else(|| serde_json::json!([])),
-                    "dynamic_deps": reply.dynamic_deps.unwrap_or_default(),
-                }))
-                .ok()
-            })
-            .flatten();
+        let structured = Some(serde_json::to_vec(&serde_json::json!({
+            "reports": reply.reports.unwrap_or_else(|| serde_json::json!([])),
+            "dynamic_deps": reply.dynamic_deps.unwrap_or_default(),
+        }))?);
         self.plugin_errors = reply.plugin_errors.unwrap_or_default();
         Ok(BoundedOutput {
             status,
@@ -905,5 +906,157 @@ mod tests {
         let mut byte = [0_u8; 1];
         reader.read_exact(&mut byte).unwrap();
         assert_eq!(byte, [b'x']);
+    }
+
+    fn test_spec(root: &Path) -> Spec {
+        Spec {
+            root: root.to_path_buf(),
+            scopes: vec![".".to_string()],
+            globs: Vec::new(),
+            excludes: Vec::new(),
+            default_excludes: true,
+            pytest_cmd: Vec::new(),
+            policy: crate::policy::MemoryPolicy::default(),
+            allow_worktrees: false,
+            managed_parent: None,
+        }
+    }
+
+    #[test]
+    fn compatible_preload_subset_reuses_parent_but_config_changes_do_not() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = test_spec(root.path());
+        let pythonpath = std::ffi::OsString::from(root.path());
+        let modules = vec!["json".to_string(), "math".to_string()];
+        let mut manager = ZygoteManager::default();
+        manager
+            .ensure(&spec, pythonpath.clone(), &modules, &[])
+            .unwrap();
+        let pid = manager.status()["pid"].clone();
+        manager
+            .ensure(&spec, pythonpath.clone(), &modules[..1], &[])
+            .unwrap();
+        assert_eq!(manager.status()["pid"], pid);
+        let parent = manager.zygote.as_mut().unwrap();
+        assert!(!parent.matches_config(&spec, &pythonpath, &["decimal".to_string()], &[]));
+        assert!(!parent.matches_config(&spec, &pythonpath, &modules, &["pytest".to_string()]));
+        assert!(!parent.matches_config(&spec, std::ffi::OsStr::new("other"), &modules, &[]));
+        let mut other_root = spec.clone();
+        other_root.root = root.path().join("other");
+        assert!(!parent.matches_config(&other_root, &pythonpath, &modules, &[]));
+        parent.runs = 200;
+        assert!(!parent.matches_config(&spec, &pythonpath, &modules, &[]));
+    }
+
+    #[test]
+    fn structured_reports_drain_multiple_pipe_chunks_with_and_without_dependency_capture() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("test_many.py"),
+            "import pytest\n@pytest.mark.parametrize('i', range(1200))\ndef test_many(i):\n    assert i >= 0\n",
+        )
+        .unwrap();
+        let spec = test_spec(root.path());
+        let mut manager = ZygoteManager::default();
+        manager.ensure(&spec, root.path().into(), &[], &[]).unwrap();
+        let args = ["-q", "-p", "no:cacheprovider", "test_many.py"].map(str::to_string);
+        for capture in [true, false] {
+            let started = Instant::now();
+            let output = manager.run(&args, 3, capture, None).unwrap();
+            assert!(!output.timed_out);
+            assert!(output.status.success());
+            assert!(started.elapsed() < Duration::from_secs(5));
+            let structured = output.structured.unwrap();
+            assert!(structured.len() > 65536);
+            let payload: serde_json::Value = serde_json::from_slice(&structured).unwrap();
+            assert_eq!(payload["reports"].as_array().unwrap().len(), 1200);
+        }
+        assert!(!root.path().join("junit.xml").exists());
+    }
+
+    #[test]
+    fn direct_reporter_preserves_failures_skips_and_fixture_errors() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("test_outcomes.py"),
+            r#"import pytest
+@pytest.fixture
+def skipped_service():
+    pytest.skip("service unavailable")
+@pytest.fixture
+def broken_setup():
+    raise RuntimeError("setup failed")
+@pytest.fixture
+def broken_teardown():
+    yield
+    raise RuntimeError("teardown failed")
+def test_pass():
+    pass
+def test_fail():
+    assert False
+def test_skip():
+    pytest.skip("call skip")
+def test_setup_skip(skipped_service):
+    pass
+def test_setup_error(broken_setup):
+    pass
+def test_teardown_error(broken_teardown):
+    pass
+"#,
+        )
+        .unwrap();
+        let spec = test_spec(root.path());
+        let mut manager = ZygoteManager::default();
+        manager.ensure(&spec, root.path().into(), &[], &[]).unwrap();
+        let args = ["-q", "-p", "no:cacheprovider", "test_outcomes.py"].map(str::to_string);
+        for capture in [true, false] {
+            let output = manager.run(&args, 3, capture, None).unwrap();
+            assert!(!output.status.success());
+            let payload: serde_json::Value =
+                serde_json::from_slice(output.structured.as_ref().unwrap()).unwrap();
+            let reports = payload["reports"].as_array().unwrap();
+            assert_eq!(reports.len(), 7);
+            assert_eq!(
+                reports.iter().filter(|r| r["outcome"] == "skipped").count(),
+                2
+            );
+            assert_eq!(
+                reports.iter().filter(|r| r["outcome"] == "failed").count(),
+                3
+            );
+            assert!(
+                reports
+                    .iter()
+                    .any(|r| r["when"] == "setup" && r["outcome"] == "failed")
+            );
+            assert!(
+                reports
+                    .iter()
+                    .any(|r| r["when"] == "teardown" && r["outcome"] == "failed")
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_reports_fail_explicitly_and_allow_parent_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("test_oversized.py"),
+            "import pytest\n@pytest.mark.parametrize('i', [0], ids=['x' * (4 * 1024 * 1024)])\ndef test_large_id(i):\n    assert i == 0\n",
+        )
+        .unwrap();
+        let spec = test_spec(root.path());
+        let mut manager = ZygoteManager::default();
+        manager.ensure(&spec, root.path().into(), &[], &[]).unwrap();
+        let args = ["-q", "-p", "no:cacheprovider", "test_oversized.py"].map(str::to_string);
+        let error = manager
+            .run(&args, 3, true, None)
+            .err()
+            .expect("oversized reports must fail")
+            .to_string();
+        assert!(error.contains("zygote result frame too large"), "{error}");
+        assert_eq!(manager.status()["ready"], false);
+        manager.ensure(&spec, root.path().into(), &[], &[]).unwrap();
+        assert_eq!(manager.status()["ready"], true);
     }
 }

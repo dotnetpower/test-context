@@ -379,3 +379,32 @@ Another session reported pytest results that disagreed with direct runs. Reprodu
 Two defects combined. The Zygote reporter recorded only `call` reports and failed `setup`/`teardown` reports, so a skip raised in fixture setup produced no per-file evidence. The missing-evidence fallback then converted a clean exit into `passed=1` and cached it. The reporter now records setup-phase skips, and a clean exit without per-file reports is reported as unverified and never cached. Skipped results already bypass the cache, so skip-only and mixed files are re-executed and reported with accurate counts.
 
 The run summary now states that skipped tests are not verification and that TCTX executes pytest in the daemon environment, and a replayed cached failure points to `rerun_failed`/`no_cache`. The Copilot instructions say the same. The environment fingerprint tag moved from `tctx-env-v2` to `tctx-env-v3`, which invalidates every record cached by earlier builds, including poisoned ones. A regression test covers a fixture-setup skip across repeated runs and fails without the fix. The benchmark was re-run for the changed source tree.
+
+### Actual pytest Execution Optimization
+
+Cache-disabled measurements found that changing from a broad selection to a subset restarted
+the warm parent even when all requested external imports were already preloaded. Parent reuse
+now accepts a preload subset while retaining the interpreter, root, Python path, plugin and
+200-run lifetime checks. Three private sessions used three parents instead of 36 across 54
+requests; each request still forked a fresh child. Broad-after-narrow median latency decreased
+from 266.59 ms to 56.64 ms, and narrow-after-broad from 229.60 ms to 55.07 ms.
+
+Structured pytest reports now run independently of optional dynamic dependency auditing, removing
+the internal JUnit round trip on warm executions. Repeated-broad median latency decreased from
+64.41 ms to 54.74 ms in the same fixture. Explicit user JUnit output and subprocess fallback were
+not removed.
+
+Enabling that reporting path consistently required repairing a larger defect: the result reader
+declared completion after the first pipe chunk and could block waiting for a child still writing
+the remaining reports. It now drains to EOF under the existing deadline, retains bounded data
+with constant-time byte accounting, and reports oversized or malformed payloads explicitly
+instead of truncating JSON. A 1,200-case cold reproduction with a three-second test timeout
+decreased from 13.89 s (response timeout plus fallback) to 0.63 s with no fallback.
+
+Regression checks cover preload reuse and incompatible configuration, more than 64 KiB of
+reports with/without auditing, skips and setup/teardown errors, oversized-report recovery, and
+240-case execution/cache round trips. Validation passed: strict Clippy, 33 Rust unit tests,
+two Rust integration tests, 19 Native extension tests, and the refreshed eight-session,
+320-observation AKS Store Demo benchmark. The environment fingerprint advanced to `tctx-env-v4`
+so prior reporter results cannot be replayed as current evidence. These changes reduce runner
+overhead; they do not accelerate slow test bodies or supply missing database/service context.

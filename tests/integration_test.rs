@@ -389,6 +389,44 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
                 .contains("skipped tests are never cached")
         );
     }
+
+    write_file(
+        &repo,
+        "tests/test_many.py",
+        "import pytest\n@pytest.mark.parametrize('i', range(240))\ndef test_many(i):\n    assert i >= 0\n",
+    );
+    for _ in 0..2 {
+        let many = unstable_root
+            .run_tests(&TestRunRequest {
+                targets: vec!["tests/test_many.py".to_string()],
+                no_cache: true,
+                ..TestRunRequest::default()
+            })
+            .unwrap();
+        assert_eq!(many.status, "passed");
+        assert_eq!((many.passed, many.failed, many.skipped), (240, 0, 0));
+        assert_eq!(many.executed_files_count, 1);
+        assert!(!many.stdout_summary.contains("generated xml file"));
+    }
+    let cached_many = unstable_root
+        .run_tests(&TestRunRequest {
+            targets: vec!["tests/test_many.py".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap();
+    assert_eq!(cached_many.mode, "instant_cache_hit");
+    assert_eq!(cached_many.passed, 240);
+    let user_junit = unstable_root
+        .run_tests(&TestRunRequest {
+            targets: vec!["tests/test_many.py".to_string()],
+            no_cache: true,
+            pytest_args: vec!["--junit-xml=report.xml".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap();
+    assert_eq!(user_junit.passed, 240);
+    let xml = std::fs::read_to_string(repo.join("report.xml")).unwrap();
+    assert_eq!(xml.matches("<testcase ").count(), 240);
     unstable_root.shutdown();
 }
 
