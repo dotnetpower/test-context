@@ -15,6 +15,11 @@ npm run package
 code --install-extension "$extension/dist/test-context-native.vsix" --force
 code --list-extensions --show-versions | grep '^moonchoi\.test-context-native@'
 
+mcp_options=(--executable "$HOME/.local/bin/tctx")
+if [[ "${TCTX_INSTALL_MCP:-0}" == "1" ]]; then
+    mcp_options+=(--enable)
+fi
+
 if [[ -n "${WSL_DISTRO_NAME:-}" ]] && command -v powershell.exe >/dev/null && command -v wslpath >/dev/null; then
     windows_profile="${TCTX_VSCODE_PROFILE:-FDAI}"
     windows_home="$(
@@ -66,40 +71,25 @@ if [[ -n "${WSL_DISTRO_NAME:-}" ]] && command -v powershell.exe >/dev/null && co
         --user-data "$windows_user_data" \
         --distribution "$WSL_DISTRO_NAME" \
         --executable "$(realpath "$HOME/.local/bin/tctx")"
+
+    python3 "$extension/scripts/configure-mcp.py" \
+        --file "$windows_user_data/mcp.json" \
+        --distribution "$WSL_DISTRO_NAME" "${mcp_options[@]}"
+    for profile_mcp in "$windows_user_data"/profiles/*/mcp.json; do
+        [[ -f "$profile_mcp" ]] || continue
+        python3 "$extension/scripts/configure-mcp.py" \
+            --file "$profile_mcp" \
+            --distribution "$WSL_DISTRO_NAME" "${mcp_options[@]}"
+    done
 fi
 
-if [[ "${TCTX_INSTALL_MCP:-0}" == "1" ]]; then
+if [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
     mcp_file="$HOME/.vscode-server/data/User/mcp.json"
-    if [[ -f "$mcp_file" ]]; then
-        node - "$mcp_file" "$HOME/.local/bin/tctx" <<'NODE'
-const fs = require('node:fs');
-
-const [path, command] = process.argv.slice(2);
-const source = fs.readFileSync(path, 'utf8');
-const document = JSON.parse(source);
-document.servers ??= {};
-document.servers['test-context'] = {
-  type: 'stdio',
-  command,
-  args: ['shared-mcp'],
-  cwd: process.env.HOME,
-};
-const temporary = `${path}.tmp.${process.pid}`;
-fs.writeFileSync(temporary, `${JSON.stringify(document, null, 2)}\n`, { mode: 0o600 });
-fs.renameSync(temporary, path);
-NODE
-        node -e '
-const fs = require("node:fs");
-const document = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-const server = document.servers?.["test-context"];
-if (server?.command !== process.argv[2] || server?.args?.join("\0") !== "shared-mcp") {
-  process.exit(1);
-}
-' "$mcp_file" "$HOME/.local/bin/tctx"
-    else
-        code --add-mcp "{\"name\":\"test-context\",\"type\":\"stdio\",\"command\":\"$HOME/.local/bin/tctx\",\"args\":[\"shared-mcp\"],\"cwd\":\"$HOME\"}"
-    fi
+else
+    mcp_file="${XDG_CONFIG_HOME:-$HOME/.config}/Code/User/mcp.json"
 fi
+python3 "$extension/scripts/configure-mcp.py" \
+    --file "$mcp_file" "${mcp_options[@]}"
 
 printf 'Native tools installed as the default. At a safe boundary reload the affected window, then run: Test Context: Getting Started\n'
 printf 'Windows Agent Sessions use the WSL native bridge when installed from WSL.\n'

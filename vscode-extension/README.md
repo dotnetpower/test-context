@@ -9,6 +9,16 @@ the WSL extension host. The installer performs both installations and configures
 extension to use `wsl.exe --exec tctx native-bridge`; it does not route Native tools through MCP or
 a network port.
 
+If the MCP Output channel reports `spawn /home/.../tctx ENOENT` from a
+`LocalProcess` host, Windows is trying to execute a Linux path from an old MCP entry.
+Run `scripts/install-vscode-extension.sh` from the repository root in WSL to keep Native as
+the default and remove installer-owned Test Context MCP registrations. Other MCP servers and
+custom commands are preserved. Reload the affected window at a safe boundary to discard its
+previous MCP discovery state. If MCP is explicitly required, use `TCTX_INSTALL_MCP=1`; the
+installer registers Windows commands through `wsl.exe --distribution ... --exec ... shared-mcp`
+and WSL commands through the Linux executable. Non-JSON configuration is left unchanged and
+requires a manual merge.
+
 ## Contributed Language Model Tools
 
 - `#tctxNativeRun` (`test-context-native_testRun`): Run `pytest` incrementally with instant cache hits for tests already verified in the background.

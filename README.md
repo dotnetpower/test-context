@@ -28,7 +28,8 @@ When GitHub Copilot (or a developer) invokes tests:
   - From WSL, the installer deploys the VSIX to both the WSL remote host and the Windows Agents profile, then configures direct `wsl.exe --exec tctx native-bridge` IPC.
   - The `Test Context Native` Output channel uses concise human-readable records; protocol JSON stays internal to IPC.
   - Optional Shared MCP Server (`tctx shared-mcp`) is a fallback for background/CLI agent sessions where Native dispatch is unavailable (`test_run`, `test_affected`, `test_graph`, `test_status`, `test_sync`, `test_workspaces`, `test_invalidate`).
-  - The VS Code installer installs Native only by default. Set `TCTX_INSTALL_MCP=1` to additionally register the MCP fallback while preserving existing servers.
+  - The VS Code installer installs Native only by default and removes installer-owned Test Context MCP entries from user/profile settings. Other servers and custom Test Context commands are preserved.
+  - Set `TCTX_INSTALL_MCP=1` to additionally register the MCP fallback. Windows entries launch through `wsl.exe`; WSL entries use the Linux executable directly.
   - Drop-in CLI (`tctx run`, `tctx pytest`, `tctx affected`, `tctx graph`, `tctx status`, `tctx sync`).
 
 `tctx` can learn only invocations routed through its Native, MCP, or CLI surfaces. A direct shell
