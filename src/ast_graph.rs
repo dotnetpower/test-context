@@ -119,6 +119,7 @@ pub struct DependencyGraph {
     pub testpaths: Vec<String>,
     pub environment_hash: String,
     pub runtime_deps_for_test: BTreeMap<String, BTreeSet<String>>,
+    pub last_env_ref_digest: String,
 }
 
 impl Default for DependencyGraph {
@@ -142,7 +143,45 @@ impl DependencyGraph {
             testpaths: Vec::new(),
             environment_hash: String::new(),
             runtime_deps_for_test: BTreeMap::new(),
+            last_env_ref_digest: String::new(),
         }
+    }
+
+    fn build_base_hasher(&self) -> Sha256 {
+        let mut hasher = Sha256::new();
+        hasher.update(b"tctx:merkle:v1\nenv:");
+        hasher.update(self.environment_hash.as_bytes());
+        hasher.update(b"\n");
+        for (cfg_path, cfg_sha) in &self.config_hashes {
+            hasher.update(b"cfg:");
+            hasher.update(cfg_path.as_bytes());
+            hasher.update(b":");
+            hasher.update(cfg_sha.as_bytes());
+            hasher.update(b"\n");
+        }
+        hasher
+    }
+
+    fn compute_env_ref_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        let mut keys = BTreeSet::new();
+        for node in self.files.values() {
+            for k in &node.parsed.env_vars_referenced {
+                keys.insert(k.as_str());
+            }
+        }
+        if keys.is_empty() {
+            return String::new();
+        }
+        for key in keys {
+            hasher.update(key.as_bytes());
+            hasher.update(b"=");
+            if let Some(val) = std::env::var_os(key) {
+                hasher.update(val.to_string_lossy().as_bytes());
+            }
+            hasher.update(b"\n");
+        }
+        hex_encode(&hasher.finalize())
     }
 
     pub fn apply_environment_hash(&mut self, environment_hash: String) {
@@ -388,18 +427,7 @@ impl DependencyGraph {
             self.recompute_edges();
             return;
         }
-        let mut cfg_prefix = Vec::new();
-        cfg_prefix.extend_from_slice(b"tctx:merkle:v1\n");
-        cfg_prefix.extend_from_slice(b"env:");
-        cfg_prefix.extend_from_slice(self.environment_hash.as_bytes());
-        cfg_prefix.extend_from_slice(b"\n");
-        for (cfg_path, cfg_sha) in &self.config_hashes {
-            cfg_prefix.extend_from_slice(b"cfg:");
-            cfg_prefix.extend_from_slice(cfg_path.as_bytes());
-            cfg_prefix.extend_from_slice(b":");
-            cfg_prefix.extend_from_slice(cfg_sha.as_bytes());
-            cfg_prefix.extend_from_slice(b"\n");
-        }
+        let base_hasher = self.build_base_hasher();
 
         let affected: Vec<String> = self
             .affected_tests(changed_files)
@@ -411,8 +439,7 @@ impl DependencyGraph {
             let Some(reachable_ids) = self.transitive_dep_ids_for_test.get(&test_path) else {
                 continue;
             };
-            let mut hasher = Sha256::new();
-            hasher.update(&cfg_prefix);
+            let mut hasher = base_hasher.clone();
             for &dep_id in reachable_ids {
                 if let Some(dep_path) = self.file_index_to_path.get(dep_id as usize)
                     && let Some(dep_node) = self.files.get(dep_path)
@@ -426,6 +453,11 @@ impl DependencyGraph {
     }
 
     pub fn refresh_referenced_env_hashes(&mut self) {
+        let digest = self.compute_env_ref_digest();
+        if digest == self.last_env_ref_digest {
+            return;
+        }
+        self.last_env_ref_digest = digest;
         let env_files: Vec<String> = self
             .files
             .iter()
@@ -520,18 +552,8 @@ impl DependencyGraph {
             .map(|n| n.path.clone())
             .collect();
 
-        let mut cfg_prefix = Vec::new();
-        cfg_prefix.extend_from_slice(b"tctx:merkle:v1\n");
-        cfg_prefix.extend_from_slice(b"env:");
-        cfg_prefix.extend_from_slice(self.environment_hash.as_bytes());
-        cfg_prefix.extend_from_slice(b"\n");
-        for (cfg_path, cfg_sha) in &self.config_hashes {
-            cfg_prefix.extend_from_slice(b"cfg:");
-            cfg_prefix.extend_from_slice(cfg_path.as_bytes());
-            cfg_prefix.extend_from_slice(b":");
-            cfg_prefix.extend_from_slice(cfg_sha.as_bytes());
-            cfg_prefix.extend_from_slice(b"\n");
-        }
+        let base_hasher = self.build_base_hasher();
+        self.last_env_ref_digest = self.compute_env_ref_digest();
 
         let mut visited_stamp = vec![0u32; num_files];
         let mut epoch = 0u32;
@@ -574,8 +596,7 @@ impl DependencyGraph {
 
             reachable_ids.sort_unstable();
 
-            let mut hasher = Sha256::new();
-            hasher.update(&cfg_prefix);
+            let mut hasher = base_hasher.clone();
             for &dep_id in &reachable_ids {
                 let dep_path = &self.file_index_to_path[dep_id as usize];
                 if let Some(dep_node) = self.files.get(dep_path) {
@@ -686,48 +707,44 @@ impl DependencyGraph {
             .filter(|node| node.is_conftest)
             .map(|node| node.path.clone())
             .collect();
-        let mut cfg_prefix = Vec::new();
-        cfg_prefix.extend_from_slice(b"tctx:merkle:v1\n");
-        cfg_prefix.extend_from_slice(b"env:");
-        cfg_prefix.extend_from_slice(self.environment_hash.as_bytes());
-        cfg_prefix.extend_from_slice(b"\n");
-        for (path, sha) in &self.config_hashes {
-            cfg_prefix.extend_from_slice(b"cfg:");
-            cfg_prefix.extend_from_slice(path.as_bytes());
-            cfg_prefix.extend_from_slice(b":");
-            cfg_prefix.extend_from_slice(sha.as_bytes());
-            cfg_prefix.extend_from_slice(b"\n");
-        }
+        let base_hasher = self.build_base_hasher();
+        let mut visited_stamp = vec![0u32; self.file_index_to_path.len()];
+        let mut epoch = 0u32;
+        let mut queue = VecDeque::new();
         for test_path in tests {
             let Some(&test_id) = path_to_id.get(test_path) else {
                 continue;
             };
+            epoch = epoch.wrapping_add(1);
+            if epoch == 0 {
+                visited_stamp.fill(0);
+                epoch = 1;
+            }
             let conftest_chain = ancestor_conftests_for(test_path, &conftests);
-            let mut seen = vec![false; self.file_index_to_path.len()];
             let mut reachable = vec![test_id];
-            let mut queue = VecDeque::from([test_id]);
-            seen[test_id as usize] = true;
+            queue.clear();
+            queue.push_back(test_id);
+            visited_stamp[test_id as usize] = epoch;
             for conftest in &conftest_chain {
                 if let Some(&id) = path_to_id.get(conftest)
-                    && !seen[id as usize]
+                    && visited_stamp[id as usize] != epoch
                 {
-                    seen[id as usize] = true;
+                    visited_stamp[id as usize] = epoch;
                     reachable.push(id);
                     queue.push_back(id);
                 }
             }
             while let Some(id) = queue.pop_front() {
                 for &next in &adj[id as usize] {
-                    if !seen[next as usize] {
-                        seen[next as usize] = true;
+                    if visited_stamp[next as usize] != epoch {
+                        visited_stamp[next as usize] = epoch;
                         reachable.push(next);
                         queue.push_back(next);
                     }
                 }
             }
             reachable.sort_unstable();
-            let mut hasher = Sha256::new();
-            hasher.update(&cfg_prefix);
+            let mut hasher = base_hasher.clone();
             for &id in &reachable {
                 let path = &self.file_index_to_path[id as usize];
                 if let Some(node) = self.files.get(path) {
@@ -754,6 +771,9 @@ impl DependencyGraph {
     }
 
     pub fn external_preload_modules_for_tests(&self, test_files: &[String]) -> Vec<String> {
+        if !test_files.iter().any(|tf| tf.ends_with(".py")) {
+            return Vec::new();
+        }
         let mut local_roots = BTreeSet::new();
         for path in self.files.keys() {
             if !path.ends_with(".py") {
@@ -780,13 +800,32 @@ impl DependencyGraph {
             "pytest_cov",
         ];
         let mut externals = BTreeSet::new();
+        let num_indexed = self.file_index_to_path.len();
         let mut relevant_paths = BTreeSet::new();
-        for test_file in test_files {
-            relevant_paths.insert(test_file.clone());
-            relevant_paths.extend(self.transitive_deps_for(test_file));
+        if num_indexed == self.files.len() && num_indexed > 0 {
+            let mut seen = vec![false; num_indexed];
+            for test_file in test_files {
+                relevant_paths.insert(test_file.as_str());
+                if let Some(ids) = self.transitive_dep_ids_for_test.get(test_file) {
+                    for &id in ids {
+                        if let Some(slot) = seen.get_mut(id as usize) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+            for (idx, flag) in seen.into_iter().enumerate() {
+                if flag {
+                    relevant_paths.insert(self.file_index_to_path[idx].as_str());
+                }
+            }
+        } else {
+            for test_file in test_files {
+                relevant_paths.insert(test_file.as_str());
+            }
         }
         for path in relevant_paths {
-            let Some(node) = self.files.get(&path) else {
+            let Some(node) = self.files.get(path) else {
                 continue;
             };
             for spec in &node.parsed.imports {
@@ -1124,24 +1163,39 @@ impl DependencyGraph {
 }
 
 fn edit_distance(a: &str, b: &str) -> usize {
+    const MAX_LEN: usize = 128;
+    const CUTOFF: usize = 8;
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
-    if a_bytes.len() > 128 || b_bytes.len() > 128 {
+    if a_bytes.len() > MAX_LEN
+        || b_bytes.len() > MAX_LEN
+        || a_bytes.len().abs_diff(b_bytes.len()) > CUTOFF
+    {
         return 99;
     }
-    let mut prev: Vec<usize> = (0..=b_bytes.len()).collect();
-    let mut curr = vec![0usize; b_bytes.len() + 1];
+    let m = b_bytes.len();
+    let mut prev = [0usize; MAX_LEN + 1];
+    let mut curr = [0usize; MAX_LEN + 1];
+    for (j, slot) in prev.iter_mut().enumerate().take(m + 1) {
+        *slot = j;
+    }
     for (i, &ca) in a_bytes.iter().enumerate() {
         curr[0] = i + 1;
+        let mut row_min = curr[0];
         for (j, &cb) in b_bytes.iter().enumerate() {
             let cost = usize::from(!ca.eq_ignore_ascii_case(&cb));
-            curr[j + 1] = (prev[j + 1] + 1)
-                .min(curr[j] + 1)
-                .min(prev[j] + cost);
+            let val = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+            curr[j + 1] = val;
+            if val < row_min {
+                row_min = val;
+            }
         }
-        std::mem::swap(&mut prev, &mut curr);
+        if row_min > CUTOFF {
+            return 99;
+        }
+        prev[..=m].copy_from_slice(&curr[..=m]);
     }
-    prev[b_bytes.len()]
+    prev[m]
 }
 
 fn compute_direct_dependencies(
@@ -1279,8 +1333,28 @@ pub fn is_test_filename(file_name: &str) -> bool {
         || (file_name.ends_with("_test.rs") && file_name.len() > "_test.rs".len())
 }
 
-fn matches_test_filename(file_name: &str, patterns: &[String]) -> bool {
+fn matches_single_pattern_fast(file_name: &str, pattern: &str) -> Option<bool> {
+    if pattern.contains(['?', '[', ']', '{', '}', '/']) {
+        return None;
+    }
+    let Some((prefix, suffix)) = pattern.split_once('*') else {
+        return Some(file_name == pattern);
+    };
+    if suffix.contains('*') {
+        return None;
+    }
+    Some(
+        file_name.len() >= prefix.len() + suffix.len()
+            && file_name.starts_with(prefix)
+            && file_name.ends_with(suffix),
+    )
+}
+
+pub fn matches_test_filename(file_name: &str, patterns: &[String]) -> bool {
     patterns.iter().any(|pattern| {
+        if let Some(matched) = matches_single_pattern_fast(file_name, pattern) {
+            return matched;
+        }
         globset::GlobBuilder::new(pattern)
             .literal_separator(true)
             .build()
@@ -2279,11 +2353,23 @@ fn is_type_checking_header(line_rem: &str) -> bool {
     )
 }
 
+fn push_py_other(tokens: &mut Vec<PyToken>) {
+    if !matches!(tokens.last(), Some(PyToken::Other)) {
+        tokens.push(PyToken::Other);
+    }
+}
+
+fn push_py_newline(tokens: &mut Vec<PyToken>) {
+    if !matches!(tokens.last(), Some(PyToken::Newline)) {
+        tokens.push(PyToken::Newline);
+    }
+}
+
 fn tokenize_python(source: &str) -> Vec<PyToken> {
     let bytes = source.as_bytes();
     let len = bytes.len();
     let mut i = 0usize;
-    let mut tokens = Vec::new();
+    let mut tokens = Vec::with_capacity((len / 6).clamp(16, 65_536));
     let mut at_line_start = true;
     let mut line_indent = 0usize;
     let mut tc_indent: Option<usize> = None;
@@ -2303,14 +2389,14 @@ fn tokenize_python(source: &str) -> Vec<PyToken> {
                 i += 1;
                 continue;
             } else if b == b'\n' {
-                tokens.push(PyToken::Newline);
+                push_py_newline(&mut tokens);
                 line_indent = 0;
                 i += 1;
                 continue;
             } else if b == b'#' {
-                while i < len && bytes[i] != b'\n' {
-                    i += 1;
-                }
+                i = memchr::memchr(b'\n', &bytes[i..])
+                    .map(|off| i + off)
+                    .unwrap_or(len);
                 continue;
             } else {
                 at_line_start = false;
@@ -2320,13 +2406,14 @@ fn tokenize_python(source: &str) -> Vec<PyToken> {
                     tokens.push(PyToken::EndTypeChecking);
                     tc_indent = None;
                 }
-                let line_end = source[i..]
-                    .find('\n')
-                    .map(|off| i + off)
-                    .unwrap_or(len);
-                if tc_indent.is_none() && is_type_checking_header(&source[i..line_end]) {
-                    tc_indent = Some(line_indent);
-                    tokens.push(PyToken::StartTypeChecking);
+                if tc_indent.is_none() && (b == b'i' || b == b't') {
+                    let line_end = memchr::memchr(b'\n', &bytes[i..])
+                        .map(|off| i + off)
+                        .unwrap_or(len);
+                    if is_type_checking_header(&source[i..line_end]) {
+                        tc_indent = Some(line_indent);
+                        tokens.push(PyToken::StartTypeChecking);
+                    }
                 }
             }
         }
@@ -2345,18 +2432,18 @@ fn tokenize_python(source: &str) -> Vec<PyToken> {
                 }
             }
             b'#' => {
-                while i < len && bytes[i] != b'\n' {
-                    i += 1;
-                }
+                i = memchr::memchr(b'\n', &bytes[i..])
+                    .map(|off| i + off)
+                    .unwrap_or(len);
             }
             b'\n' => {
-                tokens.push(PyToken::Newline);
+                push_py_newline(&mut tokens);
                 at_line_start = true;
                 line_indent = 0;
                 i += 1;
             }
             b';' => {
-                tokens.push(PyToken::Newline);
+                push_py_newline(&mut tokens);
                 i += 1;
             }
             b'.' => {
@@ -2389,7 +2476,7 @@ fn tokenize_python(source: &str) -> Vec<PyToken> {
             }
             b'=' => {
                 if i + 1 < len && bytes[i + 1] == b'=' {
-                    tokens.push(PyToken::Other);
+                    push_py_other(&mut tokens);
                     i += 2;
                 } else {
                     tokens.push(PyToken::Assign);
@@ -2433,7 +2520,7 @@ fn tokenize_python(source: &str) -> Vec<PyToken> {
                 }
             }
             _ => {
-                tokens.push(PyToken::Other);
+                push_py_other(&mut tokens);
                 i += 1;
             }
         }
@@ -2864,11 +2951,17 @@ enum RsToken {
     Other,
 }
 
+fn push_rs_other(tokens: &mut Vec<RsToken>) {
+    if !matches!(tokens.last(), Some(RsToken::Other)) {
+        tokens.push(RsToken::Other);
+    }
+}
+
 fn tokenize_rust(source: &str) -> Vec<RsToken> {
     let bytes = source.as_bytes();
     let len = bytes.len();
     let mut i = 0usize;
-    let mut tokens = Vec::new();
+    let mut tokens = Vec::with_capacity((len / 6).clamp(16, 65_536));
 
     while i < len {
         let b = bytes[i];
@@ -2877,10 +2970,9 @@ fn tokenize_rust(source: &str) -> Vec<RsToken> {
                 i += 1;
             }
             b'/' if i + 1 < len && bytes[i + 1] == b'/' => {
-                i += 2;
-                while i < len && bytes[i] != b'\n' {
-                    i += 1;
-                }
+                i = memchr::memchr(b'\n', &bytes[i + 2..])
+                    .map(|off| i + 2 + off)
+                    .unwrap_or(len);
             }
             b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
                 i += 2;
@@ -2935,7 +3027,7 @@ fn tokenize_rust(source: &str) -> Vec<RsToken> {
             }
             b'=' => {
                 if i + 1 < len && (bytes[i + 1] == b'=' || bytes[i + 1] == b'>') {
-                    tokens.push(RsToken::Other);
+                    push_rs_other(&mut tokens);
                     i += 2;
                 } else {
                     tokens.push(RsToken::Eq);
@@ -2948,7 +3040,7 @@ fn tokenize_rust(source: &str) -> Vec<RsToken> {
             }
             b'!' => {
                 if i + 1 < len && bytes[i + 1] == b'=' {
-                    tokens.push(RsToken::Other);
+                    push_rs_other(&mut tokens);
                     i += 2;
                 } else {
                     tokens.push(RsToken::Bang);
@@ -2974,16 +3066,16 @@ fn tokenize_rust(source: &str) -> Vec<RsToken> {
                     if i < len && bytes[i] == b'\'' {
                         i += 1;
                     }
-                    tokens.push(RsToken::Other);
+                    push_rs_other(&mut tokens);
                 } else if i + 2 < len && bytes[i + 2] == b'\'' {
                     i += 3;
-                    tokens.push(RsToken::Other);
+                    push_rs_other(&mut tokens);
                 } else {
                     i += 1;
                     while i < len && is_ident_continue(bytes[i]) {
                         i += 1;
                     }
-                    tokens.push(RsToken::Other);
+                    push_rs_other(&mut tokens);
                 }
             }
             _ if is_ident_start(b) => {
@@ -3001,7 +3093,7 @@ fn tokenize_rust(source: &str) -> Vec<RsToken> {
                 tokens.push(RsToken::Ident(source[start..i].to_string()));
             }
             _ => {
-                tokens.push(RsToken::Other);
+                push_rs_other(&mut tokens);
                 i += 1;
             }
         }
@@ -3015,14 +3107,15 @@ fn scan_rust_string(source: &str, quote_idx: usize) -> (String, usize) {
     let start = quote_idx + 1;
     let mut i = start;
     while i < len {
+        let Some(off) = memchr::memchr2(b'"', b'\\', &bytes[i..]) else {
+            break;
+        };
+        i += off;
         if bytes[i] == b'\\' {
             i = (i + 2).min(len);
             continue;
         }
-        if bytes[i] == b'"' {
-            return (source[start..i].to_string(), i + 1);
-        }
-        i += 1;
+        return (source[start..i].to_string(), i + 1);
     }
     (source[start..len].to_string(), len)
 }

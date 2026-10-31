@@ -615,12 +615,17 @@ impl ManagedRoot {
                     })
                     .collect();
                 spec = guard.spec.clone();
-                preload_modules = guard.graph.external_preload_modules_for_tests(
-                    &selected
-                        .iter()
-                        .map(|(test_file, _)| test_file.clone())
-                        .collect::<Vec<_>>(),
-                );
+                let has_py = selected.iter().any(|(tf, _)| tf.ends_with(".py"));
+                preload_modules = if has_py {
+                    guard.graph.external_preload_modules_for_tests(
+                        &selected
+                            .iter()
+                            .map(|(test_file, _)| test_file.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    Vec::new()
+                };
                 batch = selected;
                 environment_hash = guard.graph.environment_hash.clone();
                 capture_dynamic_dependencies = batch.iter().any(|(test_file, dep_hash)| {
@@ -915,19 +920,54 @@ impl ManagedRoot {
     }
 
     /// Reconciles live disk contents for candidate files before serving a test_run or affected query.
-    fn reconcile_live_files_locked(guard: &mut RootState, target_tests: Option<&[String]>) {
+    /// Returns `true` if the dependency graph structure changed.
+    fn reconcile_live_files_locked(guard: &mut RootState, target_tests: Option<&[String]>) -> bool {
         let files_to_check: Vec<String> = if let Some(tests) = target_tests {
-            let mut set = BTreeSet::new();
-            for t in tests {
-                set.insert(t.clone());
-                for dep in guard.graph.transitive_deps_for(t) {
-                    set.insert(dep);
+            let num_indexed = guard.graph.file_index_to_path.len();
+            if num_indexed == guard.graph.files.len() && num_indexed > 0 {
+                let mut seen = vec![false; num_indexed];
+                let mut extra = BTreeSet::new();
+                for t in tests {
+                    if let Some(ids) = guard.graph.transitive_dep_ids_for_test.get(t) {
+                        for &id in ids {
+                            if let Some(slot) = seen.get_mut(id as usize) {
+                                *slot = true;
+                            }
+                        }
+                    } else {
+                        extra.insert(t.clone());
+                    }
                 }
+                let mut list: Vec<String> = seen
+                    .into_iter()
+                    .enumerate()
+                    .filter(|&(_, flag)| flag)
+                    .map(|(idx, _)| guard.graph.file_index_to_path[idx].clone())
+                    .collect();
+                for cfg in guard.graph.config_hashes.keys() {
+                    if !list.contains(cfg) {
+                        list.push(cfg.clone());
+                    }
+                }
+                for item in extra {
+                    if !list.contains(&item) {
+                        list.push(item);
+                    }
+                }
+                list
+            } else {
+                let mut set = BTreeSet::new();
+                for t in tests {
+                    set.insert(t.clone());
+                    for dep in guard.graph.transitive_deps_for(t) {
+                        set.insert(dep);
+                    }
+                }
+                for cfg in guard.graph.config_hashes.keys() {
+                    set.insert(cfg.clone());
+                }
+                set.into_iter().collect()
             }
-            for cfg in guard.graph.config_hashes.keys() {
-                set.insert(cfg.clone());
-            }
-            set.into_iter().collect()
         } else {
             guard.graph.files.keys().cloned().collect()
         };
@@ -989,6 +1029,7 @@ impl ManagedRoot {
             }
         }
         guard.graph.refresh_referenced_env_hashes();
+        structure_changed
     }
 
     pub fn sync(&self, wait_background: bool) -> Result<serde_json::Value> {
@@ -1289,8 +1330,13 @@ impl ManagedRoot {
             // 1. Resolve target test files (and reconcile live files on disk)
             Self::maybe_safety_reconcile_locked(&mut guard);
             let initial_targets = guard.graph.resolve_target_test_files(&req.targets);
-            Self::reconcile_live_files_locked(&mut guard, Some(&initial_targets));
-            target_test_files = guard.graph.resolve_target_test_files(&req.targets);
+            let structure_changed =
+                Self::reconcile_live_files_locked(&mut guard, Some(&initial_targets));
+            target_test_files = if structure_changed {
+                guard.graph.resolve_target_test_files(&req.targets)
+            } else {
+                initial_targets
+            };
             spec = guard.spec.clone();
             environment_hash = guard.graph.environment_hash.clone();
             parallel_delta = guard.spec.policy.parallel_delta_enabled
@@ -1528,10 +1574,10 @@ impl ManagedRoot {
                     .saturating_add(cached_summaries.len() as u64);
                 guard.cache.total_saved_ms = guard.cache.total_saved_ms.saturating_add(saved_ms);
             }
-            preload_modules = if to_execute.is_empty() {
-                Vec::new()
-            } else {
+            preload_modules = if to_execute.iter().any(|tf| tf.ends_with(".py")) {
                 guard.graph.external_preload_modules_for_tests(&to_execute)
+            } else {
+                Vec::new()
             };
         }
 
@@ -1965,7 +2011,7 @@ print(json.dumps({'identity':[sys.version,sys.executable,platform.platform(),pyt
 
 fn git_dirty_files(root: &Path) -> Result<Vec<String>> {
     let mut cmd = Command::new("git");
-    cmd.args(["-c", "core.quotePath=false", "-C"])
+    cmd.args(["--no-optional-locks", "-c", "core.quotePath=false", "-C"])
         .arg(root)
         .args(["status", "--porcelain", "--untracked-files=all"]);
     let out = run_command_with_timeout(&mut cmd, Duration::from_secs(5), 1024 * 1024)?;
@@ -2521,6 +2567,133 @@ fn parse_cargo_test_output(
     stats
 }
 
+fn demux_cargo_lib_output(
+    combined_out: &str,
+    lib_files: &[String],
+    duration_ms: u64,
+    overall_success: bool,
+) -> BTreeMap<String, FileXmlStats> {
+    let mut prefixes: Vec<(String, String)> = lib_files
+        .iter()
+        .filter_map(|tf| rust_module_filter_for_file(tf).map(|pfx| (pfx, tf.clone())))
+        .collect();
+    // Longest module prefix first so nested submodules (`engine::parser::`) match before parent (`engine::`)
+    prefixes.sort_by_key(|(pfx, _)| std::cmp::Reverse(pfx.len()));
+    let fallback_lib = lib_files
+        .iter()
+        .find(|tf| tf.ends_with("src/lib.rs"))
+        .cloned();
+
+    let mut raw_cases_by_file: BTreeMap<String, Vec<(String, TestOutcome)>> = BTreeMap::new();
+    for tf in lib_files {
+        raw_cases_by_file.insert(tf.clone(), Vec::new());
+    }
+
+    let mut total_cases = 0usize;
+    for raw_line in combined_out.lines() {
+        let line = raw_line.trim();
+        let Some(rest) = line.strip_prefix("test ") else {
+            continue;
+        };
+        let Some((name_part, status_part)) = rest.rsplit_once(" ... ") else {
+            continue;
+        };
+        let test_name = name_part.trim();
+        if test_name.is_empty() || test_name.contains(' ') {
+            continue;
+        }
+        let status = status_part.trim();
+        let outcome = if status == "ok" {
+            TestOutcome::Passed
+        } else if status == "FAILED" {
+            TestOutcome::Failed
+        } else if status == "ignored" || status.starts_with("ignored,") {
+            TestOutcome::Skipped
+        } else {
+            continue;
+        };
+        let matched_file = prefixes
+            .iter()
+            .find(|(pfx, _)| test_name.starts_with(pfx.as_str()))
+            .map(|(_, tf)| tf.clone())
+            .or_else(|| fallback_lib.clone());
+        if let Some(tf) = matched_file
+            && let Some(bucket) = raw_cases_by_file.get_mut(&tf)
+        {
+            bucket.push((test_name.to_string(), outcome));
+            total_cases += 1;
+        }
+    }
+
+    let per_case_ms = (duration_ms / (total_cases.max(1) as u64)).max(1);
+    let snippet = truncate_str(combined_out, 2048);
+    let mut result = BTreeMap::new();
+
+    for tf in lib_files {
+        let cases = raw_cases_by_file.remove(tf).unwrap_or_default();
+        let file_dur = (per_case_ms * (cases.len().max(1) as u64)).max(1);
+        let mut stats = FileXmlStats {
+            duration_ms: file_dur,
+            ..FileXmlStats::default()
+        };
+        for (full_name, outcome) in cases {
+            match outcome {
+                TestOutcome::Passed => stats.passed += 1,
+                TestOutcome::Failed => stats.failed += 1,
+                TestOutcome::Skipped => stats.skipped += 1,
+                TestOutcome::Error => stats.errors += 1,
+            }
+            let short_name = full_name.rsplit("::").next().unwrap_or(&full_name);
+            let primary_nodeid = format!("{tf}::{short_name}");
+            let full_nodeid = format!("{tf}::{full_name}");
+            if outcome == TestOutcome::Failed && !stats.failed_nodeids.contains(&primary_nodeid) {
+                stats.failed_nodeids.push(primary_nodeid.clone());
+            }
+            let out_snip = if outcome.is_green() {
+                String::new()
+            } else {
+                snippet.clone()
+            };
+            stats.node_results.insert(
+                primary_nodeid.clone(),
+                CachedNodeResult {
+                    nodeid: primary_nodeid,
+                    outcome,
+                    duration_ms: per_case_ms,
+                    output_snippet: out_snip.clone(),
+                },
+            );
+            if full_nodeid != format!("{tf}::{short_name}") {
+                stats.node_results.insert(
+                    full_nodeid.clone(),
+                    CachedNodeResult {
+                        nodeid: full_nodeid,
+                        outcome,
+                        duration_ms: per_case_ms,
+                        output_snippet: out_snip,
+                    },
+                );
+            }
+        }
+        if stats.passed == 0
+            && stats.failed == 0
+            && stats.skipped == 0
+            && !overall_success
+            && (lib_files.len() == 1 || combined_out.contains(tf.as_str()))
+        {
+            if combined_out.contains("error[E") || combined_out.contains("could not compile") {
+                stats.errors = 1;
+            } else {
+                stats.failed = 1;
+            }
+            stats.failed_nodeids.push(tf.clone());
+        }
+        result.insert(tf.clone(), stats);
+    }
+
+    result
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_cargo_test_batch(
     spec: &Spec,
@@ -2541,8 +2714,155 @@ fn execute_cargo_test_batch(
     let timeout = Duration::from_secs(spec.policy.pytest_timeout_secs);
     let mut records = Vec::new();
     let mut all_outputs = Vec::new();
+    let has_explicit_node = invocation_targets.iter().any(|t| t.contains("::"));
 
-    for (test_file, dep_hash) in dep_hashes {
+    // Group eligible `--lib` unit test files by crate_dir so multiple unit test modules in the same crate
+    // run in a single `cargo test --lib` invocation instead of spawning cargo N times.
+    let mut lib_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut individual_files: Vec<String> = Vec::new();
+
+    for test_file in dep_hashes.keys() {
+        let crate_dir = crate::ast_graph::rust_crate_dir(test_file);
+        let workdir = if crate_dir.is_empty() {
+            spec.root.clone()
+        } else {
+            spec.root.join(&crate_dir)
+        };
+        let is_lib_unit = !has_explicit_node
+            && !crate::ast_graph::is_rust_integration_test_path(test_file)
+            && !test_file.ends_with("src/main.rs")
+            && test_file != "src/main.rs"
+            && !test_file.contains("src/bin/")
+            && workdir.join("src/lib.rs").is_file();
+        if is_lib_unit {
+            lib_groups
+                .entry(crate_dir)
+                .or_default()
+                .push(test_file.clone());
+        } else {
+            individual_files.push(test_file.clone());
+        }
+    }
+
+    for (crate_dir, group_files) in lib_groups {
+        if group_files.len() <= 1 {
+            individual_files.extend(group_files);
+            continue;
+        }
+        let run_started_unix_ms = now_unix_ms();
+        let workdir = if crate_dir.is_empty() {
+            spec.root.clone()
+        } else {
+            spec.root.join(&crate_dir)
+        };
+        let mut command = Command::new(program);
+        command.current_dir(&workdir);
+        command.args(base_args);
+        command.arg("test").arg("--lib");
+        if let Some(k) = k_expr
+            && !k.trim().is_empty()
+        {
+            command.arg(k);
+        }
+        for arg in extra_args {
+            command.arg(arg);
+        }
+        if mark_expr.is_some_and(|m| m == "ignore" || m == "ignored") {
+            command.arg("--").arg("--ignored");
+        }
+        let output = run_command_with_timeout_tracked(
+            &mut command,
+            timeout,
+            2 * 1024 * 1024,
+            active_pgid,
+            active_pgids,
+        )?;
+        if output.timed_out {
+            return Err(invalid(format!(
+                "cargo test execution timed out after {}s",
+                spec.policy.pytest_timeout_secs
+            ))
+            .into());
+        }
+        if output.cancelled {
+            return Err(
+                invalid("TEST_CANCELLED: cargo test child process group was terminated").into(),
+            );
+        }
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        let combined_out = match (stdout_str.trim().is_empty(), stderr_str.trim().is_empty()) {
+            (true, _) => stderr_str.to_string(),
+            (_, true) => stdout_str.to_string(),
+            (false, false) => format!("{}\n{}", stdout_str.trim(), stderr_str.trim()),
+        };
+        let snippet = truncate_str(&combined_out, 8192);
+        if !snippet.trim().is_empty() {
+            all_outputs.push(snippet.clone());
+        }
+        let overall_success = output.status.success();
+        let mut demuxed =
+            demux_cargo_lib_output(&combined_out, &group_files, output.duration_ms, overall_success);
+        let now = now_unix_ms();
+        for test_file in group_files {
+            let Some(dep_hash) = dep_hashes.get(&test_file) else {
+                continue;
+            };
+            let stats = demuxed.remove(&test_file).unwrap_or_default();
+            if stats.passed == 0
+                && stats.failed == 0
+                && stats.skipped == 0
+                && stats.errors == 0
+                && !overall_success
+            {
+                continue;
+            }
+            let outcome = if stats.failed > 0 {
+                TestOutcome::Failed
+            } else if stats.errors > 0 {
+                TestOutcome::Error
+            } else if stats.passed > 0 && stats.skipped == 0 {
+                TestOutcome::Passed
+            } else if stats.skipped > 0 && overall_success {
+                TestOutcome::Skipped
+            } else if overall_success {
+                TestOutcome::Passed
+            } else {
+                TestOutcome::Failed
+            };
+            records.push(CachedTestRecord {
+                test_file: test_file.clone(),
+                dep_hash: dep_hash.clone(),
+                outcome,
+                passed: stats.passed,
+                failed: stats.failed,
+                skipped: stats.skipped,
+                errors: stats.errors,
+                duration_ms: stats.duration_ms.max(1),
+                failed_nodeids: stats.failed_nodeids,
+                output_snippet: if outcome.is_green() {
+                    String::new()
+                } else {
+                    snippet.clone()
+                },
+                updated_unix_ms: now,
+                source: source_label.to_string(),
+                environment_hash: environment_hash.to_string(),
+                tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+                runner_mode: "cargo_test_batch".to_string(),
+                started_unix_ms: run_started_unix_ms,
+                completed_unix_ms: now,
+                dynamic_dependencies: Vec::new(),
+                dynamic_dependencies_complete: true,
+                node_results: stats.node_results,
+            });
+        }
+    }
+
+    for test_file in &individual_files {
+        let Some(dep_hash) = dep_hashes.get(test_file) else {
+            continue;
+        };
         let run_started_unix_ms = now_unix_ms();
         let crate_dir = crate::ast_graph::rust_crate_dir(test_file);
         let workdir = if crate_dir.is_empty() {
@@ -3197,5 +3517,38 @@ test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; 
                 "tests/test_unknown.py".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn demux_cargo_lib_output_splits_single_lib_run_across_source_files() {
+        let out = r#"
+running 4 tests
+test calc::tests::test_add ... ok
+test calc::sub::tests::test_sub ... ok
+test engine::tests::test_run ... FAILED
+test tests::test_root_lib ... ok
+
+failures:
+    engine::tests::test_run
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+"#;
+        let files = vec![
+            "src/lib.rs".to_string(),
+            "src/calc.rs".to_string(),
+            "src/calc/sub.rs".to_string(),
+            "src/engine.rs".to_string(),
+        ];
+        let demuxed = demux_cargo_lib_output(out, &files, 40, false);
+        assert_eq!(demuxed["src/calc.rs"].passed, 1);
+        assert_eq!(demuxed["src/calc.rs"].failed, 0);
+        assert_eq!(demuxed["src/calc/sub.rs"].passed, 1);
+        assert_eq!(demuxed["src/engine.rs"].passed, 0);
+        assert_eq!(demuxed["src/engine.rs"].failed, 1);
+        assert_eq!(
+            demuxed["src/engine.rs"].failed_nodeids,
+            vec!["src/engine.rs::test_run".to_string()]
+        );
+        assert_eq!(demuxed["src/lib.rs"].passed, 1);
     }
 }

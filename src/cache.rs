@@ -5,8 +5,8 @@ use crate::policy::MemoryPolicy;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, Read, Seek, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,6 +109,8 @@ pub struct RootCache {
     wal_valid_bytes: u64,
     #[serde(skip)]
     wal_needs_repair: bool,
+    #[serde(skip)]
+    last_snapshot_stamp: Option<(u64, i64, i64)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -164,6 +166,7 @@ impl RootCache {
             wal_sequence: 0,
             wal_valid_bytes: 0,
             wal_needs_repair: false,
+            last_snapshot_stamp: None,
         }
     }
 
@@ -171,7 +174,19 @@ impl RootCache {
         format!("{test_file}@{dep_hash}")
     }
 
+    fn snapshot_stamp(root: &Path) -> Option<(u64, i64, i64)> {
+        let path = Self::storage_path(root).ok()?;
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.len(), meta.mtime(), meta.mtime_nsec()))
+    }
+
     pub fn get_matching(&self, test_file: &str, dep_hash: &str) -> Option<&CachedTestRecord> {
+        if self.quarantined_keys.is_empty()
+            && let Some(rec) = self.latest_by_file.get(test_file)
+            && rec.dep_hash == dep_hash
+        {
+            return Some(rec);
+        }
         let key = Self::key(test_file, dep_hash);
         if self.quarantined_keys.contains(&key) {
             return None;
@@ -218,8 +233,9 @@ impl RootCache {
         self.pending_events.push(CacheWalEvent::Upsert {
             record: Box::new(record),
         });
+        let mut current_bytes = self.estimated_bytes();
         while self.history_by_key.len() > policy.max_cached_results
-            || self.estimated_bytes() > policy.max_cache_bytes
+            || current_bytes > policy.max_cache_bytes
         {
             if let Some(oldest_key) = self
                 .history_by_key
@@ -227,16 +243,23 @@ impl RootCache {
                 .min_by_key(|(_, r)| r.updated_unix_ms)
                 .map(|(k, _)| k.clone())
             {
-                self.history_by_key.remove(&oldest_key);
+                if let Some(removed_hist) = self.history_by_key.remove(&oldest_key) {
+                    current_bytes =
+                        current_bytes.saturating_sub(record_estimated_bytes(&removed_hist));
+                }
                 if let Some((test_file, dep_hash)) = oldest_key.rsplit_once('@')
                     && self
                         .latest_by_file
                         .get(test_file)
                         .is_some_and(|record| record.dep_hash == dep_hash)
+                    && let Some(removed_latest) = self.latest_by_file.remove(test_file)
                 {
-                    self.latest_by_file.remove(test_file);
+                    current_bytes =
+                        current_bytes.saturating_sub(record_estimated_bytes(&removed_latest));
                 }
-                self.quarantined_keys.remove(&oldest_key);
+                if self.quarantined_keys.remove(&oldest_key) {
+                    current_bytes = current_bytes.saturating_sub(oldest_key.len());
+                }
                 self.pending_events
                     .push(CacheWalEvent::RemoveKey { key: oldest_key });
             } else {
@@ -398,6 +421,7 @@ impl RootCache {
     }
 
     fn load_unlocked(root: &Path) -> Self {
+        let snap_stamp = Self::snapshot_stamp(root);
         let mut cache = Self::storage_path(root)
             .ok()
             .and_then(|path| std::fs::File::open(path).ok())
@@ -411,6 +435,7 @@ impl RootCache {
             .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
             .filter(|cache| cache.schema == current_cache_schema() && cache.root == root)
             .unwrap_or_else(|| Self::new(root.to_path_buf()));
+        cache.last_snapshot_stamp = snap_stamp;
         cache.pending_events.clear();
         if let Ok(wal_path) = Self::wal_path(root)
             && let Ok(file) = std::fs::File::open(wal_path)
@@ -460,8 +485,9 @@ impl RootCache {
         cache.pending_events.clear();
         cache.trim_invocation_patterns();
         let default_policy = MemoryPolicy::default();
+        let mut current_bytes = cache.estimated_bytes();
         while cache.history_by_key.len() > default_policy.max_cached_results
-            || cache.estimated_bytes() > default_policy.max_cache_bytes
+            || current_bytes > default_policy.max_cache_bytes
         {
             let Some(oldest) = cache
                 .history_by_key
@@ -471,15 +497,22 @@ impl RootCache {
             else {
                 break;
             };
-            cache.history_by_key.remove(&oldest);
-            cache.quarantined_keys.remove(&oldest);
+            if let Some(removed_hist) = cache.history_by_key.remove(&oldest) {
+                current_bytes =
+                    current_bytes.saturating_sub(record_estimated_bytes(&removed_hist));
+            }
+            if cache.quarantined_keys.remove(&oldest) {
+                current_bytes = current_bytes.saturating_sub(oldest.len());
+            }
             if let Some((test_file, dep_hash)) = oldest.rsplit_once('@')
                 && cache
                     .latest_by_file
                     .get(test_file)
                     .is_some_and(|record| record.dep_hash == dep_hash)
+                && let Some(removed_latest) = cache.latest_by_file.remove(test_file)
             {
-                cache.latest_by_file.remove(test_file);
+                current_bytes =
+                    current_bytes.saturating_sub(record_estimated_bytes(&removed_latest));
             }
         }
         cache
@@ -501,16 +534,26 @@ impl RootCache {
             total_delta_runs: self.total_delta_runs,
             total_background_runs: self.total_background_runs,
         });
-        let pending_events = std::mem::take(&mut self.pending_events);
-        let mut durable = Self::load_unlocked(&self.root);
-        for event in pending_events.iter().cloned() {
-            durable.apply_wal_event(event);
-        }
-        durable.pending_events = pending_events;
-        *self = durable;
-
         let wal_path = Self::wal_path(&self.root)?;
+        let disk_wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        let disk_snap_stamp = Self::snapshot_stamp(&self.root);
+
+        let pending_events = std::mem::take(&mut self.pending_events);
+        if self.wal_needs_repair
+            || disk_wal_len != self.wal_valid_bytes
+            || disk_snap_stamp != self.last_snapshot_stamp
         {
+            let mut durable = Self::load_unlocked(&self.root);
+            for event in pending_events.iter().cloned() {
+                durable.apply_wal_event(event);
+            }
+            durable.pending_events = pending_events;
+            *self = durable;
+        } else {
+            self.pending_events = pending_events;
+        }
+
+        let wal_bytes = {
             let mut options = std::fs::OpenOptions::new();
             options.create(true).read(true).write(true);
             let mut wal = options.mode(0o600).open(&wal_path)?;
@@ -521,24 +564,29 @@ impl RootCache {
             self.wal_needs_repair = false;
             wal.seek(std::io::SeekFrom::End(0))?;
             let mut next_sequence = self.wal_sequence.saturating_add(1);
-            for event in &self.pending_events {
-                let event_bytes = serde_json::to_vec(event)?;
-                let envelope = CacheWalEnvelope {
-                    sequence: next_sequence,
-                    checksum: sha256_hex(&event_bytes),
-                    event: event.clone(),
-                };
-                serde_json::to_writer(&mut wal, &envelope)?;
-                wal.write_all(b"\n")?;
-                next_sequence = next_sequence.saturating_add(1);
+            {
+                let mut writer = BufWriter::with_capacity(64 * 1024, &mut wal);
+                for event in &self.pending_events {
+                    let event_bytes = serde_json::to_vec(event)?;
+                    let checksum = sha256_hex(&event_bytes);
+                    write!(
+                        writer,
+                        "{{\"sequence\":{next_sequence},\"checksum\":\"{checksum}\",\"event\":"
+                    )?;
+                    writer.write_all(&event_bytes)?;
+                    writer.write_all(b"}\n")?;
+                    next_sequence = next_sequence.saturating_add(1);
+                }
+                writer.flush()?;
             }
             wal.sync_data()?;
             self.wal_sequence = next_sequence.saturating_sub(1);
-            self.wal_valid_bytes = wal.stream_position()?;
-        }
+            let pos = wal.stream_position()?;
+            self.wal_valid_bytes = pos;
+            pos
+        };
         self.pending_events.clear();
 
-        let wal_bytes = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
         if wal_bytes > 16 * 1024 * 1024 {
             self.compact_snapshot(&wal_path)?;
         }
@@ -599,7 +647,7 @@ impl RootCache {
         }
     }
 
-    fn compact_snapshot(&self, wal_path: &Path) -> Result<()> {
+    fn compact_snapshot(&mut self, wal_path: &Path) -> Result<()> {
         let path = Self::storage_path(&self.root)?;
         let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
         let bytes = serde_json::to_vec(self)?;
@@ -621,6 +669,8 @@ impl RootCache {
             .mode(0o600)
             .open(wal_path)?;
         wal.sync_all()?;
+        self.wal_valid_bytes = 0;
+        self.last_snapshot_stamp = Self::snapshot_stamp(&self.root);
         Ok(())
     }
 
@@ -648,38 +698,14 @@ impl RootCache {
     }
 
     pub fn estimated_bytes(&self) -> usize {
-        let record_bytes = |record: &CachedTestRecord| {
-            record.test_file.len()
-                + record.dep_hash.len()
-                + record.output_snippet.len()
-                + record.environment_hash.len()
-                + record.tctx_version.len()
-                + record.runner_mode.len()
-                + record.failed_nodeids.iter().map(String::len).sum::<usize>()
-                + record
-                    .dynamic_dependencies
-                    .iter()
-                    .map(String::len)
-                    .sum::<usize>()
-                + record
-                    .node_results
-                    .values()
-                    .map(|node| {
-                        node.nodeid.len()
-                            + node.output_snippet.len()
-                            + std::mem::size_of::<CachedNodeResult>()
-                    })
-                    .sum::<usize>()
-                + std::mem::size_of::<CachedTestRecord>()
-        };
         self.latest_by_file
             .values()
-            .map(record_bytes)
+            .map(record_estimated_bytes)
             .sum::<usize>()
             .saturating_add(
                 self.history_by_key
                     .values()
-                    .map(record_bytes)
+                    .map(record_estimated_bytes)
                     .sum::<usize>(),
             )
             .saturating_add(self.quarantined_keys.iter().map(String::len).sum::<usize>())
@@ -697,6 +723,31 @@ impl RootCache {
     pub fn has_pending_events(&self) -> bool {
         !self.pending_events.is_empty()
     }
+}
+
+fn record_estimated_bytes(record: &CachedTestRecord) -> usize {
+    record.test_file.len()
+        + record.dep_hash.len()
+        + record.output_snippet.len()
+        + record.environment_hash.len()
+        + record.tctx_version.len()
+        + record.runner_mode.len()
+        + record.failed_nodeids.iter().map(String::len).sum::<usize>()
+        + record
+            .dynamic_dependencies
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+        + record
+            .node_results
+            .values()
+            .map(|node| {
+                node.nodeid.len()
+                    + node.output_snippet.len()
+                    + std::mem::size_of::<CachedNodeResult>()
+            })
+            .sum::<usize>()
+        + std::mem::size_of::<CachedTestRecord>()
 }
 
 fn truncate_utf8(value: &mut String, max_bytes: usize) {
