@@ -52,6 +52,20 @@ impl Spec {
         }
         detect_pytest_cmd(&self.root, self.managed_parent.as_deref())
     }
+
+    pub fn effective_cargo_cmd(&self) -> Vec<String> {
+        detect_cargo_cmd(&self.root)
+    }
+}
+
+pub fn detect_cargo_cmd(_root: &Path) -> Vec<String> {
+    if let Some(env_bin) = std::env::var_os("TCTX_CARGO_BIN") {
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            return vec![p.to_string_lossy().into_owned()];
+        }
+    }
+    vec!["cargo".to_string()]
 }
 
 pub fn detect_pytest_cmd(root: &Path, managed_parent: Option<&Path>) -> Vec<String> {

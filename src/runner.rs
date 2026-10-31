@@ -126,7 +126,8 @@ fn test_resource_keys(graph: &DependencyGraph, test_file: &str) -> BTreeSet<Stri
     let Some(node) = graph.files.get(test_file) else {
         return BTreeSet::new();
     };
-    node.parsed
+    let mut keys: BTreeSet<String> = node
+        .parsed
         .markers
         .iter()
         .chain(node.parsed.module_markers.iter())
@@ -142,7 +143,11 @@ fn test_resource_keys(graph: &DependencyGraph, test_file: &str) -> BTreeSet<Stri
                     .then(|| marker.clone())
                 })
         })
-        .collect()
+        .collect();
+    if test_file.ends_with(".rs") {
+        keys.insert("cargo_build".to_string());
+    }
+    keys
 }
 
 fn background_capacity_available(max_ratio_percent: usize) -> bool {
@@ -222,7 +227,8 @@ impl ManagedRoot {
         if runtime_changed {
             graph.recompute_edges();
         }
-        graph.apply_environment_hash(environment_fingerprint(&spec));
+        let env_hash = environment_fingerprint_for_graph(&spec, &graph);
+        graph.apply_environment_hash(env_hash);
 
         // Queue background execution for dirty git files (or all uncached tests when suite <= 32 files)
         let mut pending_queue = VecDeque::new();
@@ -627,6 +633,7 @@ impl ManagedRoot {
 
             let files_only: Vec<String> = batch.iter().map(|(f, _)| f.clone()).collect();
             let batch_map: BTreeMap<String, String> = batch.iter().cloned().collect();
+            let plugins = pytest_plugin_manifest_for_targets(&spec, &files_only);
             let exec_res = execute_pytest_batch(
                 &spec,
                 &files_only,
@@ -640,7 +647,7 @@ impl ManagedRoot {
                 Some(&self.active_pgids),
                 &preload_modules,
                 &environment_hash,
-                &pytest_plugin_manifest(&spec),
+                &plugins,
                 capture_dynamic_dependencies,
             );
             if self.cancel_requested.swap(false, Ordering::AcqRel) {
@@ -901,7 +908,7 @@ impl ManagedRoot {
             guard.last_safety_scan = Instant::now();
         }
         if guard.last_environment_check.elapsed() >= Duration::from_secs(60) {
-            let environment_hash = environment_fingerprint(&guard.spec);
+            let environment_hash = environment_fingerprint_for_graph(&guard.spec, &guard.graph);
             guard.graph.apply_environment_hash(environment_hash);
             guard.last_environment_check = Instant::now();
         }
@@ -981,6 +988,7 @@ impl ManagedRoot {
                 Self::enqueue_affected_locked(guard, affected);
             }
         }
+        guard.graph.refresh_referenced_env_hashes();
     }
 
     pub fn sync(&self, wait_background: bool) -> Result<serde_json::Value> {
@@ -989,7 +997,7 @@ impl ManagedRoot {
             guard.last_activity = Instant::now();
             guard.graph = DependencyGraph::build(&guard.workspace, &guard.spec.policy)?;
             guard.generation = guard.generation.saturating_add(1);
-            let environment_hash = environment_fingerprint(&guard.spec);
+            let environment_hash = environment_fingerprint_for_graph(&guard.spec, &guard.graph);
             guard.graph.apply_environment_hash(environment_hash);
             if guard.spec.policy.background_enabled {
                 let candidates: Vec<(String, String)> = guard
@@ -1088,6 +1096,25 @@ impl ManagedRoot {
         }
         let root = guard.workspace.root.clone();
         let pytest_cmd = guard.spec.effective_pytest_cmd();
+        let cargo_cmd = guard.spec.effective_cargo_cmd();
+        let indexed_rust_files = guard
+            .graph
+            .files
+            .keys()
+            .filter(|k| k.ends_with(".rs"))
+            .count();
+        let total_rust_test_files = guard
+            .graph
+            .dep_hash_for_test
+            .keys()
+            .filter(|k| k.ends_with(".rs"))
+            .count();
+        let total_python_test_files = guard
+            .graph
+            .dep_hash_for_test
+            .keys()
+            .filter(|k| k.ends_with(".py"))
+            .count();
         let background_safe_only = guard.spec.policy.background_safe_only;
         let background_deferred = guard.background_runs_deferred_load;
         let generation = guard.generation;
@@ -1104,8 +1131,12 @@ impl ManagedRoot {
         let payload = serde_json::json!({
             "root": root,
             "pytest_cmd": pytest_cmd,
+            "cargo_cmd": cargo_cmd,
             "indexed_python_files": guard.graph.files.len(),
+            "indexed_rust_files": indexed_rust_files,
             "total_test_files": total_tests,
+            "total_python_test_files": total_python_test_files,
+            "total_rust_test_files": total_rust_test_files,
             "cached_passed_files": cached_passed,
             "cached_failed_files": cached_failed,
             "uncached_or_stale_files": uncached,
@@ -1283,8 +1314,14 @@ impl ManagedRoot {
 
             if target_test_files.is_empty() {
                 if !req.targets.is_empty() {
+                    let suggestions = guard.graph.suggest_closest_targets(&req.targets);
+                    let hint = if suggestions.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; did_you_mean=[{}]", suggestions.join(", "))
+                    };
                     return Err(invalid(format!(
-                        "NO_TESTS_MATCHED targets={}; check pytest python_files/testpaths configuration or target spelling",
+                        "NO_TESTS_MATCHED targets={}; check pytest python_files/testpaths or cargo test targets configuration or target spelling{hint}",
                         req.targets.join(",")
                     ))
                     .into());
@@ -1378,21 +1415,30 @@ impl ManagedRoot {
                         }
                     })
                     .collect();
+                let is_node_cache_eligible = guard.graph.files.get(tf).is_some_and(|node| {
+                    node.parsed
+                        .module_markers
+                        .iter()
+                        .any(|marker| marker == "node_cache_safe")
+                        || (tf.ends_with(".rs")
+                            && !node
+                                .parsed
+                                .markers
+                                .iter()
+                                .any(|marker| marker == "serial"))
+                });
                 if !req.no_cache
                     && !requested_nodeids.is_empty()
-                    && guard.graph.files.get(tf).is_some_and(|node| {
-                        node.parsed
-                            .module_markers
-                            .iter()
-                            .any(|marker| marker == "node_cache_safe")
-                    })
+                    && is_node_cache_eligible
                     && let Some(record) = guard.cache.get_matching(tf, &dep_hash)
                 {
                     let nodes: Option<Vec<_>> = requested_nodeids
                         .iter()
                         .map(|nodeid| record.node_results.get(nodeid))
                         .collect();
-                    if let Some(nodes) = nodes {
+                    if let Some(nodes) = nodes
+                        && (nodes.iter().all(|n| n.outcome.is_green()) || !req.rerun_failed)
+                    {
                         let mut passed = 0;
                         let mut failed = 0;
                         let mut skipped = 0;
@@ -1472,6 +1518,9 @@ impl ManagedRoot {
                 to_execute.push(tf.clone());
             }
 
+            // Prioritize previously failed test files first (Fail-First scheduling), then faster files
+            sort_targets_fail_first(&mut to_execute, &guard.cache);
+
             if !cached_summaries.is_empty() {
                 guard.cache.total_cache_hits = guard
                     .cache
@@ -1504,7 +1553,7 @@ impl ManagedRoot {
                 to_execute.clone()
             };
 
-            let plugin_manifest = pytest_plugin_manifest(&spec);
+            let plugin_manifest = pytest_plugin_manifest_for_targets(&spec, &invocation_targets);
             let exec_res = if parallel_delta && invocation_targets.len() > 1 {
                 execute_pytest_parallel(
                     &spec,
@@ -1725,13 +1774,43 @@ fn flight_key(test_file: &str, dep_hash: &str) -> String {
     format!("{test_file}@{dep_hash}")
 }
 
+pub fn sort_targets_fail_first(targets: &mut [String], cache: &RootCache) {
+    targets.sort_by_key(|tf| {
+        let prev_failed = cache
+            .latest_by_file
+            .get(tf)
+            .is_some_and(|rec| !rec.outcome.is_green());
+        let prev_dur = cache
+            .latest_by_file
+            .get(tf)
+            .map(|rec| rec.duration_ms)
+            .unwrap_or(u64::MAX / 2);
+        (!prev_failed, prev_dur, tf.clone())
+    });
+}
+
 fn is_source_changed_error(error: &(dyn std::error::Error + 'static)) -> bool {
     error.to_string().starts_with("SOURCE_CHANGED_DURING_TEST")
 }
 
+#[cfg(test)]
 fn environment_fingerprint(spec: &Spec) -> String {
+    environment_fingerprint_with_python(spec, true)
+}
+
+fn environment_fingerprint_for_graph(spec: &Spec, graph: &DependencyGraph) -> String {
+    let has_python =
+        !spec.pytest_cmd.is_empty() || graph.files.keys().any(|path| path.ends_with(".py"));
+    environment_fingerprint_with_python(spec, has_python)
+}
+
+fn environment_fingerprint_with_python(spec: &Spec, include_python: bool) -> String {
     let pytest_cmd = spec.effective_pytest_cmd();
-    let (runtime_identity, plugins) = python_runtime_identity(spec);
+    let (runtime_identity, plugins) = if include_python {
+        python_runtime_identity(spec)
+    } else {
+        ("rust-only".to_string(), Vec::new())
+    };
     let mut evidence = Vec::new();
     evidence.extend_from_slice(b"tctx-env-v4\n");
     evidence.extend_from_slice(env!("CARGO_PKG_VERSION").as_bytes());
@@ -1754,6 +1833,8 @@ fn environment_fingerprint(spec: &Spec) -> String {
         "LANG".to_string(),
         "LC_ALL".to_string(),
         "PYTEST_ADDOPTS".to_string(),
+        "RUSTFLAGS".to_string(),
+        "CARGO_TARGET_DIR".to_string(),
     ];
     if let Some(extra) = std::env::var_os("TCTX_ENV_KEYS") {
         env_keys.extend(
@@ -1785,6 +1866,17 @@ fn environment_fingerprint(spec: &Spec) -> String {
 
 fn pytest_plugin_manifest(spec: &Spec) -> Vec<String> {
     python_runtime_identity(spec).1
+}
+
+fn pytest_plugin_manifest_for_targets(spec: &Spec, targets: &[String]) -> Vec<String> {
+    if targets
+        .iter()
+        .any(|t| !t.split("::").next().unwrap_or(t).ends_with(".rs"))
+    {
+        pytest_plugin_manifest(spec)
+    } else {
+        Vec::new()
+    }
 }
 
 #[derive(Clone)]
@@ -2021,6 +2113,78 @@ fn execute_pytest_batch(
     pytest_plugins: &[String],
     capture_dynamic_dependencies: bool,
 ) -> Result<(Vec<CachedTestRecord>, String)> {
+    let rs_targets: Vec<String> = invocation_targets
+        .iter()
+        .filter(|t| t.split("::").next().unwrap_or(t).ends_with(".rs"))
+        .cloned()
+        .collect();
+    let py_targets: Vec<String> = invocation_targets
+        .iter()
+        .filter(|t| !t.split("::").next().unwrap_or(t).ends_with(".rs"))
+        .cloned()
+        .collect();
+
+    if !rs_targets.is_empty() && py_targets.is_empty() {
+        return execute_cargo_test_batch(
+            spec,
+            &rs_targets,
+            dep_hashes,
+            k_expr,
+            mark_expr,
+            extra_args,
+            source_label,
+            active_pgid,
+            active_pgids,
+            environment_hash,
+        );
+    } else if !rs_targets.is_empty() && !py_targets.is_empty() {
+        let rs_hashes: BTreeMap<String, String> = dep_hashes
+            .iter()
+            .filter(|(k, _)| k.ends_with(".rs"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let py_hashes: BTreeMap<String, String> = dep_hashes
+            .iter()
+            .filter(|(k, _)| !k.ends_with(".rs"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let (mut rs_recs, rs_out) = execute_cargo_test_batch(
+            spec,
+            &rs_targets,
+            &rs_hashes,
+            k_expr,
+            mark_expr,
+            extra_args,
+            source_label,
+            active_pgid,
+            active_pgids,
+            environment_hash,
+        )?;
+        let (mut py_recs, py_out) = execute_pytest_batch(
+            spec,
+            &py_targets,
+            &py_hashes,
+            k_expr,
+            mark_expr,
+            extra_args,
+            source_label,
+            zygote_slot,
+            active_pgid,
+            active_pgids,
+            preload_modules,
+            environment_hash,
+            pytest_plugins,
+            capture_dynamic_dependencies,
+        )?;
+        rs_recs.append(&mut py_recs);
+        let combined = match (rs_out.trim().is_empty(), py_out.trim().is_empty()) {
+            (true, _) => py_out,
+            (_, true) => rs_out,
+            (false, false) => format!("{}\n{}", rs_out.trim(), py_out.trim()),
+        };
+        return Ok((rs_recs, combined));
+    }
+
     let run_started_unix_ms = now_unix_ms();
     let pytest_cmd = spec.effective_pytest_cmd();
     let Some((program, base_args)) = pytest_cmd.split_first() else {
@@ -2243,6 +2407,272 @@ fn execute_pytest_batch(
     }
 
     Ok((records, snippet))
+}
+
+fn rust_module_filter_for_file(test_file: &str) -> Option<String> {
+    let rel_after_src = if let Some(rest) = test_file.strip_prefix("src/") {
+        rest
+    } else if let Some((_, rest)) = test_file.rsplit_once("/src/") {
+        rest
+    } else {
+        return None;
+    };
+    if matches!(rel_after_src, "lib.rs" | "main.rs") || rel_after_src.starts_with("bin/") {
+        return None;
+    }
+    let stripped = if let Some(s) = rel_after_src.strip_suffix("/mod.rs") {
+        s
+    } else {
+        rel_after_src.strip_suffix(".rs")?
+    };
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(format!("{}::", stripped.replace('/', "::")))
+    }
+}
+
+fn parse_cargo_test_output(
+    combined_out: &str,
+    test_file: &str,
+    duration_ms: u64,
+    overall_success: bool,
+) -> FileXmlStats {
+    let mut stats = FileXmlStats {
+        duration_ms: duration_ms.max(1),
+        ..FileXmlStats::default()
+    };
+    let mut cases: Vec<(String, TestOutcome)> = Vec::new();
+    for raw_line in combined_out.lines() {
+        let line = raw_line.trim();
+        let Some(rest) = line.strip_prefix("test ") else {
+            continue;
+        };
+        let Some((name_part, status_part)) = rest.rsplit_once(" ... ") else {
+            continue;
+        };
+        let test_name = name_part.trim();
+        if test_name.is_empty() || test_name.contains(' ') {
+            continue;
+        }
+        let status = status_part.trim();
+        let outcome = if status == "ok" {
+            stats.passed += 1;
+            TestOutcome::Passed
+        } else if status == "FAILED" {
+            stats.failed += 1;
+            TestOutcome::Failed
+        } else if status == "ignored" || status.starts_with("ignored,") {
+            stats.skipped += 1;
+            TestOutcome::Skipped
+        } else {
+            continue;
+        };
+        cases.push((test_name.to_string(), outcome));
+    }
+
+    let case_count = cases.len().max(1) as u64;
+    let per_case_ms = (duration_ms / case_count).max(1);
+    let snippet = truncate_str(combined_out, 2048);
+
+    for (full_name, outcome) in cases {
+        let short_name = full_name.rsplit("::").next().unwrap_or(&full_name);
+        let primary_nodeid = format!("{test_file}::{short_name}");
+        let full_nodeid = format!("{test_file}::{full_name}");
+        if outcome == TestOutcome::Failed && !stats.failed_nodeids.contains(&primary_nodeid) {
+            stats.failed_nodeids.push(primary_nodeid.clone());
+        }
+        let out_snip = if outcome.is_green() {
+            String::new()
+        } else {
+            snippet.clone()
+        };
+        stats.node_results.insert(
+            primary_nodeid.clone(),
+            CachedNodeResult {
+                nodeid: primary_nodeid,
+                outcome,
+                duration_ms: per_case_ms,
+                output_snippet: out_snip.clone(),
+            },
+        );
+        if full_nodeid != format!("{test_file}::{short_name}") {
+            stats.node_results.insert(
+                full_nodeid.clone(),
+                CachedNodeResult {
+                    nodeid: full_nodeid,
+                    outcome,
+                    duration_ms: per_case_ms,
+                    output_snippet: out_snip,
+                },
+            );
+        }
+    }
+
+    if stats.passed == 0 && stats.failed == 0 && stats.skipped == 0 && !overall_success {
+        if combined_out.contains("error[E") || combined_out.contains("could not compile") {
+            stats.errors = 1;
+        } else {
+            stats.failed = 1;
+        }
+        stats.failed_nodeids.push(test_file.to_string());
+    }
+
+    stats
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_cargo_test_batch(
+    spec: &Spec,
+    invocation_targets: &[String],
+    dep_hashes: &BTreeMap<String, String>,
+    k_expr: Option<&str>,
+    mark_expr: Option<&str>,
+    extra_args: &[String],
+    source_label: &str,
+    active_pgid: Option<&AtomicI32>,
+    active_pgids: Option<&Mutex<BTreeSet<i32>>>,
+    environment_hash: &str,
+) -> Result<(Vec<CachedTestRecord>, String)> {
+    let cargo_cmd = spec.effective_cargo_cmd();
+    let Some((program, base_args)) = cargo_cmd.split_first() else {
+        return Err(invalid("empty cargo_cmd").into());
+    };
+    let timeout = Duration::from_secs(spec.policy.pytest_timeout_secs);
+    let mut records = Vec::new();
+    let mut all_outputs = Vec::new();
+
+    for (test_file, dep_hash) in dep_hashes {
+        let run_started_unix_ms = now_unix_ms();
+        let crate_dir = crate::ast_graph::rust_crate_dir(test_file);
+        let workdir = if crate_dir.is_empty() {
+            spec.root.clone()
+        } else {
+            spec.root.join(&crate_dir)
+        };
+        let explicit_node_filter: Option<String> = invocation_targets.iter().find_map(|t| {
+            let (f, node) = t.split_once("::")?;
+            let norm_f = f.trim().trim_start_matches("./").replace('\\', "/");
+            if &norm_f == test_file {
+                Some(node.to_string())
+            } else {
+                None
+            }
+        });
+
+        let mut command = Command::new(program);
+        command.current_dir(&workdir);
+        command.args(base_args);
+        command.arg("test");
+
+        if crate::ast_graph::is_rust_integration_test_path(test_file) {
+            if let Some(stem) = Path::new(test_file).file_stem().and_then(|s| s.to_str()) {
+                command.arg("--test").arg(stem);
+            }
+        } else if test_file.ends_with("src/main.rs") || test_file == "src/main.rs" {
+            command.arg("--bins");
+        } else if let Some((_, bin_rel)) = test_file.rsplit_once("src/bin/")
+            && let Some(stem) = Path::new(bin_rel).file_stem().and_then(|s| s.to_str())
+        {
+            command.arg("--bin").arg(stem);
+        } else if workdir.join("src/lib.rs").is_file() {
+            command.arg("--lib");
+        } else {
+            command.arg("--bins");
+        }
+
+        let filter_arg = explicit_node_filter
+            .or_else(|| k_expr.map(ToOwned::to_owned))
+            .or_else(|| rust_module_filter_for_file(test_file));
+        if let Some(ref f) = filter_arg
+            && !f.trim().is_empty()
+        {
+            command.arg(f);
+        }
+        for arg in extra_args {
+            command.arg(arg);
+        }
+        if mark_expr.is_some_and(|m| m == "ignore" || m == "ignored") {
+            command.arg("--").arg("--ignored");
+        }
+
+        let output = run_command_with_timeout_tracked(
+            &mut command,
+            timeout,
+            2 * 1024 * 1024,
+            active_pgid,
+            active_pgids,
+        )?;
+        if output.timed_out {
+            return Err(invalid(format!(
+                "cargo test execution timed out after {}s",
+                spec.policy.pytest_timeout_secs
+            ))
+            .into());
+        }
+        if output.cancelled {
+            return Err(
+                invalid("TEST_CANCELLED: cargo test child process group was terminated").into(),
+            );
+        }
+
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        let combined_out = match (stdout_str.trim().is_empty(), stderr_str.trim().is_empty()) {
+            (true, _) => stderr_str.to_string(),
+            (_, true) => stdout_str.to_string(),
+            (false, false) => format!("{}\n{}", stdout_str.trim(), stderr_str.trim()),
+        };
+        let snippet = truncate_str(&combined_out, 8192);
+        if !snippet.trim().is_empty() {
+            all_outputs.push(snippet.clone());
+        }
+        let overall_success = output.status.success();
+        let stats =
+            parse_cargo_test_output(&combined_out, test_file, output.duration_ms, overall_success);
+        let outcome = if stats.failed > 0 {
+            TestOutcome::Failed
+        } else if stats.errors > 0 {
+            TestOutcome::Error
+        } else if stats.passed > 0 && stats.skipped == 0 {
+            TestOutcome::Passed
+        } else if stats.skipped > 0 && overall_success {
+            TestOutcome::Skipped
+        } else if overall_success {
+            TestOutcome::Passed
+        } else {
+            TestOutcome::Failed
+        };
+        let now = now_unix_ms();
+        records.push(CachedTestRecord {
+            test_file: test_file.clone(),
+            dep_hash: dep_hash.clone(),
+            outcome,
+            passed: stats.passed,
+            failed: stats.failed,
+            skipped: stats.skipped,
+            errors: stats.errors,
+            duration_ms: stats.duration_ms,
+            failed_nodeids: stats.failed_nodeids,
+            output_snippet: if outcome.is_green() {
+                String::new()
+            } else {
+                snippet
+            },
+            updated_unix_ms: now,
+            source: source_label.to_string(),
+            environment_hash: environment_hash.to_string(),
+            tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+            runner_mode: "cargo_test".to_string(),
+            started_unix_ms: run_started_unix_ms,
+            completed_unix_ms: now,
+            dynamic_dependencies: Vec::new(),
+            dynamic_dependencies_complete: true,
+            node_results: stats.node_results,
+        });
+    }
+
+    Ok((records, all_outputs.join("\n")))
 }
 
 fn truncate_str(s: &str, max_bytes: usize) -> String {
@@ -2654,5 +3084,118 @@ mod tests {
         let keys = test_resource_keys(&graph, "test_db.py");
         assert!(keys.contains("postgres"));
         assert!(keys.contains("serial"));
+    }
+
+    #[test]
+    fn parses_cargo_test_output_and_compile_errors_with_node_results() {
+        let out = r#"
+running 3 tests
+test math::tests::test_add_unit ... ok
+test math::tests::test_sub_unit ... FAILED
+test math::tests::test_slow ... ignored, requires cluster
+
+failures:
+    math::tests::test_sub_unit
+
+test result: FAILED. 1 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+"#;
+        let stats = parse_cargo_test_output(out, "src/math.rs", 15, false);
+        assert_eq!(stats.passed, 1);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.skipped, 1);
+        assert_eq!(stats.errors, 0);
+        assert_eq!(
+            stats.failed_nodeids,
+            vec!["src/math.rs::test_sub_unit".to_string()]
+        );
+        assert_eq!(
+            stats.node_results["src/math.rs::test_add_unit"].outcome,
+            TestOutcome::Passed
+        );
+        assert_eq!(
+            stats.node_results["src/math.rs::math::tests::test_add_unit"].outcome,
+            TestOutcome::Passed
+        );
+
+        let compile_err = "error[E0425]: cannot find value `missing` in this scope\nerror: could not compile `sample`";
+        let err_stats = parse_cargo_test_output(compile_err, "src/lib.rs", 20, false);
+        assert_eq!(err_stats.errors, 1);
+        assert_eq!(err_stats.failed_nodeids, vec!["src/lib.rs".to_string()]);
+        assert_eq!(
+            rust_module_filter_for_file("src/engine/parser.rs"),
+            Some("engine::parser::".to_string())
+        );
+        assert_eq!(rust_module_filter_for_file("src/lib.rs"), None);
+    }
+
+    #[test]
+    fn fail_first_scheduler_orders_previously_failed_tests_before_passing_and_slow_tests() {
+        let root = tempfile::tempdir().unwrap();
+        let mut cache = RootCache::new(root.path().to_path_buf());
+        let policy = crate::policy::MemoryPolicy::default();
+        cache.insert(
+            CachedTestRecord {
+                test_file: "tests/test_slow_pass.py".to_string(),
+                dep_hash: "h1".to_string(),
+                outcome: TestOutcome::Passed,
+                passed: 1,
+                failed: 0,
+                skipped: 0,
+                errors: 0,
+                duration_ms: 800,
+                failed_nodeids: Vec::new(),
+                output_snippet: String::new(),
+                updated_unix_ms: 100,
+                source: "on_demand".to_string(),
+                environment_hash: String::new(),
+                tctx_version: String::new(),
+                runner_mode: String::new(),
+                started_unix_ms: 0,
+                completed_unix_ms: 100,
+                dynamic_dependencies: Vec::new(),
+                dynamic_dependencies_complete: true,
+                node_results: BTreeMap::new(),
+            },
+            &policy,
+        );
+        cache.insert(
+            CachedTestRecord {
+                test_file: "tests/test_prev_failed.rs".to_string(),
+                dep_hash: "h2".to_string(),
+                outcome: TestOutcome::Failed,
+                passed: 0,
+                failed: 1,
+                skipped: 0,
+                errors: 0,
+                duration_ms: 500,
+                failed_nodeids: vec!["tests/test_prev_failed.rs::test_bug".to_string()],
+                output_snippet: "assertion failed".to_string(),
+                updated_unix_ms: 200,
+                source: "on_demand".to_string(),
+                environment_hash: String::new(),
+                tctx_version: String::new(),
+                runner_mode: String::new(),
+                started_unix_ms: 100,
+                completed_unix_ms: 200,
+                dynamic_dependencies: Vec::new(),
+                dynamic_dependencies_complete: true,
+                node_results: BTreeMap::new(),
+            },
+            &policy,
+        );
+        let mut targets = vec![
+            "tests/test_slow_pass.py".to_string(),
+            "tests/test_unknown.py".to_string(),
+            "tests/test_prev_failed.rs".to_string(),
+        ];
+        sort_targets_fail_first(&mut targets, &cache);
+        assert_eq!(
+            targets,
+            vec![
+                "tests/test_prev_failed.rs".to_string(),
+                "tests/test_slow_pass.py".to_string(),
+                "tests/test_unknown.py".to_string(),
+            ]
+        );
     }
 }

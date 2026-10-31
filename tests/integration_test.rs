@@ -428,6 +428,110 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     let xml = std::fs::read_to_string(repo.join("report.xml")).unwrap();
     assert_eq!(xml.matches("<testcase ").count(), 240);
     unstable_root.shutdown();
+
+    // 13. End-to-end Rust (`cargo test`) + Python (`pytest`) hybrid workspace execution, node cache, and delta run.
+    let rust_repo = temp.path().join("rust_hybrid_repo");
+    std::fs::create_dir_all(&rust_repo).unwrap();
+    write_file(
+        &rust_repo,
+        "Cargo.toml",
+        "[package]\nname = \"mini_calc\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write_file(&rust_repo, "src/lib.rs", "pub mod calc;\n");
+    write_file(
+        &rust_repo,
+        "src/calc.rs",
+        "pub fn mul(a: i32, b: i32) -> i32 {\n    a * b\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn test_mul_unit() {\n        assert_eq!(mul(3, 4), 12);\n    }\n}\n",
+    );
+    write_file(
+        &rust_repo,
+        "tests/calc_integration.rs",
+        "use mini_calc::calc::mul;\n\n#[test]\nfn test_mul_integration() {\n    assert_eq!(mul(6, 7), 42);\n}\n",
+    );
+    write_file(
+        &rust_repo,
+        "tests/test_py_side.py",
+        "def test_py_ok():\n    assert 10 + 10 == 20\n",
+    );
+
+    let rust_spec = catalog::register(Spec {
+        root: rust_repo.clone(),
+        scopes: vec![".".to_string()],
+        globs: Vec::new(),
+        excludes: Vec::new(),
+        default_excludes: true,
+        pytest_cmd: Vec::new(),
+        policy: MemoryPolicy {
+            background_enabled: false,
+            ..MemoryPolicy::default()
+        },
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+    let rust_managed = ManagedRoot::load(rust_spec).unwrap();
+    let st = rust_managed.status();
+    assert_eq!(st["indexed_rust_files"].as_u64(), Some(3));
+    assert_eq!(st["total_rust_test_files"].as_u64(), Some(2));
+    assert_eq!(st["total_python_test_files"].as_u64(), Some(1));
+
+    let calc_graph = rust_managed.graph_info("src/calc.rs").unwrap();
+    assert_eq!(calc_graph.language, "rust");
+    assert_eq!(calc_graph.test_symbols, vec!["test_mul_unit".to_string()]);
+
+    let first_hybrid = rust_managed.run_tests(&TestRunRequest::default()).unwrap();
+    assert_eq!(first_hybrid.status, "passed");
+    assert_eq!(first_hybrid.mode, "full_run");
+    assert_eq!(first_hybrid.executed_files_count, 3);
+    assert_eq!(first_hybrid.passed, 3);
+
+    let second_hybrid = rust_managed.run_tests(&TestRunRequest::default()).unwrap();
+    assert_eq!(second_hybrid.status, "passed");
+    assert_eq!(second_hybrid.mode, "instant_cache_hit");
+    assert_eq!(second_hybrid.cached_files_count, 3);
+    assert_eq!(second_hybrid.executed_files_count, 0);
+
+    // Rust node-level cache hit (`src/calc.rs::test_mul_unit`) returns immediately from cache
+    let rust_node_hit = rust_managed
+        .run_tests(&TestRunRequest {
+            targets: vec!["src/calc.rs::test_mul_unit".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap();
+    assert_eq!(rust_node_hit.mode, "instant_cache_hit");
+    assert_eq!(rust_node_hit.passed, 1);
+    assert_eq!(rust_node_hit.executed_files_count, 0);
+
+    // Editing `src/calc.rs` invalidates only the 2 Rust test files while keeping `tests/test_py_side.py` cached!
+    write_file(
+        &rust_repo,
+        "src/calc.rs",
+        "pub fn mul(a: i32, b: i32) -> i32 {\n    (a * b) + 0\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn test_mul_unit() {\n        assert_eq!(mul(3, 4), 12);\n    }\n}\n",
+    );
+    let delta_hybrid = rust_managed.run_tests(&TestRunRequest::default()).unwrap();
+    assert_eq!(delta_hybrid.status, "passed");
+    assert_eq!(delta_hybrid.mode, "hybrid_delta");
+    assert_eq!(delta_hybrid.cached_files_count, 1);
+    assert_eq!(delta_hybrid.executed_files_count, 2);
+    assert_eq!(
+        delta_hybrid.cached_files[0].test_file,
+        "tests/test_py_side.py"
+    );
+
+    // Fuzzy did_you_mean suggestion on typo target
+    let typo_err = rust_managed
+        .run_tests(&TestRunRequest {
+            targets: vec!["tests/calc_integraton.rs".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(typo_err.contains("did_you_mean="), "{typo_err}");
+    assert!(
+        typo_err.contains("tests/calc_integration.rs"),
+        "{typo_err}"
+    );
+    rust_managed.shutdown();
 }
 
 #[test]

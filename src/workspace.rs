@@ -22,8 +22,15 @@ pub const PYTEST_CONFIG_FILES: &[&str] = &[
     "requirements.txt",
 ];
 
+pub const RUST_CONFIG_FILES: &[&str] = &[
+    "Cargo.toml",
+    "rust-toolchain.toml",
+    "rust-toolchain",
+];
+
 pub const DATA_FILE_EXTENSIONS: &[&str] = &[
-    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".sql", ".rego", ".csv",
+    ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".sql", ".rego", ".csv", ".snap",
+    ".golden", ".proto", ".graphql", ".txt",
 ];
 
 #[derive(Clone, Debug)]
@@ -88,10 +95,13 @@ impl Workspace {
         let globs = if globs.is_empty() {
             vec![
                 "*.py".to_string(),
+                "*.rs".to_string(),
                 "pyproject.toml".to_string(),
                 "pytest.ini".to_string(),
                 "setup.cfg".to_string(),
                 "tox.ini".to_string(),
+                "Cargo.toml".to_string(),
+                "rust-toolchain.toml".to_string(),
             ]
         } else {
             globs
@@ -145,6 +155,7 @@ impl Workspace {
         self.include_matcher.is_match(rel)
             || self.include_matcher.is_match(Path::new(file_name))
             || PYTEST_CONFIG_FILES.contains(&file_name)
+            || RUST_CONFIG_FILES.contains(&file_name)
     }
 
     pub fn is_permitted_data_rel(&self, rel: &Path) -> bool {
@@ -588,5 +599,18 @@ mod tests {
         assert!(workspace.is_permitted_rel(Path::new("tests/unit/test_api.py")));
         assert!(!workspace.is_permitted_rel(Path::new("src/pkg/api.py")));
         assert!(workspace.is_permitted_rel(Path::new("pyproject.toml")));
+        assert!(workspace.is_permitted_rel(Path::new("Cargo.toml")));
+    }
+
+    #[test]
+    fn default_globs_include_rust_sources_configs_and_snapshot_data_files() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(root.path(), Vec::new(), Vec::new()).unwrap();
+        assert!(workspace.is_permitted_rel(Path::new("src/lib.rs")));
+        assert!(workspace.is_permitted_rel(Path::new("tests/integration.rs")));
+        assert!(workspace.is_permitted_rel(Path::new("Cargo.toml")));
+        assert!(workspace.is_permitted_rel(Path::new("rust-toolchain.toml")));
+        assert!(workspace.is_permitted_data_rel(Path::new("snapshots/output.snap")));
+        assert!(workspace.is_permitted_data_rel(Path::new("testdata/expected.golden")));
     }
 }

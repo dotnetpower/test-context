@@ -98,10 +98,15 @@ enum Action {
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    #[command(trailing_var_arg = true)]
+    CargoTest {
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 fn main() {
-    // Support invocation via `tctx-pytest` symlink as a drop-in pytest replacement
+    // Support invocation via `tctx-pytest` or `tctx-cargo-test` symlink as a drop-in replacement
     let argv0 = std::env::args()
         .next()
         .and_then(|p| {
@@ -116,6 +121,16 @@ fn main() {
             Ok(code) => std::process::exit(code),
             Err(err) => {
                 eprintln!("tctx-pytest error: {err}");
+                std::process::exit(2);
+            }
+        }
+    }
+    if argv0 == "tctx-cargo-test" {
+        let raw_args: Vec<String> = std::env::args().skip(1).collect();
+        match run_cargo_test_dropin(PathBuf::from("."), &raw_args) {
+            Ok(code) => std::process::exit(code),
+            Err(err) => {
+                eprintln!("tctx-cargo-test error: {err}");
                 std::process::exit(2);
             }
         }
@@ -305,7 +320,88 @@ fn run() -> Result<i32> {
             Ok(if failed { 1 } else { 0 })
         }
         Action::Pytest { args: pytest_args } => run_pytest_dropin(args.root.clone(), pytest_args),
+        Action::CargoTest { args: cargo_args } => {
+            run_cargo_test_dropin(args.root.clone(), cargo_args)
+        }
     }
+}
+
+fn run_cargo_test_dropin(root: PathBuf, raw_args: &[String]) -> Result<i32> {
+    let root = root.canonicalize()?;
+    let mut targets = Vec::new();
+    let mut k: Option<String> = None;
+    let mut mark: Option<String> = None;
+    let mut no_cache = false;
+    let mut extra_args = Vec::new();
+
+    let mut i = 0usize;
+    if raw_args.first().map(String::as_str) == Some("test") {
+        i = 1;
+    }
+    while i < raw_args.len() {
+        let arg = &raw_args[i];
+        match arg.as_str() {
+            "--test" => {
+                if i + 1 < raw_args.len() {
+                    let name = &raw_args[i + 1];
+                    if name.ends_with(".rs") {
+                        targets.push(name.clone());
+                    } else {
+                        targets.push(format!("tests/{name}.rs"));
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            "--lib" => {
+                targets.push("src".to_string());
+            }
+            "--no-cache" => {
+                no_cache = true;
+            }
+            "--ignored" => {
+                mark = Some("ignore".to_string());
+            }
+            "-q" | "--quiet" | "--" => {}
+            _ if arg.starts_with('-') => {
+                extra_args.push(arg.clone());
+            }
+            _ => {
+                if arg.ends_with(".rs") || arg.contains('/') || arg.contains("::") {
+                    targets.push(arg.clone());
+                } else {
+                    targets.push(arg.clone());
+                    if k.is_none() {
+                        k = Some(arg.clone());
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let res = daemon::request_or_local(&daemon::Request {
+        root: Some(root),
+        name: "test_run".to_string(),
+        arguments: json!({
+            "targets": targets,
+            "k": k,
+            "mark": mark,
+            "no_cache": no_cache,
+            "rerun_failed": true,
+            "pytest_args": extra_args,
+        }),
+        compact: false,
+    })?;
+
+    if let Some(summary) = res.get("stdout_summary").and_then(Value::as_str) {
+        println!("{summary}");
+    } else {
+        print_json(&res)?;
+    }
+
+    let failed = res["status"].as_str() == Some("failed");
+    Ok(if failed { 1 } else { 0 })
 }
 
 fn run_pytest_dropin(root: PathBuf, raw_args: &[String]) -> Result<i32> {

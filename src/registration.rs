@@ -18,6 +18,7 @@ pub fn plan(spec: &Spec) -> Result<Value> {
         "excludes": workspace.excludes,
         "default_excludes": workspace.default_excludes,
         "pytest_cmd": spec.effective_pytest_cmd(),
+        "cargo_cmd": spec.effective_cargo_cmd(),
         "policy": spec.policy,
         "allow_worktrees": spec.allow_worktrees,
         "managed_parent": spec.managed_parent,

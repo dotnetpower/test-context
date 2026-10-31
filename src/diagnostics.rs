@@ -20,6 +20,10 @@ pub fn doctor(root: &Path) -> Result<Value> {
         .canonicalize()
         .ok()
         .and_then(|canon| catalog::resolve_spec(&canon).ok());
+    let cargo_available = std::process::Command::new("cargo")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
 
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -28,6 +32,7 @@ pub fn doctor(root: &Path) -> Result<Value> {
         "socket_exists": sock_path.exists(),
         "daemon_reachable": ping.is_some(),
         "daemon_ping": ping,
+        "cargo_available": cargo_available,
         "registered_workspaces": specs.len(),
         "current_root_registered": resolved.is_some(),
         "current_root_spec": resolved,
