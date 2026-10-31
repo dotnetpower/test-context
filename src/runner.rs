@@ -25,11 +25,24 @@ pub struct TestRunRequest {
     #[serde(default = "default_true")]
     pub rerun_failed: bool,
     pub no_cache: bool,
+    pub ruff_fix: bool,
     pub pytest_args: Vec<String>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuffDiagnostic {
+    pub file: String,
+    pub row: usize,
+    pub column: usize,
+    pub code: String,
+    pub message: String,
+    pub fixable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,6 +77,8 @@ pub struct TestRunResponse {
     pub cached_files: Vec<FileRunSummary>,
     pub executed_files: Vec<FileRunSummary>,
     pub failed_nodeids: Vec<String>,
+    #[serde(default)]
+    pub ruff_diagnostics: Vec<RuffDiagnostic>,
     pub stdout_summary: String,
 }
 
@@ -193,6 +208,8 @@ struct RootState {
     background_batches: u64,
     last_environment_check: Instant,
     prediction_enqueues: u64,
+    ruff_cache: BTreeMap<String, (String, Vec<RuffDiagnostic>)>,
+    pending_ruff_files: BTreeSet<String>,
 }
 
 pub struct ManagedRoot {
@@ -232,8 +249,15 @@ impl ManagedRoot {
 
         // Queue background execution for dirty git files (or all uncached tests when suite <= 32 files)
         let mut pending_queue = VecDeque::new();
+        let mut pending_ruff_files = BTreeSet::new();
         if spec.policy.background_enabled {
             let dirty = git_dirty_files(&workspace.root).unwrap_or_default();
+            for f in &dirty {
+                let norm = f.trim().trim_start_matches("./").replace('\\', "/");
+                if norm.ends_with(".py") && graph.files.contains_key(&norm) {
+                    pending_ruff_files.insert(norm);
+                }
+            }
             if !dirty.is_empty() {
                 for item in graph.affected_tests(&dirty) {
                     if cache
@@ -274,6 +298,8 @@ impl ManagedRoot {
             background_batches: 0,
             last_environment_check: Instant::now(),
             prediction_enqueues: 0,
+            ruff_cache: BTreeMap::new(),
+            pending_ruff_files,
         };
 
         let (fs_tx, fs_rx) = sync_channel(4096);
@@ -523,7 +549,10 @@ impl ManagedRoot {
             {
                 let mut guard = self.state.lock().expect("state lock");
                 self.drain_fs_events_locked(&mut guard);
-                while guard.pending_queue.is_empty() && !self.stopped.load(Ordering::SeqCst) {
+                while guard.pending_queue.is_empty()
+                    && guard.pending_ruff_files.is_empty()
+                    && !self.stopped.load(Ordering::SeqCst)
+                {
                     guard.background_running = false;
                     let (next_guard, _) = self
                         .condvar
@@ -540,6 +569,15 @@ impl ManagedRoot {
                 }
                 if self.stopped.load(Ordering::SeqCst) {
                     return;
+                }
+                if !guard.pending_ruff_files.is_empty() {
+                    let ruff_files: Vec<String> =
+                        std::mem::take(&mut guard.pending_ruff_files).into_iter().collect();
+                    Self::ensure_ruff_cached_locked(&mut guard, &ruff_files);
+                    if guard.pending_queue.is_empty() {
+                        guard.background_running = false;
+                        continue;
+                    }
                 }
                 let max_batch = guard.spec.policy.background_batch_size.max(1);
                 let mut sorted: Vec<String> = guard.pending_queue.drain(..).collect();
@@ -833,6 +871,8 @@ impl ManagedRoot {
                     }
                 }
             } else if !full.exists() && guard.graph.remove_file(&rel_str) {
+                guard.ruff_cache.remove(&rel_str);
+                guard.pending_ruff_files.remove(&rel_str);
                 changed_rels.push(rel_str);
                 structure_changed = true;
             }
@@ -852,6 +892,16 @@ impl ManagedRoot {
 
         if !changed_rels.is_empty() {
             guard.generation = guard.generation.saturating_add(1);
+            for rel_str in &changed_rels {
+                if matches!(
+                    Path::new(rel_str).file_name().and_then(|n| n.to_str()),
+                    Some("pyproject.toml" | "ruff.toml" | ".ruff.toml")
+                ) {
+                    guard.ruff_cache.clear();
+                } else if rel_str.ends_with(".py") && guard.graph.files.contains_key(rel_str) {
+                    guard.pending_ruff_files.insert(rel_str.clone());
+                }
+            }
             if structure_changed {
                 guard
                     .graph
@@ -1008,6 +1058,8 @@ impl ManagedRoot {
                     }
                 }
             } else if !full.exists() && guard.graph.remove_file(&rel_str) {
+                guard.ruff_cache.remove(&rel_str);
+                guard.pending_ruff_files.remove(&rel_str);
                 changed.push(rel_str);
                 structure_changed = true;
             }
@@ -1015,6 +1067,16 @@ impl ManagedRoot {
 
         if !changed.is_empty() {
             guard.generation = guard.generation.saturating_add(1);
+            for rel_str in &changed {
+                if matches!(
+                    Path::new(rel_str).file_name().and_then(|n| n.to_str()),
+                    Some("pyproject.toml" | "ruff.toml" | ".ruff.toml")
+                ) {
+                    guard.ruff_cache.clear();
+                } else if rel_str.ends_with(".py") && guard.graph.files.contains_key(rel_str) {
+                    guard.pending_ruff_files.insert(rel_str.clone());
+                }
+            }
             if structure_changed {
                 guard
                     .graph
@@ -1169,6 +1231,12 @@ impl ManagedRoot {
         let watched_directories = guard.watched_dirs.len();
         let watcher_overflow = self.fs_overflow.load(Ordering::Acquire);
         let cache_storage = guard.cache.storage_metrics();
+        let ruff_cached_files = guard.ruff_cache.len();
+        let ruff_diagnostics_count: usize = guard
+            .ruff_cache
+            .values()
+            .map(|(_, diags)| diags.len())
+            .sum();
         let payload = serde_json::json!({
             "root": root,
             "pytest_cmd": pytest_cmd,
@@ -1181,6 +1249,8 @@ impl ManagedRoot {
             "cached_passed_files": cached_passed,
             "cached_failed_files": cached_failed,
             "uncached_or_stale_files": uncached,
+            "ruff_cached_files": ruff_cached_files,
+            "ruff_diagnostics_count": ruff_diagnostics_count,
             "background_pending_queue": guard.pending_queue.len(),
             "background_in_flight": guard.in_flight.len(),
             "background_running": guard.background_running,
@@ -1243,6 +1313,16 @@ impl ManagedRoot {
             Vec::new()
         };
 
+        let py_changed: Vec<String> = changed_files
+            .iter()
+            .map(|f| f.trim().trim_start_matches("./").replace('\\', "/"))
+            .filter(|f| f.ends_with(".py"))
+            .collect();
+        if !py_changed.is_empty() {
+            Self::ensure_ruff_cached_locked(&mut guard, &py_changed);
+        }
+        let ruff_diagnostics = Self::collect_ruff_diagnostics_locked(&guard, &py_changed);
+
         let affected_modules = guard.graph.affected_modules(&changed_files);
         let affected_raw: Vec<AffectedTest> = guard.graph.affected_tests(&changed_files);
         let mut items = Vec::with_capacity(affected_raw.len());
@@ -1276,7 +1356,132 @@ impl ManagedRoot {
             "affected_modules": affected_modules,
             "total_affected_test_files": items.len(),
             "affected_tests": items,
+            "ruff_errors_count": ruff_diagnostics.len(),
+            "ruff_diagnostics": ruff_diagnostics,
         }))
+    }
+
+    pub fn check_ruff(&self, files: &[String], fix: bool) -> Result<serde_json::Value> {
+        let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+        guard.last_activity = Instant::now();
+        self.drain_fs_events_locked(&mut guard);
+        Self::ingest_explicit_paths_locked(&mut guard, files);
+        Self::maybe_safety_reconcile_locked(&mut guard);
+
+        let target_py_files: Vec<String> = if !files.is_empty() {
+            let mut set = BTreeSet::new();
+            for raw in files {
+                let norm = raw
+                    .split("::")
+                    .next()
+                    .unwrap_or(raw)
+                    .trim()
+                    .trim_start_matches("./")
+                    .trim_end_matches('/')
+                    .replace('\\', "/");
+                if norm.ends_with(".py") {
+                    set.insert(norm);
+                } else {
+                    let prefix = if norm.is_empty() || norm == "." {
+                        String::new()
+                    } else {
+                        format!("{norm}/")
+                    };
+                    for k in guard.graph.files.keys() {
+                        if k.ends_with(".py") && (prefix.is_empty() || k.starts_with(&prefix)) {
+                            set.insert(k.clone());
+                        }
+                    }
+                }
+            }
+            set.into_iter().collect()
+        } else {
+            let dirty: Vec<String> = git_dirty_files(&guard.workspace.root)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| f.trim().trim_start_matches("./").replace('\\', "/"))
+                .filter(|f| f.ends_with(".py") && guard.graph.files.contains_key(f))
+                .collect();
+            if !dirty.is_empty() {
+                dirty
+            } else {
+                guard
+                    .graph
+                    .files
+                    .keys()
+                    .filter(|k| k.ends_with(".py"))
+                    .cloned()
+                    .collect()
+            }
+        };
+
+        if fix && !target_py_files.is_empty() {
+            let _ = execute_ruff_check(&guard.spec, &target_py_files, true);
+            for f in &target_py_files {
+                guard.ruff_cache.remove(f);
+            }
+            Self::reconcile_live_files_locked(&mut guard, None);
+        }
+        Self::ensure_ruff_cached_locked(&mut guard, &target_py_files);
+        let diagnostics = Self::collect_ruff_diagnostics_locked(&guard, &target_py_files);
+        let status = if diagnostics.is_empty() {
+            "passed"
+        } else {
+            "failed"
+        };
+        Ok(serde_json::json!({
+            "root": guard.workspace.root,
+            "status": status,
+            "fixed": fix,
+            "checked_files_count": target_py_files.len(),
+            "ruff_errors_count": diagnostics.len(),
+            "ruff_diagnostics": diagnostics,
+        }))
+    }
+
+    fn ensure_ruff_cached_locked(guard: &mut RootState, py_files: &[String]) {
+        let mut uncached = Vec::new();
+        let mut expected_shas = BTreeMap::new();
+        for f in py_files {
+            if !f.ends_with(".py") {
+                continue;
+            }
+            let Some(node) = guard.graph.files.get(f) else {
+                continue;
+            };
+            let already = guard
+                .ruff_cache
+                .get(f)
+                .is_some_and(|(cached_sha, _)| cached_sha == &node.sha256);
+            if !already {
+                uncached.push(f.clone());
+                expected_shas.insert(f.clone(), node.sha256.clone());
+            }
+        }
+        if uncached.is_empty() {
+            return;
+        }
+        let by_file = execute_ruff_check(&guard.spec, &uncached, false);
+        for (file, sha) in expected_shas {
+            let diags = by_file.get(&file).cloned().unwrap_or_default();
+            guard.ruff_cache.insert(file, (sha, diags));
+        }
+    }
+
+    fn collect_ruff_diagnostics_locked(
+        guard: &RootState,
+        py_files: &[String],
+    ) -> Vec<RuffDiagnostic> {
+        let mut out = Vec::new();
+        for f in py_files {
+            if let Some(node) = guard.graph.files.get(f)
+                && let Some((cached_sha, diags)) = guard.ruff_cache.get(f)
+                && cached_sha == &node.sha256
+            {
+                out.extend(diags.iter().cloned());
+            }
+        }
+        out
     }
 
     /// Re-runs once or twice when sources were edited mid-run, so the caller receives a result for the
@@ -1320,12 +1525,44 @@ impl ManagedRoot {
         let parallel_delta: bool;
         let capture_dynamic_dependencies: bool;
         let target_test_files: Vec<String>;
+        let ruff_diagnostics: Vec<RuffDiagnostic>;
 
         {
             let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
             guard.last_activity = Instant::now();
             self.drain_fs_events_locked(&mut guard);
             Self::ingest_explicit_paths_locked(&mut guard, &req.targets);
+
+            if req.ruff_fix {
+                let mut fix_py: Vec<String> = req
+                    .targets
+                    .iter()
+                    .map(|t| {
+                        t.split("::")
+                            .next()
+                            .unwrap_or(t)
+                            .trim()
+                            .trim_start_matches("./")
+                            .replace('\\', "/")
+                    })
+                    .filter(|t| t.ends_with(".py"))
+                    .collect();
+                if fix_py.is_empty() {
+                    fix_py = guard
+                        .graph
+                        .files
+                        .keys()
+                        .filter(|k| k.ends_with(".py"))
+                        .cloned()
+                        .collect();
+                }
+                if !fix_py.is_empty() {
+                    let _ = execute_ruff_check(&guard.spec, &fix_py, true);
+                    for f in &fix_py {
+                        guard.ruff_cache.remove(f);
+                    }
+                }
+            }
 
             // 1. Resolve target test files (and reconcile live files on disk)
             Self::maybe_safety_reconcile_locked(&mut guard);
@@ -1389,6 +1626,7 @@ impl ManagedRoot {
                     cached_files: Vec::new(),
                     executed_files: Vec::new(),
                     failed_nodeids: Vec::new(),
+                    ruff_diagnostics: Vec::new(),
                     stdout_summary: "=== no tests matched in 0.00s ===".to_string(),
                 });
             }
@@ -1579,6 +1817,55 @@ impl ManagedRoot {
             } else {
                 Vec::new()
             };
+
+            let mut ruff_scope: BTreeSet<String> = BTreeSet::new();
+            for raw in &req.targets {
+                let norm = raw
+                    .split("::")
+                    .next()
+                    .unwrap_or(raw)
+                    .trim()
+                    .trim_start_matches("./")
+                    .replace('\\', "/");
+                if norm.ends_with(".py") && guard.graph.files.contains_key(&norm) {
+                    ruff_scope.insert(norm);
+                }
+            }
+            for tf in &target_test_files {
+                if tf.ends_with(".py") {
+                    ruff_scope.insert(tf.clone());
+                }
+                if let Some(ids) = guard.graph.transitive_dep_ids_for_test.get(tf) {
+                    for &id in ids {
+                        if let Some(dep_path) = guard.graph.file_index_to_path.get(id as usize)
+                            && dep_path.ends_with(".py")
+                        {
+                            ruff_scope.insert(dep_path.clone());
+                        }
+                    }
+                }
+            }
+            let ruff_scope_vec: Vec<String> = ruff_scope.into_iter().collect();
+            if req.ruff_fix || !guard.pending_ruff_files.is_empty() {
+                let pending: Vec<String> = guard
+                    .pending_ruff_files
+                    .iter()
+                    .filter(|f| ruff_scope_vec.contains(f))
+                    .cloned()
+                    .collect();
+                for f in &pending {
+                    guard.pending_ruff_files.remove(f);
+                }
+                let to_check = if req.ruff_fix {
+                    &ruff_scope_vec
+                } else {
+                    &pending
+                };
+                if !to_check.is_empty() {
+                    Self::ensure_ruff_cached_locked(&mut guard, to_check);
+                }
+            }
+            ruff_diagnostics = Self::collect_ruff_diagnostics_locked(&guard, &ruff_scope_vec);
         }
 
         // 4. Execute delta tests if any remain uncached
@@ -1772,6 +2059,20 @@ impl ManagedRoot {
             saved_ms as f64 / 1000.0
         );
         let mut output_parts = Vec::new();
+        if !ruff_diagnostics.is_empty() {
+            let mut ruff_lines = vec![format!(
+                "[ruff] {} pre-flight lint/syntax issue(s) detected (pass ruff_fix=true or run `tctx ruff --fix` to auto-fix safe rules):",
+                ruff_diagnostics.len()
+            )];
+            for diag in ruff_diagnostics.iter().take(10) {
+                let fix_tag = if diag.fixable { " [fixable]" } else { "" };
+                ruff_lines.push(format!(
+                    "  {}:{}:{}: {} {}{}",
+                    diag.file, diag.row, diag.column, diag.code, diag.message, fix_tag
+                ));
+            }
+            output_parts.push(ruff_lines.join("\n"));
+        }
         for cached_out in cached_failure_outputs {
             if !cached_out.trim().is_empty() {
                 output_parts.push(cached_out.trim().to_string());
@@ -1811,9 +2112,113 @@ impl ManagedRoot {
             cached_files: cached_summaries,
             executed_files: executed_summaries,
             failed_nodeids,
+            ruff_diagnostics,
             stdout_summary,
         })
     }
+}
+
+fn execute_ruff_check(
+    spec: &Spec,
+    rel_files: &[String],
+    fix: bool,
+) -> BTreeMap<String, Vec<RuffDiagnostic>> {
+    let by_file: BTreeMap<String, Vec<RuffDiagnostic>> = BTreeMap::new();
+    if rel_files.is_empty() {
+        return by_file;
+    }
+    let Some(ruff_cmd) = spec.effective_ruff_cmd() else {
+        return by_file;
+    };
+    let Some((program, base_args)) = ruff_cmd.split_first() else {
+        return by_file;
+    };
+    let mut command = Command::new(program);
+    command.current_dir(&spec.root);
+    command.args(base_args);
+    command.arg("check");
+    if fix {
+        command.arg("--fix");
+    }
+    command.arg("--output-format=json");
+    command.arg("--no-cache");
+    for f in rel_files {
+        command.arg(f);
+    }
+    let Ok(output) = run_command_with_timeout(&mut command, Duration::from_secs(15), 2 * 1024 * 1024)
+    else {
+        return by_file;
+    };
+    parse_ruff_json_output(&output.stdout, &spec.root, rel_files)
+}
+
+pub fn parse_ruff_json_output(
+    stdout: &[u8],
+    workspace_root: &Path,
+    known_rel_files: &[String],
+) -> BTreeMap<String, Vec<RuffDiagnostic>> {
+    let mut by_file: BTreeMap<String, Vec<RuffDiagnostic>> = BTreeMap::new();
+    let Ok(items) = serde_json::from_slice::<Vec<serde_json::Value>>(stdout) else {
+        return by_file;
+    };
+    let root_str = workspace_root.to_string_lossy().replace('\\', "/");
+    let root_prefix = format!("{}/", root_str.trim_end_matches('/'));
+
+    for item in items {
+        let raw_file = item
+            .get("filename")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .replace('\\', "/");
+        let rel_file = if let Some(stripped) = raw_file.strip_prefix(&root_prefix) {
+            stripped.to_string()
+        } else {
+            let clean = raw_file.trim_start_matches("./");
+            known_rel_files
+                .iter()
+                .find(|k| raw_file.ends_with(k.as_str()) || k.ends_with(clean))
+                .cloned()
+                .unwrap_or_else(|| clean.to_string())
+        };
+        let code = item
+            .get("code")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| item.get("name").and_then(serde_json::Value::as_str))
+            .unwrap_or("RUFF")
+            .to_string();
+        let message = item
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let row = item
+            .get("location")
+            .and_then(|l| l.get("row"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as usize;
+        let column = item
+            .get("location")
+            .and_then(|l| l.get("column"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as usize;
+        let fix_obj = item.get("fix").filter(|v| !v.is_null());
+        let fixable = fix_obj.is_some();
+        let fix_message = fix_obj
+            .and_then(|f| f.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+
+        by_file.entry(rel_file.clone()).or_default().push(RuffDiagnostic {
+            file: rel_file,
+            row,
+            column,
+            code,
+            message,
+            fixable,
+            fix_message,
+        });
+    }
+    by_file
 }
 
 fn flight_key(test_file: &str, dep_hash: &str) -> String {
@@ -3550,5 +3955,42 @@ test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             vec!["src/engine.rs::test_run".to_string()]
         );
         assert_eq!(demuxed["src/lib.rs"].passed, 1);
+    }
+
+    #[test]
+    fn parses_ruff_json_diagnostics_and_fixability() {
+        let json_bytes = br#"[
+  {
+    "code": "F401",
+    "filename": "/repo/src/pkg/service.py",
+    "fix": {
+      "applicability": "safe",
+      "message": "Remove unused import: `os`"
+    },
+    "location": { "row": 3, "column": 8 },
+    "message": "`os` imported but unused"
+  },
+  {
+    "code": "F821",
+    "filename": "/repo/src/pkg/service.py",
+    "fix": null,
+    "location": { "row": 10, "column": 12 },
+    "message": "Undefined name `missing_symbol`"
+  }
+]"#;
+        let known = vec!["src/pkg/service.py".to_string()];
+        let by_file = parse_ruff_json_output(json_bytes, Path::new("/repo"), &known);
+        let diags = &by_file["src/pkg/service.py"];
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].code, "F401");
+        assert_eq!(diags[0].row, 3);
+        assert_eq!(diags[0].column, 8);
+        assert!(diags[0].fixable);
+        assert_eq!(
+            diags[0].fix_message.as_deref(),
+            Some("Remove unused import: `os`")
+        );
+        assert_eq!(diags[1].code, "F821");
+        assert!(!diags[1].fixable);
     }
 }

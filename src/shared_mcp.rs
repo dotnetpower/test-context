@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 
-const INSTRUCTIONS: &str = "TCTX (test-context) is a local Rust AST dependency graph and speculative background pytest runner/cache. Use test_run (#tctxNativeRun) FIRST instead of running shell pytest directly: unchanged tests that already passed in the background return in < 5ms from cache, and only uncached/modified tests run. Use test_affected (#tctxNativeAffected) to see which tests are affected by edited source files and whether the background runner has already verified them.";
+const INSTRUCTIONS: &str = "TCTX (test-context) is a local Rust AST dependency graph, speculative background pytest/cargo-test runner, and content-addressed Ruff pre-flight checker. Use test_run (#tctxNativeRun) FIRST instead of running shell pytest/ruff directly: unchanged tests that already passed in the background return in < 5ms from cache, only uncached/modified tests run, and pre-flight Ruff diagnostics (with optional ruff_fix=true auto-remediation) are surfaced automatically. Use test_affected (#tctxNativeAffected) to see which tests are affected by edited source files, whether the background runner has already verified them, and any pre-checked Ruff errors.";
 
 pub fn serve(mut input: impl BufRead, mut output: impl Write) -> Result<()> {
     let default_root = std::env::current_dir().ok();

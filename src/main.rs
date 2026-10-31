@@ -91,7 +91,14 @@ enum Action {
         #[arg(long)]
         no_rerun_failed: bool,
         #[arg(long)]
+        ruff_fix: bool,
+        #[arg(long)]
         pytest_arg: Vec<String>,
+    },
+    Ruff {
+        files: Vec<String>,
+        #[arg(long)]
+        fix: bool,
     },
     #[command(trailing_var_arg = true)]
     Pytest {
@@ -299,6 +306,7 @@ fn run() -> Result<i32> {
             mark,
             no_cache,
             no_rerun_failed,
+            ruff_fix,
             pytest_arg,
         } => {
             let root = args.root.canonicalize()?;
@@ -311,7 +319,23 @@ fn run() -> Result<i32> {
                     "mark": mark,
                     "no_cache": no_cache,
                     "rerun_failed": !no_rerun_failed,
+                    "ruff_fix": ruff_fix,
                     "pytest_args": pytest_arg,
+                }),
+                compact: false,
+            })?;
+            print_json(&res)?;
+            let failed = res["status"].as_str() == Some("failed");
+            Ok(if failed { 1 } else { 0 })
+        }
+        Action::Ruff { files, fix } => {
+            let root = args.root.canonicalize()?;
+            let res = daemon::request_or_local(&daemon::Request {
+                root: Some(root),
+                name: "test_ruff".to_string(),
+                arguments: json!({
+                    "files": files,
+                    "fix": fix,
                 }),
                 compact: false,
             })?;

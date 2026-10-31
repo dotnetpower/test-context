@@ -531,6 +531,51 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         typo_err.contains("tests/calc_integration.rs"),
         "{typo_err}"
     );
+
+    // 14. Pre-flight Ruff check in `affected()` / `check_ruff()` and automatic remediation via `ruff_fix: true` in `run_tests()`.
+    if test_context::catalog::detect_ruff_cmd(&rust_repo, None).is_some() {
+        write_file(
+            &rust_repo,
+            "tests/test_py_side.py",
+            "import os\n\ndef test_py_ok():\n    assert 10 + 10 == 20\n",
+        );
+        let aff_with_ruff = rust_managed
+            .affected(&["tests/test_py_side.py".to_string()], false)
+            .unwrap();
+        assert!(
+            aff_with_ruff["ruff_errors_count"].as_u64().unwrap_or(0) >= 1,
+            "expected pre-flight F401 ruff error: {aff_with_ruff}"
+        );
+        assert!(
+            aff_with_ruff["ruff_diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"].as_str() == Some("F401") && d["fixable"].as_bool() == Some(true)),
+            "{aff_with_ruff}"
+        );
+
+        let fixed_run = rust_managed
+            .run_tests(&TestRunRequest {
+                targets: vec!["tests/test_py_side.py".to_string()],
+                ruff_fix: true,
+                ..TestRunRequest::default()
+            })
+            .unwrap();
+        assert_eq!(fixed_run.status, "passed");
+        assert!(
+            fixed_run.ruff_diagnostics.is_empty(),
+            "ruff_fix=true must auto-fix F401 before running pytest: {:?}",
+            fixed_run.ruff_diagnostics
+        );
+        let cleaned_source =
+            std::fs::read_to_string(rust_repo.join("tests/test_py_side.py")).unwrap();
+        assert!(
+            !cleaned_source.contains("import os"),
+            "unused import was not removed by ruff_fix: {cleaned_source}"
+        );
+    }
+
     rust_managed.shutdown();
 }
 

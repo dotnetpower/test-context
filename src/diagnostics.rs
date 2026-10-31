@@ -24,6 +24,7 @@ pub fn doctor(root: &Path) -> Result<Value> {
         .arg("--version")
         .output()
         .is_ok_and(|out| out.status.success());
+    let ruff_available = catalog::detect_ruff_cmd(root, None).is_some();
 
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -33,6 +34,7 @@ pub fn doctor(root: &Path) -> Result<Value> {
         "daemon_reachable": ping.is_some(),
         "daemon_ping": ping,
         "cargo_available": cargo_available,
+        "ruff_available": ruff_available,
         "registered_workspaces": specs.len(),
         "current_root_registered": resolved.is_some(),
         "current_root_spec": resolved,

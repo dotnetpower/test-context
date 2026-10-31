@@ -39,6 +39,7 @@ interface TestRunInput extends RootInput {
   mark?: string;
   rerun_failed?: boolean;
   no_cache?: boolean;
+  ruff_fix?: boolean;
   pytest_args?: string[];
 }
 
@@ -292,6 +293,9 @@ const testRunDefinition: ToolDefinition<TestRunInput> = {
       no_cache: input.no_cache ?? false,
       pytest_args: input.pytest_args ?? [],
     };
+    if (input.ruff_fix === true) {
+      args.ruff_fix = true;
+    }
     if (input.k !== undefined) {
       args.k = input.k;
     }

@@ -40,6 +40,11 @@ pub fn tools() -> Value {
                             "default": false,
                             "description": "Bypass cached pass results and force execution."
                         },
+                        "ruff_fix": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Auto-fix safe Ruff lint/import issues (ruff check --fix) on targeted Python files before running tests."
+                        },
                         "pytest_args": {
                             "type": "array",
                             "maxItems": 32,

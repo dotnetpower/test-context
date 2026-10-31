@@ -42,6 +42,16 @@ export function formatToolResult(operation: string, value: JsonValue): string {
           .join(' -> ');
         lines.push(`${file} state=${state} chain=[${chain}]`);
       }
+      if (Array.isArray(result.ruff_diagnostics) && result.ruff_diagnostics.length > 0) {
+        lines.push(`ruff_errors=${result.ruff_diagnostics.length}`);
+        for (const [idx, rawDiag] of result.ruff_diagnostics.slice(0, 10).entries()) {
+          const diag = recordValue(rawDiag, `ruff diagnostic ${idx}`);
+          const fixTag = diag.fixable === true ? ' [fixable]' : '';
+          lines.push(
+            `ruff ${stringValue(diag.file, 'file')}:${integerValue(diag.row, 'row')}:${integerValue(diag.column, 'column')} ${stringValue(diag.code, 'code')} ${stringValue(diag.message, 'message')}${fixTag}`,
+          );
+        }
+      }
       return lines.join('\n');
     }
     case 'test_status':

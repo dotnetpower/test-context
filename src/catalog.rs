@@ -56,6 +56,10 @@ impl Spec {
     pub fn effective_cargo_cmd(&self) -> Vec<String> {
         detect_cargo_cmd(&self.root)
     }
+
+    pub fn effective_ruff_cmd(&self) -> Option<Vec<String>> {
+        detect_ruff_cmd(&self.root, self.managed_parent.as_deref())
+    }
 }
 
 pub fn detect_cargo_cmd(_root: &Path) -> Vec<String> {
@@ -66,6 +70,56 @@ pub fn detect_cargo_cmd(_root: &Path) -> Vec<String> {
         }
     }
     vec!["cargo".to_string()]
+}
+
+pub fn detect_ruff_cmd(root: &Path, managed_parent: Option<&Path>) -> Option<Vec<String>> {
+    if let Some(env_bin) = std::env::var_os("TCTX_RUFF_BIN") {
+        if env_bin == "none" || env_bin == "0" {
+            return None;
+        }
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            return Some(vec![p.to_string_lossy().into_owned()]);
+        }
+    }
+    let mut candidates = vec![
+        root.join(".venv/bin/ruff"),
+        root.join("venv/bin/ruff"),
+        root.join(".env/bin/ruff"),
+    ];
+    for container in ["src", "services", "packages", "apps"] {
+        let dir = root.join(container);
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let sub = entry.path();
+                if sub.is_dir() {
+                    candidates.push(sub.join(".venv/bin/ruff"));
+                    candidates.push(sub.join("venv/bin/ruff"));
+                }
+            }
+        }
+    }
+    if let Some(parent) = managed_parent {
+        candidates.push(parent.join(".venv/bin/ruff"));
+        candidates.push(parent.join("venv/bin/ruff"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".local/bin/ruff"));
+    }
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(vec![candidate.to_string_lossy().into_owned()]);
+        }
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let cand = dir.join("ruff");
+            if cand.is_file() {
+                return Some(vec![cand.to_string_lossy().into_owned()]);
+            }
+        }
+    }
+    None
 }
 
 pub fn detect_pytest_cmd(root: &Path, managed_parent: Option<&Path>) -> Vec<String> {

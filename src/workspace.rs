@@ -20,6 +20,8 @@ pub const PYTEST_CONFIG_FILES: &[&str] = &[
     "uv.lock",
     "poetry.lock",
     "requirements.txt",
+    "ruff.toml",
+    ".ruff.toml",
 ];
 
 pub const RUST_CONFIG_FILES: &[&str] = &[

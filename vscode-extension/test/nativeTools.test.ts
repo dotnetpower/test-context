@@ -40,12 +40,24 @@ void test('formatToolResult formats test_affected output', () => {
         reason_chain: ['src/pkg/math.py', 'src/pkg/service.py', 'tests/test_service.py'],
       },
     ],
+    ruff_diagnostics: [
+      {
+        file: 'src/pkg/service.py',
+        row: 4,
+        column: 1,
+        code: 'F401',
+        message: '`os` imported but unused',
+        fixable: true,
+      },
+    ],
   });
   assert.match(text, /affected_test_files=1/);
   assert.match(
     text,
     /tests\/test_service\.py state=cached_passed chain=\[src\/pkg\/math\.py -> src\/pkg\/service\.py -> tests\/test_service\.py\]/,
   );
+  assert.match(text, /ruff_errors=1/);
+  assert.match(text, /ruff src\/pkg\/service\.py:4:1 F401 `os` imported but unused \[fixable\]/);
 });
 
 void test('status and workspace logs are readable text rather than JSON', () => {

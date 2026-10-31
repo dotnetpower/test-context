@@ -366,6 +366,7 @@ impl DaemonHub {
             "test_sync": true,
             "test_invalidate": true,
             "test_cancel": true,
+            "test_ruff": true,
             "authorized_worktrees": true,
             "request_tracing": true,
             "trace_clock": "unix_ms",
@@ -557,6 +558,30 @@ impl DaemonHub {
                 let managed = self.get_or_load_root(root_path)?;
                 let response = managed.run_tests(&run_req)?;
                 Ok(serde_json::to_value(response)?)
+            }
+            "test_ruff" => {
+                let root_path = req
+                    .root
+                    .as_deref()
+                    .ok_or_else(|| invalid("test_ruff requires a workspace root"))?;
+                let files: Vec<String> = req
+                    .arguments
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let fix = req
+                    .arguments
+                    .get("fix")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let managed = self.get_or_load_root(root_path)?;
+                managed.check_ruff(&files, fix)
             }
             other => Err(invalid(format!("unknown daemon operation: {other}")).into()),
         }
