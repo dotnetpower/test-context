@@ -1,23 +1,43 @@
-# Test Context Native for VS Code
+<p align="center">
+  <img src="resources/banner.png" alt="Test Context — instant AST test cache for AI agents" width="100%">
+</p>
 
-Native VS Code Language Model Tools for **Test Context (`tctx`)** — incremental Python AST dependency analysis, speculative background `pytest` execution, and zero-startup cached test results for GitHub Copilot.
+# Test Context by dotnetpower
 
-These Native tools are the default Test Context surface in VS Code. Use the optional MCP server only when Native extension dispatch is unavailable, such as an unattended background agent session.
+**Native VS Code Language Model Tools for Test Context (`tctx`) — incremental Python (`pytest` + `ruff`) and Rust (`cargo test`) AST dependency analysis, speculative background execution, and sub-millisecond cached test results for GitHub Copilot.**
+Publisher: **dotnetpower** (`dotnetpower.test-context-native`).
 
-For a Windows Agents window backed by WSL, install the VSIX in both the Windows FDAI profile and
-the WSL extension host. The installer performs both installations and configures the Windows
-extension to use `wsl.exe --exec tctx native-bridge`; it does not route Native tools through MCP or
-a network port.
+## Resources
 
-If the MCP Output channel reports `spawn /home/.../tctx ENOENT` from a
-`LocalProcess` host, Windows is trying to execute a Linux path from an old MCP entry.
-Run `scripts/install-vscode-extension.sh` from the repository root in WSL to keep Native as
-the default and remove installer-owned Test Context MCP registrations. Other MCP servers and
-custom commands are preserved. Reload the affected window at a safe boundary to discard its
-previous MCP discovery state. If MCP is explicitly required, use `TCTX_INSTALL_MCP=1`; the
-installer registers Windows commands through `wsl.exe --distribution ... --exec ... shared-mcp`
-and WSL commands through the Linux executable. Non-JSON configuration is left unchanged and
-requires a manual merge.
+[Repository](https://github.com/dotnetpower/test-context) ·
+[Benchmark report](https://github.com/dotnetpower/test-context/blob/main/docs/BENCHMARKS.md) ·
+[Publishing guide](docs/PUBLISHING.md) ·
+[Issues](https://github.com/dotnetpower/test-context/issues) · [License](LICENSE)
+
+## Performance
+
+Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo) (`src/ai-service`):
+
+| Task | TCTX off (`pytest`) | TCTX on | Speedup [95% CI] |
+|---|---:|---:|---:|
+| Warm suite (`warm_suite`) | 1000.90 ms | **0.56 ms** (median 0.53 ms) | **1796.00×** [1710.88, 1867.12] |
+| Post-edit background pre-run (`bg_speculative`) | 994.27 ms | **0.81 ms** (median 0.51 ms) | **1230.61×** [817.21, 1915.37] |
+| Reverted edit Merkle hit (`merkle_revert`) | 988.26 ms | **0.60 ms** (median 0.55 ms) | **1643.59×** [1413.96, 1850.33] |
+| Immediate 0ms-delay leaf edit (`leaf_delta`) | 981.56 ms | **78.14 ms** (median 74.92 ms) | **12.56×** [12.00, 13.18] |
+| Impact query + Ruff pre-check (`affected_graph`) | 960.91 ms | **0.47 ms** (median 0.45 ms) | **2049.69×** [1957.13, 2155.51] |
+| Fixed mixed suite (`all`, 320 pairs) | 985.18 ms | **16.11 ms** (median 0.53 ms) | **61.13×** [57.39, 64.72] |
+
+![Test execution and query latency and paired-session speedup](resources/benchmark.png)
+
+## Install
+
+```sh
+git clone https://github.com/dotnetpower/test-context.git && cd test-context
+./scripts/install.sh
+code --install-extension dotnetpower.test-context-native
+```
+
+For Windows Agents windows backed by WSL, run `./scripts/install-vscode-extension.sh` from WSL to configure the `wsl.exe --exec tctx native-bridge` transport automatically.
 
 ## Contributed Language Model Tools
 
@@ -28,3 +48,4 @@ requires a manual merge.
 - `#tctxNativeSync` (`test-context-native_testSync`): Force AST graph synchronization and schedule background test execution.
 - `#tctxNativeInvalidate` (`test-context-native_testInvalidate`): Invalidate cached test results for specific files or the entire workspace.
 - `#tctxNativeWorkspaces` (`test-context-native_testWorkspaces`): List registered `tctx` workspaces.
+

@@ -35,9 +35,9 @@ void test('manifest metadata, branding PNGs, walkthrough, and 7 native tools are
     };
   };
 
-  assert.equal(manifest.publisher, 'moonchoi');
+  assert.equal(manifest.publisher, 'dotnetpower');
   assert.equal(manifest.name, 'test-context-native');
-  assert.equal(manifest.displayName, 'Test Context');
+  assert.equal(manifest.displayName, 'Test Context by dotnetpower');
   assert.ok(manifest.description.length <= 140);
   assert.deepEqual(manifest.extensionKind, ['workspace', 'ui']);
   assert.equal(manifest.capabilities?.agentsWindow?.supported, true);

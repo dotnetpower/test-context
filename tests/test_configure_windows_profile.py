@@ -71,7 +71,7 @@ class ConfigureWindowsProfileTests(unittest.TestCase):
             self.assertEqual(base_settings["window.zoomLevel"], 1)
             self.assertEqual(
                 base_settings["remote.extensionKind"][
-                    "moonchoi.test-context-native"
+                    "dotnetpower.test-context-native"
                 ],
                 ["ui"],
             )
@@ -83,7 +83,7 @@ class ConfigureWindowsProfileTests(unittest.TestCase):
                 settings["remote.extensionKind"]["other.extension"], ["workspace"]
             )
             self.assertEqual(
-                settings["remote.extensionKind"]["moonchoi.test-context-native"],
+                settings["remote.extensionKind"]["dotnetpower.test-context-native"],
                 ["ui"],
             )
             self.assertEqual(

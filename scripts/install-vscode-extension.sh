@@ -9,11 +9,15 @@ command -v npm >/dev/null
 command -v code >/dev/null
 
 cd "$extension"
+if code --list-extensions | grep -Fqx 'moonchoi.test-context-native'; then
+    code --uninstall-extension moonchoi.test-context-native || true
+fi
 npm ci
 npm run package
 
+expected="$(node -p "const p = require('./package.json'); p.publisher + '.' + p.name + '@' + p.version")"
 code --install-extension "$extension/dist/test-context-native.vsix" --force
-code --list-extensions --show-versions | grep '^moonchoi\.test-context-native@'
+code --list-extensions --show-versions | grep -Fx "$expected"
 
 mcp_options=(--executable "$HOME/.local/bin/tctx")
 if [[ "${TCTX_INSTALL_MCP:-0}" == "1" ]]; then
@@ -36,14 +40,14 @@ if [[ -n "${WSL_DISTRO_NAME:-}" ]] && command -v powershell.exe >/dev/null && co
     (
         cd /mnt/c
         powershell.exe -NoProfile -Command \
-            '& { param($Vsix) Set-Location C:\; code --install-extension $Vsix --force }' \
+            '& { param($Vsix) Set-Location C:\; code --uninstall-extension moonchoi.test-context-native 2>$null; code --install-extension $Vsix --force }' \
             "$windows_vsix"
     )
     # shellcheck disable=SC2016
     (
         cd /mnt/c
         powershell.exe -NoProfile -Command \
-            '& { param($Profile, $Vsix) Set-Location C:\; code --profile $Profile --install-extension $Vsix --force }' \
+            '& { param($Profile, $Vsix) Set-Location C:\; code --profile $Profile --uninstall-extension moonchoi.test-context-native 2>$null; code --profile $Profile --install-extension $Vsix --force }' \
             "$windows_profile" "$windows_vsix"
     )
     rm -f "$windows_vsix_wsl"
@@ -55,7 +59,7 @@ if [[ -n "${WSL_DISTRO_NAME:-}" ]] && command -v powershell.exe >/dev/null && co
             '& { Set-Location C:\; code --list-extensions --show-versions }'
     ) |
         tr -d '\r' |
-        grep '^moonchoi\.test-context-native@'
+        grep -Fx "$expected"
     # shellcheck disable=SC2016
     (
         cd /mnt/c
@@ -64,7 +68,7 @@ if [[ -n "${WSL_DISTRO_NAME:-}" ]] && command -v powershell.exe >/dev/null && co
             "$windows_profile"
     ) |
         tr -d '\r' |
-        grep '^moonchoi\.test-context-native@'
+        grep -Fx "$expected"
 
     windows_user_data="$windows_home_wsl/AppData/Roaming/Code/User"
     python3 "$extension/scripts/configure-windows-profile.py" \

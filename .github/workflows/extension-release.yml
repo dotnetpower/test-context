@@ -1,0 +1,86 @@
+name: Validate and package
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Install Python test dependencies
+        run: |
+          python3 -m pip install pytest
+      - name: Test and lint backend
+        run: |
+          cargo +stable test --locked
+          cargo +stable clippy --all-targets --locked -- -D warnings
+          python3 -m unittest discover -s tests -p 'test_*.py'
+
+  package:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+      - name: Check release version
+        env:
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        working-directory: vscode-extension
+        run: |
+          node -e "const m=require('./package.json'); if(process.env.RELEASE_REF.startsWith('refs/tags/') && process.env.RELEASE_TAG !== 'v'+m.version) throw Error('Tag must match extension version');"
+      - name: Build extension
+        working-directory: vscode-extension
+        run: |
+          npm ci
+          npm run check
+          npm run package
+      - name: Verify artifact
+        run: |
+          python3 scripts/verify_vsix.py vscode-extension/dist/test-context-native.vsix
+          cd vscode-extension/dist
+          sha256sum test-context-native.vsix > test-context-native.vsix.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-context-vsix
+          path: |
+            vscode-extension/dist/test-context-native.vsix
+            vscode-extension/dist/test-context-native.vsix.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [backend, package]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: test-context-vsix
+          path: release-artifacts
+      - name: Publish installable VSIX
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            release-artifacts/test-context-native.vsix \
+            release-artifacts/test-context-native.vsix.sha256 \
+            --verify-tag \
+            --title "Test Context ${RELEASE_TAG#v}" \
+            --notes "Install the VSIX from Extensions > Install from VSIX. Includes 7 native VS Code Language Model Tools for Python pytest, Rust cargo test, PyO3 hybrid graphs, and Ruff pre-flight checks."

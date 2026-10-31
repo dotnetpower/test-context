@@ -58,7 +58,8 @@ def configure_settings(
     extension_kinds = settings.setdefault("remote.extensionKind", {})
     if not isinstance(extension_kinds, dict):
         raise RuntimeError("remote.extensionKind must be a JSON object")
-    extension_kinds["moonchoi.test-context-native"] = ["ui"]
+    extension_kinds.pop("moonchoi.test-context-native", None)
+    extension_kinds["dotnetpower.test-context-native"] = ["ui"]
     settings["testContextNative.wslDistribution"] = distribution
     settings["testContextNative.wslExecutablePath"] = executable
 

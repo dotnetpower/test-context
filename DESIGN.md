@@ -15,7 +15,7 @@ Eliminate the `pytest`, `ruff`, and `cargo test` execution and collection bottle
 
 ## Surfaces for GitHub Copilot
 
-1. **Native VS Code Extension (`moonchoi.test-context-native`)**:
+1. **Native VS Code Extension (`dotnetpower.test-context-native`)**:
    - Contributes 7 Language Model Tools (`#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeWorkspaces`, `#tctxNativeInvalidate`) and automatic `chatInstructions`.
    - Uses a persistent framed-JSON (`TCTXJ1\n`) Unix-socket connection (or WSL `native-bridge` on Windows hosts) to the shared `tctx daemon`.
 2. **Shared MCP Server (`tctx shared-mcp` / `tctx mcp`)**:

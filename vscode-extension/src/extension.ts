@@ -75,14 +75,14 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('testContextNative.gettingStarted', async () => {
       await vscode.commands.executeCommand(
         'workbench.action.openWalkthrough',
-        'moonchoi.test-context-native#getting-started',
+        `${context.extension.id}#getting-started`,
         false,
       );
     }),
     vscode.commands.registerCommand('testContextNative.configureConnection', async () => {
       await vscode.commands.executeCommand(
         'workbench.action.openSettings',
-        '@ext:moonchoi.test-context-native',
+        `@ext:${context.extension.id}`,
       );
     }),
     vscode.commands.registerCommand('testContextNative.showStatus', async () => {

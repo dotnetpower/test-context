@@ -21,7 +21,7 @@ When GitHub Copilot (or a developer) invokes tests:
   - Batches multiple Rust `--lib` unit test modules per crate into a single `cargo test --lib` invocation and demultiplexes output per source file and per test node (`src/calc.rs::test_mul_unit`).
   - Supports function/node-level cache hits (`file.py::test_fn` and `src/file.rs::test_fn`), fuzzy `did_you_mean` suggestions on target typos, and single-writer WAL persistence with `BufWriter` and $O(1)$ incremental memory accounting.
   - Creates the warm pytest Zygote lazily, preloads only imports needed by the requested tests, reuses compatible parents across narrowed selections, and reclaims idle Zygotes after 60 seconds.
-- **Native GitHub Copilot Integration (`moonchoi.test-context-native`)**:
+- **Native GitHub Copilot Integration (`dotnetpower.test-context-native`)**:
   - 7 Native VS Code Language Model Tools (`#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeWorkspaces`, `#tctxNativeInvalidate`).
   - Native tools are the default in VS Code foreground sessions; optional Shared MCP Server (`tctx shared-mcp`) is available for unattended background/CLI agent sessions.
   - Drop-in CLI (`tctx run [--ruff-fix]`, `tctx pytest`, `tctx cargo-test`, `tctx ruff [--fix]`, `tctx affected`, `tctx graph`, `tctx status`, `tctx sync`).

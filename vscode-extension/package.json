@@ -1,9 +1,9 @@
 {
   "name": "test-context-native",
-  "displayName": "Test Context",
-  "description": "Fast Python AST dependency graph, speculative background pytest runner, and instant test cache for AI agents.",
+  "displayName": "Test Context by dotnetpower",
+  "description": "Fast Python & Rust AST dependency graph, speculative background pytest/cargo runner, Ruff pre-check, and instant test cache.",
   "version": "0.1.0",
-  "publisher": "moonchoi",
+  "publisher": "dotnetpower",
   "license": "MIT",
   "icon": "resources/icon.png",
   "preview": true,
@@ -20,6 +20,7 @@
   "bugs": {
     "url": "https://github.com/dotnetpower/test-context/issues"
   },
+  "qna": "https://github.com/dotnetpower/test-context/issues",
   "engines": {
     "vscode": "^1.140.0"
   },
@@ -45,6 +46,8 @@
     "language model tool",
     "pytest",
     "python",
+    "ruff",
+    "cargo test",
     "ast",
     "rust",
     "test context"
@@ -57,6 +60,7 @@
     "out/src",
     "prompts",
     "resources/*.png",
+    "docs",
     "CHANGELOG.md",
     "README.md",
     "LICENSE",
@@ -408,7 +412,10 @@
             "description": "Connect to the local tctx daemon over Unix socket or WSL bridge.\n[Configure connection](command:testContextNative.configureConnection)",
             "completionEvents": [
               "onCommand:testContextNative.configureConnection"
-            ]
+            ],
+            "media": {
+              "markdown": "docs/walkthrough/connection.md"
+            }
           },
           {
             "id": "check",
@@ -416,15 +423,21 @@
             "description": "Verify that the 7 native Test Context tools are registered and callable.\n[Run native self-test](command:testContextNative.selfTest)",
             "completionEvents": [
               "onContext:testContextNative.selfTestPassed"
-            ]
+            ],
+            "media": {
+              "markdown": "docs/walkthrough/check.md"
+            }
           },
           {
             "id": "status",
             "title": "3. View AST & Cache Status",
-            "description": "Inspect indexed Python files, cached test results, and cumulative time saved.\n[Show status](command:testContextNative.showStatus)",
+            "description": "Inspect indexed Python/Rust files, cached test results, and cumulative time saved.\n[Show status](command:testContextNative.showStatus)",
             "completionEvents": [
               "onCommand:testContextNative.showStatus"
-            ]
+            ],
+            "media": {
+              "markdown": "docs/walkthrough/status.md"
+            }
           }
         ]
       }
