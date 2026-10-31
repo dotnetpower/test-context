@@ -1,42 +1,38 @@
 # Test Context (`tctx`)
 
-**Test Context (`tctx`)** is a local Rust accelerator for Python `pytest` workflows, designed as the companion to `code-context` (`cctx`) for GitHub Copilot and AI coding agents.
+**Test Context (`tctx`)** is a local Rust accelerator for **Python (`pytest` + `ruff`)** and **Rust (`cargo test`)** workflows, designed as the companion to `code-context` (`cctx`) for GitHub Copilot and AI coding agents.
 
-Instead of running the entire test suite or paying Python interpreter/collection startup costs on every `pytest` call, `tctx` maintains an in-memory **Python AST reverse dependency graph** and runs affected tests **speculatively in the background** as files are saved.
+Instead of running the entire test suite or paying interpreter/compiler startup costs on every test or lint call, `tctx` maintains an in-memory **Python + Rust AST reverse dependency graph**, pre-checks Python files with **Ruff**, and runs affected tests **speculatively in the background** as files are saved.
 
 When GitHub Copilot (or a developer) invokes tests:
-- **100% Cache Hit**: If all targeted or affected tests have already passed against the current Merkle dependency hash (`dep_hash`), `tctx` returns the result **instantly (< 5ms)** without spawning `pytest`.
-- **Delta Execution**: If some tests are uncached or modified, `tctx` reuses cached results for unchanged tests, joins any in-flight background test run, and runs `pytest` **only on the uncached delta**.
+- **100% Cache Hit**: If all targeted or affected tests have already passed against the current Merkle dependency hash (`dep_hash`), `tctx` returns the result **instantly (< 1ms)** without spawning `pytest` or `cargo test`.
+- **Delta Execution**: If some tests are uncached or modified, `tctx` reuses cached results for unchanged tests, joins any in-flight background test run, prioritizes previously failed tests first (**Fail-First scheduling**), and runs `pytest` / `cargo test` **only on the uncached delta**.
+- **Pre-Flight Ruff Diagnostics & Auto-Fix**: Modified Python files are pre-checked by `ruff` in the background worker and cached by content `sha256`. `#tctxNativeAffected` and `#tctxNativeRun` surface exact `file:row:col` Ruff diagnostics immediately, and passing `ruff_fix: true` (`--ruff-fix`) auto-remediates safe lint/import issues before tests run.
 
 ## Features
 
-- **Rust Python AST & Import Graph Analyzer**:
-  - Extracts `import x`, `from x import y`, relative imports (`from . import z`), multi-line parenthesized imports, and in-function lazy imports.
-  - Automatically links `conftest.py` hierarchies and `pyproject.toml`/`pytest.ini` configurations into each test file's Merkle dependency hash (`dep_hash`).
-  - Supports root packages, `src/` layouts, and monorepo layouts (`services/*/src`, `packages/*/src`).
+- **Dual-Language Python & Rust AST Dependency Graph**:
+  - **Python**: Extracts `import x`, `from x import y`, relative imports, multi-line parenthesized imports, in-function lazy imports, `conftest.py` hierarchies, and `pyproject.toml`/`pytest.ini` configs while excluding `if TYPE_CHECKING:`-only imports from false test invalidation.
+  - **Rust**: Parses `mod foo;`, `#[path = "..."] mod`, nested `use crate::{...}` trees, `#[test]` / `#[tokio::test]` / `#[rstest]` symbols, `#[ignore]` / `#[serial]` attributes, `tests/common/mod.rs` shared helpers, `build.rs`, and `include_str!` / `include_bytes!` compile-time data dependencies.
+  - **PyO3 / Maturin Cross-Language Graph**: Links Rust `cdylib` / `[tool.maturin]` / `#[pymodule]` crates to Python importers so editing a `.rs` kernel automatically marks dependent Python `pytest` files as affected alongside Rust unit tests.
+  - **Static Environment Variable & Data Tracking**: Tracks `os.getenv`, `os.environ`, `env!`, and `env::var` keys as well as referenced `.json`, `.yaml`, `.toml`, `.sql`, `.snap`, `.golden`, and `.proto` files in each test's Merkle `dep_hash`.
 - **Speculative Background Daemon (`tctx daemon`)**:
-  - Watches workspace changes through `notify` (Linux `inotify` in the validated environment), filters access-only callbacks, and immediately queues affected test files in a background worker upon file changes.
-  - Learns bounded, successful whole-file `test_run` invocation patterns and prioritizes those affected tests on later edits; filtered, node-level, failed, and arbitrary-argument runs are not learned.
-  - Persists content-addressed test results (`dep_hash -> pass/fail/counts/duration/output`) per workspace root.
-  - Creates the warm pytest Zygote lazily, preloads only imports needed by the requested tests, and reclaims it after 60 seconds of inactivity.
-  - Reuses an existing Zygote when it already contains every requested preload; narrowing a test selection no longer restarts Python. Each run still forks a fresh isolated child.
-  - Collects structured pytest reports directly, without an internal JUnit file round trip. Explicit user-requested JUnit output and the subprocess fallback remain supported.
-  - Returns released allocator arenas to the OS, evicts inactive large graphs and roots under RSS pressure, and expires idle persistent clients after 30 seconds.
+  - Watches workspace changes through `notify` (Linux `inotify`), filters access-only callbacks, and immediately queues affected test files and Ruff pre-checks in a background worker upon file changes.
+  - Batches multiple Rust `--lib` unit test modules per crate into a single `cargo test --lib` invocation and demultiplexes output per source file and per test node (`src/calc.rs::test_mul_unit`).
+  - Supports function/node-level cache hits (`file.py::test_fn` and `src/file.rs::test_fn`), fuzzy `did_you_mean` suggestions on target typos, and single-writer WAL persistence with `BufWriter` and $O(1)$ incremental memory accounting.
+  - Creates the warm pytest Zygote lazily, preloads only imports needed by the requested tests, reuses compatible parents across narrowed selections, and reclaims idle Zygotes after 60 seconds.
 - **Native GitHub Copilot Integration (`moonchoi.test-context-native`)**:
   - 7 Native VS Code Language Model Tools (`#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeWorkspaces`, `#tctxNativeInvalidate`).
-  - Native tools are the default in VS Code foreground sessions.
-  - From WSL, the installer deploys the VSIX to both the WSL remote host and the Windows Agents profile, then configures direct `wsl.exe --exec tctx native-bridge` IPC.
-  - The `Test Context Native` Output channel uses concise human-readable records; protocol JSON stays internal to IPC.
-  - Optional Shared MCP Server (`tctx shared-mcp`) is a fallback for background/CLI agent sessions where Native dispatch is unavailable (`test_run`, `test_affected`, `test_graph`, `test_status`, `test_sync`, `test_workspaces`, `test_invalidate`).
-  - The VS Code installer installs Native only by default and removes installer-owned Test Context MCP entries from user/profile settings. Other servers and custom Test Context commands are preserved.
-  - Set `TCTX_INSTALL_MCP=1` to additionally register the MCP fallback. Windows entries launch through `wsl.exe`; WSL entries use the Linux executable directly.
-  - Drop-in CLI (`tctx run`, `tctx pytest`, `tctx affected`, `tctx graph`, `tctx status`, `tctx sync`).
+  - Native tools are the default in VS Code foreground sessions; optional Shared MCP Server (`tctx shared-mcp`) is available for unattended background/CLI agent sessions.
+  - Drop-in CLI (`tctx run [--ruff-fix]`, `tctx pytest`, `tctx cargo-test`, `tctx ruff [--fix]`, `tctx affected`, `tctx graph`, `tctx status`, `tctx sync`).
 
 `tctx` can learn only invocations routed through its Native, MCP, or CLI surfaces. A direct shell
 command such as `pytest tests/test_api.py` is not intercepted; use `tctx pytest
-tests/test_api.py` when invocation learning and cache reuse are desired.
+tests/test_api.py` or `tctx cargo-test` when invocation learning and cache reuse are desired.
 
-## Measured Performance (`aks-store-demo` Python AI Service)
+## Measured Performance
+
+### 1. Python FastAPI Suite (`aks-store-demo`, 320 Paired Observations)
 
 Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store Demo](https://github.com/dotnetpower/aks-store-demo) (`src/ai-service`):
 
@@ -44,19 +40,24 @@ Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store
 
 | Task | TCTX off (`pytest`) | TCTX on | Speedup [95% CI] |
 |---|---:|---:|---:|
-| Warm suite (`warm_suite`) | 911.38 ms | **0.47 ms** (median 0.46 ms) | **1948.53×** [1897.96, 2005.05] |
-| Post-edit background pre-run (`bg_speculative`) | 920.08 ms | **0.46 ms** (median 0.46 ms) | **1983.64×** [1924.26, 2052.37] |
-| Reverted edit Merkle hit (`merkle_revert`) | 907.72 ms | **0.48 ms** (median 0.48 ms) | **1873.61×** [1800.33, 1943.23] |
-| Immediate 0ms-delay leaf edit (`leaf_delta`) | 915.21 ms | **62.52 ms** (median 61.77 ms) | **14.64×** [14.24, 14.96] |
-| Impact query (`affected_graph`) | 883.79 ms | **0.44 ms** (median 0.43 ms) | **2019.97×** [1962.72, 2092.94] |
-| Fixed mixed suite (`all`, 320 pairs) | 907.64 ms | **12.87 ms** (median 0.47 ms) | **70.50×** [69.04, 71.75] |
+| Warm suite (`warm_suite`) | 1000.90 ms | **0.56 ms** (median 0.53 ms) | **1796.00×** [1710.88, 1867.12] |
+| Post-edit background pre-run (`bg_speculative`) | 994.27 ms | **0.81 ms** (median 0.51 ms) | **1230.61×** [817.21, 1915.37] |
+| Reverted edit Merkle hit (`merkle_revert`) | 988.26 ms | **0.60 ms** (median 0.55 ms) | **1643.59×** [1413.96, 1850.33] |
+| Immediate 0ms-delay leaf edit (`leaf_delta`) | 981.56 ms | **78.14 ms** (median 74.92 ms) | **12.56×** [12.00, 13.18] |
+| Impact query + Ruff pre-check (`affected_graph`) | 960.91 ms | **0.47 ms** (median 0.45 ms) | **2049.69×** [1957.13, 2155.51] |
+| Fixed mixed suite (`all`, 320 pairs) | 985.18 ms | **16.11 ms** (median 0.53 ms) | **61.13×** [57.39, 64.72] |
+
+### 2. Rust (`cargo test`) & Multi-File Demux Benchmarks (`test-context` Workspace)
+
+| Scenario | Cold / Unbatched | With `tctx` | Speedup / Improvement |
+|---|---:|---:|---:|
+| 4 Rust modules (`25 unit tests`) cold batch | ~5,800 ms (4× `cargo test`) | **1,254.64 ms** (1× `cargo test --lib` demux) | **4.6× faster cold batch** |
+| 4 Rust modules (`25 unit tests`) warm cache hit | 1,254.64 ms | **0.41 ms** (`instant_cache_hit`) | **3,060.1× speedup** |
+| Single Rust test node (`src/runner.rs::demux_...`) | 1,254.64 ms | **0.23 ms** (`cached_node`) | **5,455.0× speedup** |
+| Rust AST graph query (`test_graph` on `src/ast_graph.rs`) | — | **0.19 ms** | **< 0.2 ms instant** |
+| Rust reverse impact query (`test_affected` on `src/cache.rs`) | — | **0.24 ms** | **< 0.3 ms instant** |
 
 See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology, cold-start measurements, raw samples, and reproduction instructions.
-
-Cache-disabled execution was measured separately against the previous build. Alternating broad and
-narrow selections improved from **267/230 ms to 57/55 ms median** in a local two-file
-Pydantic/HTTPX fixture. These are execution-overhead measurements, not cached results or a claim that
-test bodies, database operations, or network calls become faster.
 
 ## Quick Start
 
@@ -64,16 +65,18 @@ test bodies, database operations, or network calls become faster.
 # 1. Build and install tctx + user systemd service
 ./scripts/install.sh
 
-# 2. Register a Python workspace
+# 2. Register a Python, Rust, or PyO3 hybrid workspace
 tctx --root /path/to/repo register
 
-# 3. Inspect AST dependency graph or affected tests
+# 3. Inspect AST dependency graph, affected tests, or pre-flight Ruff diagnostics
 tctx --root /path/to/repo status
 tctx --root /path/to/repo affected --file src/my_pkg/core.py
+tctx --root /path/to/repo ruff --fix
 
-# 4. Run tests with incremental AST caching (or drop-in pytest wrapper)
-tctx --root /path/to/repo run
+# 4. Run Python (pytest) and Rust (cargo test) tests with incremental AST caching
+tctx --root /path/to/repo run --ruff-fix
 tctx --root /path/to/repo pytest -q
+tctx --root /path/to/repo cargo-test
 
 # 5. Package and install the VS Code Native Extension
 ./scripts/install-vscode-extension.sh

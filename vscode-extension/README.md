@@ -21,10 +21,10 @@ requires a manual merge.
 
 ## Contributed Language Model Tools
 
-- `#tctxNativeRun` (`test-context-native_testRun`): Run `pytest` incrementally with instant cache hits for tests already verified in the background.
-- `#tctxNativeAffected` (`test-context-native_testAffected`): Inspect which test files are affected by modified Python source files or `git diff`, plus their live background cache state.
-- `#tctxNativeGraph` (`test-context-native_testGraph`): Query direct imports, reverse importers, transitive dependencies, `conftest.py` chains, and Merkle `dep_hash` for any Python file.
-- `#tctxNativeStatus` (`test-context-native_testStatus`): View daemon health, cached test counts, background worker queue, and total time saved.
+- `#tctxNativeRun` (`test-context-native_testRun`): Run `pytest` and `cargo test` incrementally with instant cache hits for tests already verified in the background, plus pre-flight Ruff diagnostics and optional `ruff_fix: true` auto-remediation.
+- `#tctxNativeAffected` (`test-context-native_testAffected`): Inspect which Python/Rust test files are affected by modified source files or `git diff`, along with their live background cache state and pre-checked Ruff errors.
+- `#tctxNativeGraph` (`test-context-native_testGraph`): Query direct imports, reverse importers, transitive dependencies, `conftest.py` / `tests/common` chains, referenced env vars, and Merkle `dep_hash` for any Python or Rust file.
+- `#tctxNativeStatus` (`test-context-native_testStatus`): View daemon health, indexed Python/Rust counts, cached test counts, Ruff diagnostic counts, background worker queue, and total time saved.
 - `#tctxNativeSync` (`test-context-native_testSync`): Force AST graph synchronization and schedule background test execution.
 - `#tctxNativeInvalidate` (`test-context-native_testInvalidate`): Invalidate cached test results for specific files or the entire workspace.
 - `#tctxNativeWorkspaces` (`test-context-native_testWorkspaces`): List registered `tctx` workspaces.

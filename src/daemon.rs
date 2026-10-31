@@ -643,9 +643,12 @@ pub fn serve() -> Result<()> {
         }
         let _ = std::fs::remove_file(&sock_path);
     }
-    let listener = UnixListener::bind(&sock_path)?;
+    let tmp_sock = dir.join("sock.tmp");
+    let _ = std::fs::remove_file(&tmp_sock);
+    let listener = UnixListener::bind(&tmp_sock)?;
     listener.set_nonblocking(true)?;
-    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::set_permissions(&tmp_sock, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::rename(&tmp_sock, &sock_path)?;
     let runtime_identity = Arc::new(RuntimeIdentity::capture(&dir, &sock_path, &lock_file)?);
 
     let hub = Arc::new(DaemonHub::new());

@@ -2,15 +2,16 @@
 
 ## Purpose and Scope
 
-Eliminate the `pytest` execution and collection bottleneck for Python projects and AI coding agents (such as GitHub Copilot) by combining:
+Eliminate the `pytest`, `ruff`, and `cargo test` execution and collection bottleneck for Python, Rust, and PyO3 hybrid projects and AI coding agents (such as GitHub Copilot) by combining:
 
-1. **Fast Rust Python AST & Dependency Graph Analysis**: Parses Python `import` / `from ... import ...` statements (including relative imports, parenthesized multi-line imports, and in-function imports), `conftest.py` directory hierarchies, and `pyproject.toml`/`pytest.ini` configurations.
-2. **Transitive Reverse Dependency Graph & Merkle Dependency Digests**: Computes a deterministic SHA-256 Merkle dependency hash (`dep_hash`) for every test file from its own source hash, all transitively imported workspace Python modules, applicable `conftest.py` files, and pytest configuration files.
-3. **Speculative Background Test Execution**: Watches workspace files via `notify`. When Python source or test files change, affected tests are marked stale and queued for background pytest execution while the developer or AI agent is still editing or reasoning.
-4. **Zero-Startup Instant Cache Return & Singleflight Delta Execution**:
-   - When GitHub Copilot (via Native VS Code Language Model Tools, MCP, or `tctx run`/`tctx pytest`) requests test execution:
-     - **100% Cache Hit**: If all targeted test files already have a `Passed` record matching their live `dep_hash`, `tctx` returns the cached pass result immediately in **< 5ms** without spawning Python or `pytest`.
-     - **Partial Hit / Delta Run**: Already-passed test files with matching `dep_hash` are skipped, in-flight background runs for the same `dep_hash` are joined (singleflight), and only uncached/changed/failed test files are executed in a single delta `pytest` invocation.
+1. **Fast Rust Python & Rust AST & Dependency Graph Analysis**: Parses Python `import` / `from ... import ...` statements (excluding `if TYPE_CHECKING:`), `conftest.py` hierarchies, and `pyproject.toml`/`pytest.ini` configurations, as well as Rust `mod`/`use` trees, `#[test]`/`#[tokio::test]` symbols, `include_str!` / `include_bytes!`, `tests/common/mod.rs`, `build.rs`, `Cargo.toml`, and PyO3/maturin cross-language native module bindings.
+2. **Transitive Reverse Dependency Graph & Merkle Dependency Digests**: Computes a deterministic SHA-256 Merkle dependency hash (`dep_hash`) for every Python and Rust test file from its own source hash, all transitively imported workspace modules, applicable `conftest.py` / `tests/common` files, referenced environment variables (`os.getenv`, `env!`, `env::var`), data/snapshot files, and configuration files.
+3. **Speculative Background Test Execution & Ruff Pre-Flight Checking**: Watches workspace files via `notify`. When Python or Rust source/test files change, affected tests and Ruff checks (`file@sha256 -> Vec<RuffDiagnostic>`) are queued in the background while the developer or AI agent is still editing or reasoning.
+4. **Zero-Startup Instant Cache Return, Singleflight Delta Execution & Auto-Fix**:
+   - When GitHub Copilot (via Native VS Code Language Model Tools, MCP, or `tctx run`/`tctx pytest`/`tctx cargo-test`) requests test execution:
+     - **100% Cache Hit**: If all targeted test files (or test nodes `file::test_fn`) already have a `Passed` record matching their live `dep_hash`, `tctx` returns the cached pass result immediately in **< 1ms** without spawning Python, `pytest`, or `cargo test`.
+     - **Partial Hit / Delta Run**: Already-passed test files with matching `dep_hash` are skipped, in-flight background runs for the same `dep_hash` are joined (singleflight), previously failed tests are prioritized first (**Fail-First scheduling**), and only uncached/changed/failed test files are executed (with multi-module `cargo test --lib` demuxing for Rust).
+     - **Pre-Flight Ruff Remediation**: Surfaces cached Ruff lint/syntax diagnostics on `#tctxNativeAffected` and `#tctxNativeRun`, and auto-fixes safe rules before running tests when `ruff_fix: true` (`--ruff-fix`) is passed.
 
 ## Surfaces for GitHub Copilot
 

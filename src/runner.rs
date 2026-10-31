@@ -208,7 +208,7 @@ struct RootState {
     background_batches: u64,
     last_environment_check: Instant,
     prediction_enqueues: u64,
-    ruff_cache: BTreeMap<String, (String, Vec<RuffDiagnostic>)>,
+    ruff_cache: BTreeMap<String, Vec<RuffDiagnostic>>,
     pending_ruff_files: BTreeSet<String>,
 }
 
@@ -251,6 +251,15 @@ impl ManagedRoot {
         let mut pending_queue = VecDeque::new();
         let mut pending_ruff_files = BTreeSet::new();
         if spec.policy.background_enabled {
+            let py_files: Vec<String> = graph
+                .files
+                .keys()
+                .filter(|k| k.ends_with(".py"))
+                .cloned()
+                .collect();
+            if py_files.len() <= 64 {
+                pending_ruff_files.extend(py_files);
+            }
             let dirty = git_dirty_files(&workspace.root).unwrap_or_default();
             for f in &dirty {
                 let norm = f.trim().trim_start_matches("./").replace('\\', "/");
@@ -574,6 +583,7 @@ impl ManagedRoot {
                     let ruff_files: Vec<String> =
                         std::mem::take(&mut guard.pending_ruff_files).into_iter().collect();
                     Self::ensure_ruff_cached_locked(&mut guard, &ruff_files);
+                    self.condvar.notify_all();
                     if guard.pending_queue.is_empty() {
                         guard.background_running = false;
                         continue;
@@ -1124,7 +1134,9 @@ impl ManagedRoot {
         if wait_background {
             let deadline = Instant::now() + Duration::from_secs(60);
             let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
-            while (!guard.pending_queue.is_empty() || !guard.in_flight.is_empty())
+            while (!guard.pending_queue.is_empty()
+                || !guard.in_flight.is_empty()
+                || !guard.pending_ruff_files.is_empty())
                 && Instant::now() < deadline
             {
                 let (next_guard, _) = self
@@ -1233,9 +1245,12 @@ impl ManagedRoot {
         let cache_storage = guard.cache.storage_metrics();
         let ruff_cached_files = guard.ruff_cache.len();
         let ruff_diagnostics_count: usize = guard
-            .ruff_cache
-            .values()
-            .map(|(_, diags)| diags.len())
+            .graph
+            .files
+            .iter()
+            .filter(|(p, _)| p.ends_with(".py"))
+            .filter_map(|(p, n)| guard.ruff_cache.get(&flight_key(p, &n.sha256)))
+            .map(Vec::len)
             .sum();
         let payload = serde_json::json!({
             "root": root,
@@ -1417,9 +1432,6 @@ impl ManagedRoot {
 
         if fix && !target_py_files.is_empty() {
             let _ = execute_ruff_check(&guard.spec, &target_py_files, true);
-            for f in &target_py_files {
-                guard.ruff_cache.remove(f);
-            }
             Self::reconcile_live_files_locked(&mut guard, None);
         }
         Self::ensure_ruff_cached_locked(&mut guard, &target_py_files);
@@ -1449,11 +1461,8 @@ impl ManagedRoot {
             let Some(node) = guard.graph.files.get(f) else {
                 continue;
             };
-            let already = guard
-                .ruff_cache
-                .get(f)
-                .is_some_and(|(cached_sha, _)| cached_sha == &node.sha256);
-            if !already {
+            let key = flight_key(f, &node.sha256);
+            if !guard.ruff_cache.contains_key(&key) {
                 uncached.push(f.clone());
                 expected_shas.insert(f.clone(), node.sha256.clone());
             }
@@ -1464,7 +1473,14 @@ impl ManagedRoot {
         let by_file = execute_ruff_check(&guard.spec, &uncached, false);
         for (file, sha) in expected_shas {
             let diags = by_file.get(&file).cloned().unwrap_or_default();
-            guard.ruff_cache.insert(file, (sha, diags));
+            guard.ruff_cache.insert(flight_key(&file, &sha), diags);
+        }
+        while guard.ruff_cache.len() > 4096 {
+            if let Some(first_key) = guard.ruff_cache.keys().next().cloned() {
+                guard.ruff_cache.remove(&first_key);
+            } else {
+                break;
+            }
         }
     }
 
@@ -1475,8 +1491,7 @@ impl ManagedRoot {
         let mut out = Vec::new();
         for f in py_files {
             if let Some(node) = guard.graph.files.get(f)
-                && let Some((cached_sha, diags)) = guard.ruff_cache.get(f)
-                && cached_sha == &node.sha256
+                && let Some(diags) = guard.ruff_cache.get(&flight_key(f, &node.sha256))
             {
                 out.extend(diags.iter().cloned());
             }
