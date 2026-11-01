@@ -4,7 +4,7 @@
 
 # Test Context by dotnetpower
 
-**Native VS Code Language Model Tools for Test Context (`tctx`) — incremental Python (`pytest` + `ruff`) and Rust (`cargo test`) AST dependency analysis, speculative background execution, and sub-millisecond cached test results for GitHub Copilot.**
+**Native VS Code Language Model Tools for Test Context (`tctx`) — incremental Python (`pytest` + `ruff`), Rust (`cargo test`), and Frontend (`React`, `Vite`, `TypeScript`, `CSS/SCSS`, `Vitest`/`Jest`/`Node test`, `ESLint`) AST dependency analysis, speculative background execution, and sub-millisecond cached test results for GitHub Copilot.**
 Publisher: **dotnetpower** (`dotnetpower.test-context-native`).
 
 ## Resources

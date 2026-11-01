@@ -1,7 +1,7 @@
 {
   "name": "test-context-native",
   "displayName": "Test Context by dotnetpower",
-  "description": "Fast Python & Rust AST dependency graph, speculative background pytest/cargo runner, Ruff pre-check, and instant test cache.",
+  "description": "Fast Python, Rust & React/Vite AST graph, background pytest/cargo/vitest runner, Ruff/ESLint pre-check, and instant test cache.",
   "version": "0.1.0",
   "publisher": "dotnetpower",
   "license": "MIT",
@@ -48,7 +48,8 @@
     "python",
     "ruff",
     "cargo test",
-    "ast",
+    "vitest",
+    "react",
     "rust",
     "test context"
   ],
@@ -152,13 +153,17 @@
       {
         "name": "test-context-native_testRun",
         "toolReferenceName": "tctxNativeRun",
-        "displayName": "Test Context: Incremental Pytest Run",
-        "modelDescription": "Use this FIRST instead of running shell pytest in a registered Python workspace. Resolves target test files or expands modified Python source files through the Rust AST reverse dependency graph, verifies live SHA-256 Merkle dependency hashes (dep_hash), skips tests that already passed in the background worker, joins in-flight background runs, and runs only the uncached delta. Returns instant results (< 5ms) when all targeted tests are already cached green.",
-        "userDescription": "Run pytest incrementally using the Rust AST dependency graph and background test cache.",
+        "displayName": "Test Context: Incremental Test Run",
+        "modelDescription": "Use this FIRST instead of running shell pytest, cargo test, vitest, jest, or node --test in a registered workspace. Resolves target test files or expands modified Python, Rust, or Frontend (TS/JS/JSX/TSX/Vue/Svelte/CSS/SCSS) source files through the polyglot AST reverse dependency graph, verifies live SHA-256 Merkle dependency hashes (dep_hash), skips tests that already passed in the background worker, joins in-flight background runs, and runs only the uncached delta. Returns instant results (< 5ms) when all targeted tests are already cached green.",
+        "userDescription": "Run pytest, cargo test, vitest, jest, and node --test incrementally using the AST dependency graph and background test cache.",
         "tags": [
           "test",
           "pytest",
+          "cargo",
+          "vitest",
           "python",
+          "rust",
+          "typescript",
           "ast",
           "cache",
           "native",
@@ -180,11 +185,11 @@
               "items": {
                 "type": "string"
               },
-              "description": "Optional relative test file paths, test directories, pytest nodeids (path::test_name), or modified Python source file paths. Omit to target all workspace tests."
+              "description": "Optional relative test file paths, test directories, test nodeids (path::test_name), or modified Python/Rust/Frontend source file paths. Omit to target all workspace tests."
             },
             "k": {
               "type": "string",
-              "description": "Optional pytest -k expression filter."
+              "description": "Optional test name/expression filter (-k / -t)."
             },
             "mark": {
               "type": "string",
@@ -198,12 +203,12 @@
             "no_cache": {
               "type": "boolean",
               "default": false,
-              "description": "Bypass cached pass results and force pytest execution."
+              "description": "Bypass cached pass results and force test execution."
             },
             "ruff_fix": {
               "type": "boolean",
               "default": false,
-              "description": "Auto-fix safe Ruff lint/import issues (ruff check --fix) on targeted Python files before running tests."
+              "description": "Auto-fix safe Ruff/ESLint lint and import issues (ruff check --fix / eslint --fix) on targeted files before running tests."
             },
             "pytest_args": {
               "type": "array",
@@ -211,7 +216,7 @@
               "items": {
                 "type": "string"
               },
-              "description": "Optional additional pytest CLI flags."
+              "description": "Optional additional test runner CLI flags."
             }
           }
         }
@@ -220,11 +225,13 @@
         "name": "test-context-native_testAffected",
         "toolReferenceName": "tctxNativeAffected",
         "displayName": "Test Context: Affected Tests",
-        "modelDescription": "Use this FIRST to discover which pytest test files are impacted by modified Python source files or git working-tree changes via the Rust AST reverse dependency graph, along with each test file's dependency chain and live background cache status (cached_passed, cached_failed, running_in_background, queued_in_background, uncached).",
-        "userDescription": "Find pytest files affected by source changes and inspect their background cache status.",
+        "modelDescription": "Use this FIRST to discover which Python (pytest), Rust (cargo test), or Frontend (Vitest/Jest/Node/Storybook) test files are impacted by modified source files or git working-tree changes via the AST reverse dependency graph, along with each test file's dependency chain, live background cache status (cached_passed, cached_failed, running_in_background, queued_in_background, uncached), and pre-checked Ruff/ESLint diagnostics.",
+        "userDescription": "Find Python, Rust, and Frontend test files affected by source changes and inspect their background cache and lint status.",
         "tags": [
           "test",
           "pytest",
+          "cargo",
+          "vitest",
           "ast",
           "affected",
           "native",
@@ -246,7 +253,7 @@
               "items": {
                 "type": "string"
               },
-              "description": "Optional relative paths of modified Python or config files. Omit to use git dirty files when git_diff=true."
+              "description": "Optional relative paths of modified Python, Rust, Frontend, stylesheet, or config files. Omit to use git dirty files when git_diff=true."
             },
             "git_diff": {
               "type": "boolean",
@@ -260,13 +267,15 @@
         "name": "test-context-native_testGraph",
         "toolReferenceName": "tctxNativeGraph",
         "displayName": "Test Context: AST Dependency Graph",
-        "modelDescription": "Inspect the Python AST dependency graph for a specific Python source or test file: direct imports, reverse importers, transitive dependencies, conftest.py chain, affected test files, test symbols, fixtures, and Merkle dep_hash.",
-        "userDescription": "Inspect the Python AST import and fixture dependency graph for a file.",
+        "modelDescription": "Inspect the AST dependency graph for a specific Python, Rust, or Frontend (TS/JS/JSX/TSX/Vue/Svelte/CSS/SCSS) source or test file: direct imports, reverse importers, transitive dependencies, conftest.py / tests/common / setupTests.ts chains, affected test files, test symbols, fixtures, and Merkle dep_hash.",
+        "userDescription": "Inspect the Python, Rust, or Frontend AST import and fixture dependency graph for a file.",
         "tags": [
           "test",
           "ast",
           "graph",
           "python",
+          "rust",
+          "typescript",
           "native",
           "test-context"
         ],
@@ -283,7 +292,7 @@
             "file": {
               "type": "string",
               "minLength": 1,
-              "description": "Relative path to the Python file within the workspace."
+              "description": "Relative path to the Python, Rust, or Frontend file within the workspace."
             }
           },
           "required": [

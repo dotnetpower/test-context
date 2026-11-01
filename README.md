@@ -1,8 +1,8 @@
 # Test Context (`tctx`)
 
-**Test Context (`tctx`)** is a local Rust accelerator for **Python (`pytest` + `ruff`)** and **Rust (`cargo test`)** workflows, designed as the companion to `code-context` (`cctx`) for GitHub Copilot and AI coding agents.
+**Test Context (`tctx`)** is a local Rust accelerator for **Python (`pytest` + `ruff`)**, **Rust (`cargo test`)**, and **Frontend (`React`, `Vite`, `TypeScript`/`JavaScript`, `CSS`/`SCSS`, `Vitest`/`Jest`/`Node test`, `ESLint`)** workflows, designed as the companion to `code-context` (`cctx`) for GitHub Copilot and AI coding agents.
 
-Instead of running the entire test suite or paying interpreter/compiler startup costs on every test or lint call, `tctx` maintains an in-memory **Python + Rust AST reverse dependency graph**, pre-checks Python files with **Ruff**, and runs affected tests **speculatively in the background** as files are saved.
+Instead of running the entire test suite or paying interpreter/compiler startup costs on every test or lint call, `tctx` maintains an in-memory **polyglot Python + Rust + Frontend AST reverse dependency graph**, pre-checks files with **Ruff** and **ESLint**, and runs affected tests **speculatively in the background** as files are saved.
 
 When GitHub Copilot (or a developer) invokes tests:
 - **100% Cache Hit**: If all targeted or affected tests have already passed against the current Merkle dependency hash (`dep_hash`), `tctx` returns the result **instantly (< 1ms)** without spawning `pytest` or `cargo test`.

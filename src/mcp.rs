@@ -7,7 +7,7 @@ pub fn tools() -> Value {
         "tools": [
             {
                 "name": "test_run",
-                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Use this before shell pytest in a registered Python workspace. Resolves target test files (or expands modified source files via the Rust AST reverse dependency graph), checks live SHA-256 Merkle dependency hashes (dep_hash), skips tests that already passed in the background or prior runs, joins in-flight background runs, and executes only the uncached delta. Returns instant results (< 5ms) when all targeted tests are already cached green.",
+                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Use this before shell pytest, cargo test, vitest, jest, or node --test in a registered workspace. Resolves target test files (or expands modified Python, Rust, or Frontend source/stylesheet files via the AST reverse dependency graph), checks live SHA-256 Merkle dependency hashes (dep_hash), skips tests that already passed in the background or prior runs, joins in-flight background runs, and executes only the uncached delta. Returns instant results (< 5ms) when all targeted tests are already cached green.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -20,11 +20,11 @@ pub fn tools() -> Value {
                             "type": "array",
                             "maxItems": 128,
                             "items": { "type": "string" },
-                            "description": "Optional relative test file paths, test directories, pytest nodeids (path::test_name), or modified Python source file paths. Omit to target all workspace tests."
+                            "description": "Optional relative test file paths, test directories, test nodeids (path::test_name), or modified Python/Rust/Frontend source file paths. Omit to target all workspace tests."
                         },
                         "k": {
                             "type": "string",
-                            "description": "Optional pytest -k expression filter."
+                            "description": "Optional test name/expression filter (-k / -t)."
                         },
                         "mark": {
                             "type": "string",
@@ -43,13 +43,13 @@ pub fn tools() -> Value {
                         "ruff_fix": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Auto-fix safe Ruff lint/import issues (ruff check --fix) on targeted Python files before running tests."
+                            "description": "Auto-fix safe Ruff/ESLint lint and import issues (ruff check --fix / eslint --fix) on targeted files before running tests."
                         },
                         "pytest_args": {
                             "type": "array",
                             "maxItems": 32,
                             "items": { "type": "string" },
-                            "description": "Optional additional pytest CLI flags."
+                            "description": "Optional additional test runner CLI flags."
                         }
                     }
                 },
@@ -61,7 +61,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "test_affected",
-                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Find which pytest test files are impacted by changed Python source files or git working-tree edits via the Rust AST reverse dependency graph, along with each test file's dependency chain and live background cache state (cached_passed, cached_failed, running_in_background, queued_in_background, uncached).",
+                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Find which Python (pytest), Rust (cargo test), or Frontend (Vitest/Jest/Node/Storybook) test files are impacted by changed source files or git working-tree edits via the AST reverse dependency graph, along with each test file's dependency chain, live background cache state (cached_passed, cached_failed, running_in_background, queued_in_background, uncached), and pre-checked Ruff/ESLint diagnostics.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -74,7 +74,7 @@ pub fn tools() -> Value {
                             "type": "array",
                             "maxItems": 128,
                             "items": { "type": "string" },
-                            "description": "Optional relative paths of modified Python or config files. If omitted, uses git status dirty files when git_diff=true."
+                            "description": "Optional relative paths of modified Python, Rust, Frontend, stylesheet, or config files. If omitted, uses git status dirty files when git_diff=true."
                         },
                         "git_diff": {
                             "type": "boolean",
@@ -91,7 +91,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "test_graph",
-                "description": "Inspect the Python AST dependency graph for a specific Python source or test file: direct imports, reverse importers, transitive dependencies, conftest.py chain, affected test files, test symbols, fixtures, and Merkle dep_hash.",
+                "description": "Inspect the AST dependency graph for a specific Python, Rust, or Frontend (TS/JS/JSX/TSX/Vue/Svelte/CSS/SCSS) source or test file: direct imports, reverse importers, transitive dependencies, conftest.py / tests/common / setupTests.ts chains, affected test files, test symbols, fixtures, and Merkle dep_hash.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -103,7 +103,7 @@ pub fn tools() -> Value {
                         "file": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Relative path to the Python file within the workspace."
+                            "description": "Relative path to the Python, Rust, or Frontend file within the workspace."
                         }
                     },
                     "required": ["file"]
