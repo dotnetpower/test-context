@@ -24,7 +24,12 @@ pub fn doctor(root: &Path) -> Result<Value> {
         .arg("--version")
         .output()
         .is_ok_and(|out| out.status.success());
+    let node_available = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
     let ruff_available = catalog::detect_ruff_cmd(root, None).is_some();
+    let frontend_test_cmd = catalog::detect_frontend_test_cmd(root, None);
 
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -34,7 +39,9 @@ pub fn doctor(root: &Path) -> Result<Value> {
         "daemon_reachable": ping.is_some(),
         "daemon_ping": ping,
         "cargo_available": cargo_available,
+        "node_available": node_available,
         "ruff_available": ruff_available,
+        "frontend_test_cmd": frontend_test_cmd,
         "registered_workspaces": specs.len(),
         "current_root_registered": resolved.is_some(),
         "current_root_spec": resolved,

@@ -30,9 +30,33 @@ pub const RUST_CONFIG_FILES: &[&str] = &[
     "rust-toolchain",
 ];
 
+pub const FRONTEND_CONFIG_FILES: &[&str] = &[
+    "package.json",
+    "tsconfig.json",
+    "tsconfig.app.json",
+    "tsconfig.node.json",
+    "jsconfig.json",
+    "vite.config.ts",
+    "vite.config.js",
+    "vite.config.mjs",
+    "vitest.config.ts",
+    "vitest.config.js",
+    "vitest.config.mjs",
+    "jest.config.js",
+    "jest.config.ts",
+    "jest.config.mjs",
+    "playwright.config.ts",
+    "playwright.config.js",
+];
+
+pub const FRONTEND_SOURCE_EXTENSIONS: &[&str] = &[
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue", ".svelte",
+];
+
 pub const DATA_FILE_EXTENSIONS: &[&str] = &[
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".sql", ".rego", ".csv", ".snap",
-    ".golden", ".proto", ".graphql", ".txt",
+    ".golden", ".proto", ".graphql", ".txt", ".css", ".scss", ".sass", ".less", ".svg", ".mdx",
+    ".html",
 ];
 
 #[derive(Clone, Debug)]
@@ -98,12 +122,34 @@ impl Workspace {
             vec![
                 "*.py".to_string(),
                 "*.rs".to_string(),
+                "*.ts".to_string(),
+                "*.tsx".to_string(),
+                "*.js".to_string(),
+                "*.jsx".to_string(),
+                "*.mjs".to_string(),
+                "*.cjs".to_string(),
+                "*.mts".to_string(),
+                "*.cts".to_string(),
+                "*.vue".to_string(),
+                "*.svelte".to_string(),
+                "*.css".to_string(),
+                "*.scss".to_string(),
+                "*.sass".to_string(),
+                "*.less".to_string(),
                 "pyproject.toml".to_string(),
                 "pytest.ini".to_string(),
                 "setup.cfg".to_string(),
                 "tox.ini".to_string(),
                 "Cargo.toml".to_string(),
                 "rust-toolchain.toml".to_string(),
+                "package.json".to_string(),
+                "tsconfig.json".to_string(),
+                "vite.config.ts".to_string(),
+                "vite.config.js".to_string(),
+                "vitest.config.ts".to_string(),
+                "vitest.config.js".to_string(),
+                "jest.config.js".to_string(),
+                "jest.config.ts".to_string(),
             ]
         } else {
             globs
@@ -158,6 +204,7 @@ impl Workspace {
             || self.include_matcher.is_match(Path::new(file_name))
             || PYTEST_CONFIG_FILES.contains(&file_name)
             || RUST_CONFIG_FILES.contains(&file_name)
+            || FRONTEND_CONFIG_FILES.contains(&file_name)
     }
 
     pub fn is_permitted_data_rel(&self, rel: &Path) -> bool {

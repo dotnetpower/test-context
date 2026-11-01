@@ -576,6 +576,70 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         );
     }
 
+    // 15. Frontend (JS/TS/CSS/Barrel) end-to-end execution, node cache hit, and CSS delta invalidation.
+    write_file(&rust_repo, "src/ui/theme.css", ".btn { color: green; }\n");
+    write_file(
+        &rust_repo,
+        "src/ui/button.mjs",
+        "export const STYLESHEET = 'src/ui/theme.css';\nexport function renderButton(label) {\n  return `<button data-css=\"${STYLESHEET}\">${label}</button>`;\n}\n",
+    );
+    write_file(
+        &rust_repo,
+        "src/ui/index.mjs",
+        "export { renderButton } from './button.mjs';\n",
+    );
+    write_file(
+        &rust_repo,
+        "src/ui/button.test.mjs",
+        "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { renderButton } from './index.mjs';\n\ntest('renders button element', () => {\n  assert.match(renderButton('Save'), /<button.*>Save<\\/button>/);\n});\n",
+    );
+    rust_managed.sync(false).unwrap();
+
+    let fe_run1 = rust_managed
+        .run_tests(&TestRunRequest {
+            targets: vec!["src/ui/button.mjs".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap();
+    assert_eq!(fe_run1.status, "passed");
+    assert_eq!(fe_run1.mode, "full_run");
+    assert_eq!(fe_run1.executed_files_count, 1);
+    assert_eq!(fe_run1.passed, 1);
+
+    // Second run is an instant cache hit!
+    let fe_run2 = rust_managed
+        .run_tests(&TestRunRequest {
+            targets: vec!["src/ui/button.test.mjs".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap();
+    assert_eq!(fe_run2.mode, "instant_cache_hit");
+    assert_eq!(fe_run2.cached_files_count, 1);
+    assert_eq!(fe_run2.executed_files_count, 0);
+
+    // Node-level cache hit (`src/ui/button.test.mjs::renders button element`)
+    let fe_node_hit = rust_managed
+        .run_tests(&TestRunRequest {
+            targets: vec!["src/ui/button.test.mjs::renders button element".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap();
+    assert_eq!(fe_node_hit.mode, "instant_cache_hit");
+    assert_eq!(fe_node_hit.passed, 1);
+    assert_eq!(fe_node_hit.executed_files_count, 0);
+
+    // Editing `src/ui/theme.css` invalidates `src/ui/button.test.mjs` while keeping Rust and Python tests cached!
+    write_file(&rust_repo, "src/ui/theme.css", ".btn { color: purple; }\n");
+    let polyglot_delta = rust_managed.run_tests(&TestRunRequest::default()).unwrap();
+    assert_eq!(polyglot_delta.status, "passed");
+    assert_eq!(polyglot_delta.mode, "hybrid_delta");
+    assert_eq!(polyglot_delta.cached_files_count, 3);
+    assert_eq!(polyglot_delta.executed_files_count, 1);
+    assert_eq!(
+        polyglot_delta.executed_files[0].test_file,
+        "src/ui/button.test.mjs"
+    );
+
     rust_managed.shutdown();
 }
 

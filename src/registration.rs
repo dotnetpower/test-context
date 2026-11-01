@@ -19,6 +19,7 @@ pub fn plan(spec: &Spec) -> Result<Value> {
         "default_excludes": workspace.default_excludes,
         "pytest_cmd": spec.effective_pytest_cmd(),
         "cargo_cmd": spec.effective_cargo_cmd(),
+        "frontend_test_cmd": spec.effective_frontend_test_cmd(),
         "ruff_cmd": spec.effective_ruff_cmd(),
         "policy": spec.policy,
         "allow_worktrees": spec.allow_worktrees,

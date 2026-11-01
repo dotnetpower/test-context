@@ -1,5 +1,8 @@
 use crate::policy::MemoryPolicy;
-use crate::workspace::{DATA_FILE_EXTENSIONS, PYTEST_CONFIG_FILES, RUST_CONFIG_FILES, Workspace};
+use crate::workspace::{
+    DATA_FILE_EXTENSIONS, FRONTEND_CONFIG_FILES, FRONTEND_SOURCE_EXTENSIONS, PYTEST_CONFIG_FILES,
+    RUST_CONFIG_FILES, Workspace,
+};
 use crate::{Result, invalid};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -322,10 +325,24 @@ impl DependencyGraph {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        if PYTEST_CONFIG_FILES.contains(&file_name) || RUST_CONFIG_FILES.contains(&file_name) {
+        if PYTEST_CONFIG_FILES.contains(&file_name)
+            || RUST_CONFIG_FILES.contains(&file_name)
+            || FRONTEND_CONFIG_FILES.contains(&file_name)
+        {
             let is_new = !self.config_hashes.contains_key(rel_str);
             self.config_hashes.insert(rel_str.to_string(), sha.clone());
-            let parsed = if file_name == "Cargo.toml" || file_name == "pyproject.toml" {
+            let parsed = if matches!(
+                file_name,
+                "Cargo.toml"
+                    | "pyproject.toml"
+                    | "package.json"
+                    | "tsconfig.json"
+                    | "tsconfig.app.json"
+                    | "tsconfig.node.json"
+                    | "jsconfig.json"
+            ) || file_name.starts_with("vite.config.")
+                || file_name.starts_with("vitest.config.")
+            {
                 parse_manifest_metadata(&String::from_utf8_lossy(bytes), file_name)
             } else {
                 ParsedPythonFile::default()
@@ -370,6 +387,66 @@ impl DependencyGraph {
                     stamp,
                     is_test,
                     is_conftest,
+                    is_config: false,
+                    parsed,
+                },
+            );
+            return structure_changed;
+        }
+        if is_frontend_source_path(rel_str) {
+            let source = String::from_utf8_lossy(bytes);
+            let mut parsed = parse_frontend_source(&source);
+            if is_playwright_e2e_path(rel_str) {
+                if !parsed.markers.iter().any(|m| m == "playwright") {
+                    parsed.markers.push("playwright".to_string());
+                }
+                if !parsed.module_markers.iter().any(|m| m == "e2e") {
+                    parsed.module_markers.push("e2e".to_string());
+                }
+            }
+            let is_conftest = is_frontend_setup_file(rel_str);
+            let is_test = !is_conftest
+                && (is_frontend_test_path(rel_str)
+                    || parsed.markers.iter().any(|m| m == "in_source_vitest")
+                    || (is_storybook_story_path(rel_str)
+                        && parsed.markers.iter().any(|m| m == "storybook_play")));
+            let structure_changed = match self.files.get(rel_str) {
+                Some(existing) => {
+                    existing.is_test != is_test
+                        || existing.is_conftest != is_conftest
+                        || existing.parsed != parsed
+                }
+                None => true,
+            };
+            self.files.insert(
+                rel_str.to_string(),
+                FileNode {
+                    path: rel_str.to_string(),
+                    sha256: sha,
+                    stamp,
+                    is_test,
+                    is_conftest,
+                    is_config: false,
+                    parsed,
+                },
+            );
+            return structure_changed;
+        }
+        if is_stylesheet_path(rel_str) {
+            let source = String::from_utf8_lossy(bytes);
+            let parsed = parse_css_source(&source);
+            let structure_changed = match self.files.get(rel_str) {
+                Some(existing) => existing.parsed != parsed,
+                None => true,
+            };
+            self.files.insert(
+                rel_str.to_string(),
+                FileNode {
+                    path: rel_str.to_string(),
+                    sha256: sha,
+                    stamp,
+                    is_test: false,
+                    is_conftest: false,
                     is_config: false,
                     parsed,
                 },
@@ -503,6 +580,7 @@ impl DependencyGraph {
         let module_index = ModuleIndex::build(&self.files);
         let fixture_providers = build_fixture_provider_index(&self.files);
         let rust_index = RustModuleIndex::build(&self.files);
+        let frontend_index = FrontendModuleIndex::build(&self.files);
 
         for (path, node) in &self.files {
             if node.is_config {
@@ -514,6 +592,7 @@ impl DependencyGraph {
                 &self.files,
                 &module_index,
                 &rust_index,
+                &frontend_index,
                 &fixture_providers,
                 &self.runtime_deps_for_test,
             );
@@ -624,6 +703,8 @@ impl DependencyGraph {
                     || path == "src/lib.rs"
                     || path.ends_with("build.rs")
                     || is_rust_common_test_helper(path)
+                    || is_frontend_setup_file(path)
+                    || is_frontend_barrel_file(path)
                     || self.files.get(path).is_some_and(|node| node.is_config)
             })
         {
@@ -637,6 +718,7 @@ impl DependencyGraph {
             .collect();
         let module_index = ModuleIndex::build(&self.files);
         let rust_index = RustModuleIndex::build(&self.files);
+        let frontend_index = FrontendModuleIndex::build(&self.files);
         let fixture_providers = build_fixture_provider_index(&self.files);
         let mut replacements = BTreeMap::new();
         for path in changed_files {
@@ -652,6 +734,7 @@ impl DependencyGraph {
                     &self.files,
                     &module_index,
                     &rust_index,
+                    &frontend_index,
                     &fixture_providers,
                     &self.runtime_deps_for_test,
                 ),
@@ -890,14 +973,20 @@ impl DependencyGraph {
             // 1. Global config change affects matching language tests
             if PYTEST_CONFIG_FILES.contains(&file_name)
                 || RUST_CONFIG_FILES.contains(&file_name)
+                || FRONTEND_CONFIG_FILES.contains(&file_name)
                 || self.config_hashes.contains_key(&norm)
             {
                 let is_rust_only_cfg = RUST_CONFIG_FILES.contains(&file_name);
+                let is_fe_only_cfg = FRONTEND_CONFIG_FILES.contains(&file_name);
                 let is_py_only_cfg =
                     PYTEST_CONFIG_FILES.contains(&file_name) && file_name != "pyproject.toml";
                 for (test_path, dep_hash) in &self.dep_hash_for_test {
                     let is_rs_test = test_path.ends_with(".rs");
-                    if is_py_only_cfg && is_rs_test {
+                    let is_fe_test = is_frontend_source_path(test_path);
+                    if is_py_only_cfg && (is_rs_test || is_fe_test) {
+                        continue;
+                    }
+                    if is_fe_only_cfg && !is_fe_test {
                         continue;
                     }
                     if is_rust_only_cfg && !is_rs_test {
@@ -918,12 +1007,15 @@ impl DependencyGraph {
                 continue;
             }
 
-            // 2. conftest.py or Rust tests/common helper change affects tests under its scope directory
-            if file_name == "conftest.py" || is_rust_common_test_helper(&norm) {
+            // 2. conftest.py, Rust tests/common helper, or frontend setupTests change affects tests under its scope directory
+            if file_name == "conftest.py"
+                || is_rust_common_test_helper(&norm)
+                || is_frontend_setup_file(&norm)
+            {
                 let scope_dir = conftest_scope_dir(&norm);
-                let is_rs_helper = norm.ends_with(".rs");
+                let helper_lang = file_language_family(&norm);
                 for test_path in self.dep_hash_for_test.keys() {
-                    if test_path.ends_with(".rs") != is_rs_helper {
+                    if file_language_family(test_path) != helper_lang {
                         continue;
                     }
                     if scope_dir.is_empty() || test_path.starts_with(&format!("{scope_dir}/")) {
@@ -947,9 +1039,9 @@ impl DependencyGraph {
                 }
                 if node.is_conftest {
                     let scope_dir = conftest_scope_dir(&curr);
-                    let is_rs_helper = curr.ends_with(".rs");
+                    let helper_lang = file_language_family(&curr);
                     for test_path in self.dep_hash_for_test.keys() {
-                        if test_path.ends_with(".rs") != is_rs_helper {
+                        if file_language_family(test_path) != helper_lang {
                             continue;
                         }
                         if scope_dir.is_empty() || test_path.starts_with(&format!("{scope_dir}/"))
@@ -1023,6 +1115,24 @@ impl DependencyGraph {
             "rust"
         } else if norm.ends_with(".py") {
             "python"
+        } else if norm.ends_with(".tsx") {
+            "react_tsx"
+        } else if norm.ends_with(".jsx") {
+            "react_jsx"
+        } else if norm.ends_with(".ts") || norm.ends_with(".mts") || norm.ends_with(".cts") {
+            "typescript"
+        } else if norm.ends_with(".js") || norm.ends_with(".mjs") || norm.ends_with(".cjs") {
+            "javascript"
+        } else if norm.ends_with(".vue") {
+            "vue"
+        } else if norm.ends_with(".svelte") {
+            "svelte"
+        } else if norm.ends_with(".css")
+            || norm.ends_with(".scss")
+            || norm.ends_with(".sass")
+            || norm.ends_with(".less")
+        {
+            "css"
         } else if node.is_config {
             "config"
         } else {
@@ -1098,7 +1208,11 @@ impl DependencyGraph {
                     for affected in self.affected_tests(&source_files) {
                         selected.insert(affected.test_file);
                     }
-                } else if !norm.contains('/') && !norm.ends_with(".py") && !norm.ends_with(".rs") {
+                } else if !norm.contains('/')
+                    && !norm.ends_with(".py")
+                    && !norm.ends_with(".rs")
+                    && !is_frontend_source_path(&norm)
+                {
                     // Exact test symbol match (e.g. `test_add_unit` or `test_create_user`)
                     for test_path in self.dep_hash_for_test.keys() {
                         if self
@@ -1198,18 +1312,22 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[m]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_direct_dependencies(
     path: &str,
     node: &FileNode,
     files: &BTreeMap<String, FileNode>,
     module_index: &ModuleIndex,
     rust_index: &RustModuleIndex,
+    frontend_index: &FrontendModuleIndex,
     fixture_providers: &BTreeMap<String, Vec<String>>,
     runtime_deps_for_test: &BTreeMap<String, BTreeSet<String>>,
 ) -> BTreeSet<String> {
     let mut deps = BTreeSet::new();
     if path.ends_with(".rs") {
         deps.extend(rust_index.resolve_file_dependencies(path, node, files));
+    } else if is_frontend_source_path(path) || is_stylesheet_path(path) {
+        deps.extend(frontend_index.resolve_file_dependencies(path, node, files));
     } else {
         for spec in &node.parsed.imports {
             for resolved in module_index.resolve_import(path, spec, files) {
@@ -1284,6 +1402,173 @@ pub fn normalize_lexical_rel(path: &Path) -> Option<String> {
     }
 }
 
+pub fn is_frontend_source_path(rel_path: &str) -> bool {
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if FRONTEND_CONFIG_FILES.contains(&file_name) {
+        return false;
+    }
+    FRONTEND_SOURCE_EXTENSIONS
+        .iter()
+        .any(|ext| file_name.ends_with(ext))
+}
+
+pub fn is_frontend_setup_file(rel_path: &str) -> bool {
+    if !is_frontend_source_path(rel_path) {
+        return false;
+    }
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let stem = file_name.split('.').next().unwrap_or("");
+    if matches!(
+        stem,
+        "setupTests" | "vitest.setup" | "jest.setup" | "test-setup" | "setup-tests"
+    ) || file_name.starts_with("vitest.setup.")
+        || file_name.starts_with("jest.setup.")
+    {
+        return true;
+    }
+    rel_path.ends_with("/test/setup.ts")
+        || rel_path.ends_with("/test/setup.tsx")
+        || rel_path.ends_with("/test/setup.js")
+        || rel_path.ends_with("/tests/setup.ts")
+        || rel_path.ends_with("/tests/setup.tsx")
+        || rel_path.ends_with("/tests/setup.js")
+        || rel_path == "test/setup.ts"
+        || rel_path == "test/setup.tsx"
+        || rel_path == "test/setup.js"
+        || rel_path == "src/test/setup.ts"
+        || rel_path == "src/test/setup.tsx"
+}
+
+pub fn is_frontend_test_path(rel_path: &str) -> bool {
+    if !is_frontend_source_path(rel_path) || is_frontend_setup_file(rel_path) {
+        return false;
+    }
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    for ext in FRONTEND_SOURCE_EXTENSIONS {
+        if let Some(stem) = file_name.strip_suffix(ext)
+            && (stem.ends_with(".test")
+                || stem.ends_with(".spec")
+                || stem.ends_with(".e2e")
+                || stem.ends_with("_test")
+                || stem.ends_with("_spec"))
+        {
+            return true;
+        }
+    }
+    (rel_path.starts_with("__tests__/")
+        || rel_path.contains("/__tests__/")
+        || rel_path.starts_with("e2e/")
+        || rel_path.contains("/e2e/"))
+        && !file_name.starts_with("setup")
+        && !file_name.starts_with("helper")
+}
+
+pub fn is_frontend_barrel_file(rel_path: &str) -> bool {
+    if !is_frontend_source_path(rel_path) {
+        return false;
+    }
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    file_name.starts_with("index.")
+}
+
+pub fn is_stylesheet_path(rel_path: &str) -> bool {
+    rel_path.ends_with(".css")
+        || rel_path.ends_with(".scss")
+        || rel_path.ends_with(".sass")
+        || rel_path.ends_with(".less")
+}
+
+pub fn is_storybook_story_path(rel_path: &str) -> bool {
+    if !is_frontend_source_path(rel_path) {
+        return false;
+    }
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    for ext in FRONTEND_SOURCE_EXTENSIONS {
+        if let Some(stem) = file_name.strip_suffix(ext)
+            && (stem.ends_with(".stories") || stem.ends_with(".story"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn is_playwright_e2e_path(rel_path: &str) -> bool {
+    if !is_frontend_source_path(rel_path) {
+        return false;
+    }
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    for ext in FRONTEND_SOURCE_EXTENSIONS {
+        if let Some(stem) = file_name.strip_suffix(ext)
+            && (stem.ends_with(".e2e") || stem.ends_with(".e2e.spec") || stem.ends_with(".e2e.test"))
+        {
+            return true;
+        }
+    }
+    rel_path.starts_with("e2e/") || rel_path.contains("/e2e/")
+}
+
+pub fn file_language_family(rel_path: &str) -> &'static str {
+    if rel_path.ends_with(".rs") {
+        "rust"
+    } else if is_frontend_source_path(rel_path) {
+        "frontend"
+    } else {
+        "python"
+    }
+}
+
+pub fn frontend_pkg_dir(rel_path: &str, files: &BTreeMap<String, FileNode>) -> String {
+    let mut cur = Path::new(rel_path).parent();
+    while let Some(dir) = cur {
+        let dir_str = normalize_rel_str(dir);
+        if dir_str.is_empty() {
+            break;
+        }
+        if files.contains_key(&format!("{dir_str}/package.json"))
+            || files.contains_key(&format!("{dir_str}/tsconfig.json"))
+            || files.contains_key(&format!("{dir_str}/vite.config.ts"))
+            || files.contains_key(&format!("{dir_str}/vitest.config.ts"))
+        {
+            return dir_str;
+        }
+        cur = dir.parent();
+    }
+    if let Some((first, rest)) = rel_path.split_once('/')
+        && matches!(first, "packages" | "apps" | "services")
+        && let Some((second, _)) = rest.split_once('/')
+    {
+        return format!("{first}/{second}");
+    }
+    if let Some((first, _)) = rel_path.split_once('/')
+        && matches!(
+            first,
+            "frontend" | "web" | "client" | "ui" | "vscode-extension"
+        )
+    {
+        return first.to_string();
+    }
+    String::new()
+}
+
 pub fn is_rust_common_test_helper(rel_path: &str) -> bool {
     rel_path == "tests/common/mod.rs"
         || rel_path == "tests/common.rs"
@@ -1320,6 +1605,26 @@ pub fn conftest_scope_dir(path: &str) -> String {
     if let Some(prefix) = path.strip_suffix("/common.rs") {
         return prefix.to_string();
     }
+    if is_frontend_setup_file(path) {
+        for suffix in [
+            "/src/test/setup.ts",
+            "/src/test/setup.tsx",
+            "/src/test/setup.js",
+            "/src/setupTests.ts",
+            "/src/setupTests.tsx",
+            "/src/setupTests.js",
+            "/test/setup.ts",
+            "/test/setup.tsx",
+            "/test/setup.js",
+        ] {
+            if let Some(prefix) = path.strip_suffix(suffix) {
+                return prefix.to_string();
+            }
+        }
+        if path.starts_with("src/") || path.starts_with("test/") || path.starts_with("tests/") {
+            return String::new();
+        }
+    }
     Path::new(path)
         .parent()
         .map(normalize_rel_str)
@@ -1331,6 +1636,7 @@ pub fn is_test_filename(file_name: &str) -> bool {
         || (file_name.ends_with("_test.py") && file_name.len() > "_test.py".len())
         || (file_name.starts_with("test_") && file_name.ends_with(".rs"))
         || (file_name.ends_with("_test.rs") && file_name.len() > "_test.rs".len())
+        || is_frontend_test_path(file_name)
 }
 
 fn matches_single_pattern_fast(file_name: &str, pattern: &str) -> Option<bool> {
@@ -1411,6 +1717,18 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn ancestor_conftests_for(test_path: &str, conftests: &BTreeSet<String>) -> Vec<String> {
     let mut result = Vec::new();
+    if is_frontend_source_path(test_path) {
+        for cf in conftests {
+            if !is_frontend_source_path(cf) || cf == test_path {
+                continue;
+            }
+            let scope = conftest_scope_dir(cf);
+            if scope.is_empty() || test_path.starts_with(&format!("{scope}/")) {
+                result.push(cf.clone());
+            }
+        }
+        return result;
+    }
     if test_path.ends_with(".rs") {
         let mut prefix = String::new();
         let parent = Path::new(test_path)
@@ -1483,9 +1801,165 @@ fn is_provider_applicable(provider_path: &str, consumer_path: &str) -> bool {
     parent.is_empty() || consumer_path.starts_with(&format!("{parent}/"))
 }
 
+fn extract_package_export_target(val: &serde_json::Value) -> Option<String> {
+    match val {
+        serde_json::Value::String(s) => {
+            let clean = s.trim().trim_start_matches("./");
+            if !clean.is_empty() && !clean.ends_with(".d.ts") {
+                Some(clean.to_string())
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in ["source", "import", "module", "default", "require"] {
+                if let Some(sub) = map.get(key)
+                    && let Some(found) = extract_package_export_target(sub)
+                {
+                    return Some(found);
+                }
+            }
+            for sub in map.values() {
+                if let Some(found) = extract_package_export_target(sub) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn parse_manifest_metadata(text: &str, file_name: &str) -> ParsedPythonFile {
     let mut defined_symbols = BTreeSet::new();
     let mut module_markers = BTreeSet::new();
+    let mut data_refs = BTreeSet::new();
+    if file_name == "package.json" {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+            let pkg_name = val
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            if let Some(ref name) = pkg_name {
+                defined_symbols.insert(format!("fe_pkg:{name}"));
+            }
+            // Parse Node.js Subpath Imports (`"imports": { "#utils/*": "./src/utils/*" }`)
+            if let Some(imports_map) = val.get("imports").and_then(serde_json::Value::as_object) {
+                for (sub_key, sub_val) in imports_map {
+                    if sub_key.starts_with('#')
+                        && let Some(target) = extract_package_export_target(sub_val)
+                    {
+                        let k = sub_key.trim_end_matches('*');
+                        let v = target.trim_end_matches('*');
+                        defined_symbols.insert(format!("fe_subpath:{k}->{v}"));
+                    }
+                }
+            }
+            // Parse package `exports` map (`".": "./src/index.ts"`, `"./button": "./src/components/Button.tsx"`)
+            if let Some(ref name) = pkg_name
+                && let Some(exports_val) = val.get("exports")
+            {
+                if let Some(s) = exports_val.as_str() {
+                    let clean = s.trim().trim_start_matches("./");
+                    if !clean.is_empty() {
+                        defined_symbols.insert(format!("fe_export:{name}:.->{clean}"));
+                    }
+                } else if let Some(exports_map) = exports_val.as_object() {
+                    let has_subpath_keys = exports_map
+                        .keys()
+                        .any(|k| k == "." || k.starts_with("./"));
+                    if has_subpath_keys {
+                        for (exp_key, exp_val) in exports_map {
+                            if let Some(target) = extract_package_export_target(exp_val) {
+                                let clean_sub = if exp_key == "." {
+                                    "."
+                                } else {
+                                    exp_key.trim_start_matches("./").trim_end_matches('*')
+                                };
+                                let clean_target = target.trim_end_matches('*');
+                                defined_symbols.insert(format!(
+                                    "fe_export:{name}:{clean_sub}->{clean_target}"
+                                ));
+                            }
+                        }
+                    } else if let Some(root_target) = extract_package_export_target(exports_val) {
+                        defined_symbols.insert(format!("fe_export:{name}:.->{root_target}"));
+                    }
+                }
+            }
+        }
+        return ParsedPythonFile {
+            defined_symbols: defined_symbols.into_iter().collect(),
+            ..ParsedPythonFile::default()
+        };
+    }
+    if file_name == "tsconfig.json"
+        || file_name == "tsconfig.app.json"
+        || file_name == "tsconfig.node.json"
+        || file_name == "jsconfig.json"
+    {
+        for raw in text.lines() {
+            let line = raw.split("//").next().unwrap_or("").trim();
+            if let Some((left, right)) = line.split_once(':') {
+                let left_clean = left.trim().trim_matches(['"', '\'', ' ']);
+                if left_clean == "extends" {
+                    let ext_val = right
+                        .trim()
+                        .trim_matches([',', '"', '\'', ' '])
+                        .trim_start_matches("./");
+                    if !ext_val.is_empty() {
+                        defined_symbols.insert(format!("fe_extends:{ext_val}"));
+                        data_refs.insert(ext_val.to_string());
+                    }
+                } else if left.contains('*') && right.contains('*') {
+                    let alias_key = left_clean.trim_end_matches('*');
+                    let target_val = right
+                        .trim()
+                        .trim_matches(['[', ']', '"', '\'', ',', ' '])
+                        .trim_start_matches("./")
+                        .trim_end_matches('*');
+                    if !alias_key.is_empty() && !target_val.is_empty() {
+                        defined_symbols.insert(format!("fe_alias:{alias_key}->{target_val}"));
+                    }
+                }
+            }
+        }
+        return ParsedPythonFile {
+            defined_symbols: defined_symbols.into_iter().collect(),
+            data_refs: data_refs.into_iter().collect(),
+            ..ParsedPythonFile::default()
+        };
+    }
+    if file_name.starts_with("vite.config.") || file_name.starts_with("vitest.config.") {
+        let mut parsed = parse_frontend_source(text);
+        for raw in text.lines() {
+            let line = raw.split("//").next().unwrap_or("").trim();
+            if let Some((left, right)) = line.split_once(':') {
+                let k = left.trim().trim_matches(['"', '\'', ' ']);
+                let v = right
+                    .trim()
+                    .trim_matches([',', '"', '\'', ' '])
+                    .trim_start_matches(['.', '/']);
+                if (k.starts_with('@') || k.starts_with('~'))
+                    && !v.is_empty()
+                    && !v.contains(['(', ')', '{', '}'])
+                {
+                    let alias_pfx = format!("{}/", k.trim_end_matches('/'));
+                    let target_pfx = format!("{}/", v.trim_end_matches('/'));
+                    parsed
+                        .defined_symbols
+                        .push(format!("fe_alias:{alias_pfx}->{target_pfx}"));
+                }
+            }
+        }
+        for lit in &parsed.data_refs {
+            data_refs.insert(lit.clone());
+        }
+        parsed.data_refs = data_refs.into_iter().collect();
+        return parsed;
+    }
     let mut section = String::new();
     for raw in text.lines() {
         let line = raw.split('#').next().unwrap_or("").trim();
@@ -1919,6 +2393,585 @@ impl RustModuleIndex {
         }
 
         resolved
+    }
+}
+
+const FRONTEND_RESOLVE_EXTS: &[&str] = &[
+    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts", ".vue", ".svelte", ".json",
+    ".css", ".scss", ".sass", ".less", ".svg",
+];
+
+const FRONTEND_INDEX_FILES: &[&str] = &[
+    "index.tsx",
+    "index.ts",
+    "index.jsx",
+    "index.js",
+    "index.mjs",
+    "index.mts",
+];
+
+struct FrontendModuleIndex {
+    pkg_to_dir: BTreeMap<String, String>,
+    aliases_by_dir: BTreeMap<String, Vec<(String, String)>>,
+    subpath_imports_by_dir: BTreeMap<String, Vec<(String, String)>>,
+    pkg_exports: BTreeMap<String, Vec<(String, String)>>,
+    reexports: BTreeMap<(String, String), BTreeSet<String>>,
+    wildcard_reexports: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl FrontendModuleIndex {
+    fn build(files: &BTreeMap<String, FileNode>) -> Self {
+        let mut pkg_to_dir = BTreeMap::new();
+        let mut aliases_by_dir: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        let mut subpath_imports_by_dir: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        let mut pkg_exports: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        let mut extends_edges: Vec<(String, String)> = Vec::new();
+
+        for (path, node) in files {
+            if !node.is_config {
+                continue;
+            }
+            let dir = Path::new(path)
+                .parent()
+                .map(normalize_rel_str)
+                .unwrap_or_default();
+            for sym in &node.parsed.defined_symbols {
+                if let Some(pkg_name) = sym.strip_prefix("fe_pkg:") {
+                    pkg_to_dir.insert(pkg_name.to_string(), dir.clone());
+                } else if let Some(alias_rule) = sym.strip_prefix("fe_alias:")
+                    && let Some((alias_pfx, target_pfx)) = alias_rule.split_once("->")
+                {
+                    aliases_by_dir
+                        .entry(dir.clone())
+                        .or_default()
+                        .push((alias_pfx.to_string(), target_pfx.to_string()));
+                } else if let Some(sub_rule) = sym.strip_prefix("fe_subpath:")
+                    && let Some((sub_pfx, target_pfx)) = sub_rule.split_once("->")
+                {
+                    subpath_imports_by_dir
+                        .entry(dir.clone())
+                        .or_default()
+                        .push((sub_pfx.to_string(), target_pfx.to_string()));
+                } else if let Some(exp_rule) = sym.strip_prefix("fe_export:")
+                    && let Some((pkg_and_sub, target_pfx)) = exp_rule.split_once("->")
+                    && let Some((pkg_name, sub_key)) = pkg_and_sub.rsplit_once(':')
+                {
+                    pkg_exports
+                        .entry(pkg_name.to_string())
+                        .or_default()
+                        .push((sub_key.to_string(), target_pfx.to_string()));
+                } else if let Some(ext_rel) = sym.strip_prefix("fe_extends:") {
+                    let parent_dir = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+                    if let Some(ext_norm) = normalize_lexical_rel(&parent_dir.join(ext_rel)) {
+                        let base_dir = Path::new(&ext_norm)
+                            .parent()
+                            .map(normalize_rel_str)
+                            .unwrap_or_default();
+                        extends_edges.push((dir.clone(), base_dir));
+                    }
+                }
+            }
+        }
+
+        // Propagate `tsconfig.json` `extends` aliases from base config directory to child config directory
+        for (child_dir, base_dir) in extends_edges {
+            if let Some(base_aliases) = aliases_by_dir.get(&base_dir).cloned() {
+                let entry = aliases_by_dir.entry(child_dir).or_default();
+                for pair in base_aliases {
+                    if !entry.contains(&pair) {
+                        entry.push(pair);
+                    }
+                }
+            }
+        }
+
+        let mut index = Self {
+            pkg_to_dir,
+            aliases_by_dir,
+            subpath_imports_by_dir,
+            pkg_exports,
+            reexports: BTreeMap::new(),
+            wildcard_reexports: BTreeMap::new(),
+        };
+
+        // Two passes to resolve nested barrel (`index.ts` / `index.tsx`) re-exports
+        for _ in 0..2 {
+            let mut next_reexports = index.reexports.clone();
+            let mut next_wildcards = index.wildcard_reexports.clone();
+            for (path, node) in files {
+                if !is_frontend_barrel_file(path) {
+                    continue;
+                }
+                for sym_def in &node.parsed.defined_symbols {
+                    if let Some(rest) = sym_def.strip_prefix("reexport:")
+                        && let Some((exported_sym, target_part)) = rest.split_once("->")
+                        && let Some((module_spec, orig_sym)) = target_part.rsplit_once(':')
+                    {
+                        let targets = index.resolve_raw_specifier(path, module_spec, files);
+                        for t in targets {
+                            if is_frontend_barrel_file(&t)
+                                && let Some(forwarded) =
+                                    index.reexports.get(&(t.clone(), orig_sym.to_string()))
+                            {
+                                next_reexports
+                                    .entry((path.clone(), exported_sym.to_string()))
+                                    .or_default()
+                                    .extend(forwarded.iter().cloned());
+                            } else {
+                                next_reexports
+                                    .entry((path.clone(), exported_sym.to_string()))
+                                    .or_default()
+                                    .insert(t);
+                            }
+                        }
+                    }
+                }
+                for spec in &node.parsed.imports {
+                    if spec.symbols.iter().any(|s| s == "*") {
+                        let targets = index.resolve_raw_specifier(path, &spec.module, files);
+                        for t in targets {
+                            if is_frontend_barrel_file(&t)
+                                && let Some(forwarded) = index.wildcard_reexports.get(&t)
+                            {
+                                next_wildcards
+                                    .entry(path.clone())
+                                    .or_default()
+                                    .extend(forwarded.iter().cloned());
+                            }
+                            next_wildcards.entry(path.clone()).or_default().insert(t);
+                        }
+                    }
+                }
+            }
+            index.reexports = next_reexports;
+            index.wildcard_reexports = next_wildcards;
+        }
+
+        index
+    }
+
+    fn resolve_file_dependencies(
+        &self,
+        path: &str,
+        node: &FileNode,
+        files: &BTreeMap<String, FileNode>,
+    ) -> BTreeSet<String> {
+        let mut deps = BTreeSet::new();
+        for spec in &node.parsed.imports {
+            for resolved in self.resolve_import(path, spec, files) {
+                if resolved != path {
+                    deps.insert(resolved);
+                }
+            }
+        }
+        if node.is_test {
+            let parent = Path::new(path)
+                .parent()
+                .map(normalize_rel_str)
+                .unwrap_or_default();
+            let file_name = Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let snap_in_dir = if parent.is_empty() {
+                format!("__snapshots__/{file_name}.snap")
+            } else {
+                format!("{parent}/__snapshots__/{file_name}.snap")
+            };
+            if files.contains_key(&snap_in_dir) {
+                deps.insert(snap_in_dir);
+            }
+            let adjacent_snap = format!("{path}.snap");
+            if files.contains_key(&adjacent_snap) {
+                deps.insert(adjacent_snap);
+            }
+        }
+        deps
+    }
+
+    fn resolve_import(
+        &self,
+        importer_path: &str,
+        spec: &ImportSpec,
+        files: &BTreeMap<String, FileNode>,
+    ) -> BTreeSet<String> {
+        let raw_targets = self.resolve_raw_specifier(importer_path, &spec.module, files);
+        if spec.symbols.is_empty() || spec.symbols.iter().any(|s| s == "*") {
+            let mut expanded = raw_targets.clone();
+            for t in &raw_targets {
+                if let Some(wild) = self.wildcard_reexports.get(t) {
+                    expanded.extend(wild.iter().cloned());
+                }
+            }
+            return expanded;
+        }
+
+        let mut resolved = BTreeSet::new();
+        for target in &raw_targets {
+            if is_frontend_barrel_file(target) {
+                let mut all_accounted = true;
+                for sym in &spec.symbols {
+                    if let Some(reexported) = self.reexports.get(&(target.clone(), sym.clone())) {
+                        resolved.extend(reexported.iter().cloned());
+                    } else if files
+                        .get(target)
+                        .is_some_and(|n| n.parsed.defined_symbols.contains(sym))
+                    {
+                        resolved.insert(target.clone());
+                    } else {
+                        let barrel_dir = Path::new(target)
+                            .parent()
+                            .map(normalize_rel_str)
+                            .unwrap_or_default();
+                        let sym_base = if barrel_dir.is_empty() {
+                            sym.clone()
+                        } else {
+                            format!("{barrel_dir}/{sym}")
+                        };
+                        let mut sub_matches = BTreeSet::new();
+                        add_frontend_path_candidates(&sym_base, files, &mut sub_matches);
+                        if !sub_matches.is_empty() {
+                            resolved.extend(sub_matches);
+                        } else {
+                            all_accounted = false;
+                        }
+                    }
+                }
+                if !all_accounted {
+                    resolved.insert(target.clone());
+                    if let Some(wild) = self.wildcard_reexports.get(target) {
+                        for w in wild {
+                            if files.get(w).is_some_and(|n| {
+                                spec.symbols
+                                    .iter()
+                                    .any(|s| n.parsed.defined_symbols.contains(s))
+                            }) {
+                                resolved.insert(w.clone());
+                            }
+                        }
+                    }
+                }
+            } else {
+                resolved.insert(target.clone());
+            }
+        }
+        resolved
+    }
+
+    fn resolve_raw_specifier(
+        &self,
+        importer_path: &str,
+        raw_module: &str,
+        files: &BTreeMap<String, FileNode>,
+    ) -> BTreeSet<String> {
+        let mut resolved = BTreeSet::new();
+        let parent = Path::new(importer_path)
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
+        let pkg_dir = frontend_pkg_dir(importer_path, files);
+
+        // 0. Vite `import.meta.glob('...')` pattern expansion
+        if let Some(glob_pat) = raw_module.strip_prefix("glob:") {
+            let norm_glob = if glob_pat.starts_with("./") || glob_pat.starts_with("../") {
+                normalize_lexical_rel(&parent.join(glob_pat)).unwrap_or_else(|| glob_pat.to_string())
+            } else if let Some(rest) = glob_pat.strip_prefix('/') {
+                if pkg_dir.is_empty() {
+                    rest.to_string()
+                } else {
+                    format!("{pkg_dir}/{rest}")
+                }
+            } else {
+                glob_pat.to_string()
+            };
+            if let Ok(glob) = globset::Glob::new(&norm_glob) {
+                let matcher = glob.compile_matcher();
+                for candidate_path in files.keys() {
+                    if candidate_path != importer_path && matcher.is_match(candidate_path) {
+                        resolved.insert(candidate_path.clone());
+                    }
+                }
+            }
+            return resolved;
+        }
+
+        let Some(clean_mod) = clean_frontend_import_specifier(raw_module) else {
+            return resolved;
+        };
+
+        // 0b. Node.js / Package `#...` Subpath Imports (`#utils/math` -> `src/utils/math.ts`)
+        if clean_mod.starts_with('#') {
+            for lookup_dir in [&pkg_dir, &String::new()] {
+                if let Some(rules) = self.subpath_imports_by_dir.get(lookup_dir) {
+                    for (sub_pfx, target_pfx) in rules {
+                        if let Some(rest) = clean_mod.strip_prefix(sub_pfx.as_str()) {
+                            let mapped = if lookup_dir.is_empty() {
+                                format!("{target_pfx}{rest}")
+                            } else {
+                                format!("{lookup_dir}/{target_pfx}{rest}")
+                            };
+                            if let Some(norm) = normalize_lexical_rel(Path::new(&mapped)) {
+                                add_frontend_path_candidates(&norm, files, &mut resolved);
+                            }
+                        }
+                    }
+                }
+            }
+            return resolved;
+        }
+
+        // 1. Relative import (`./foo`, `../bar`)
+        if clean_mod.starts_with("./")
+            || clean_mod.starts_with("../")
+            || clean_mod == "."
+            || clean_mod == ".."
+        {
+            if let Some(norm) = normalize_lexical_rel(&parent.join(&clean_mod)) {
+                add_frontend_path_candidates(&norm, files, &mut resolved);
+            }
+            return resolved;
+        }
+
+        // 2. Root-relative import (`/src/...`)
+        if let Some(stripped_root) = clean_mod.strip_prefix('/') {
+            let cand = if pkg_dir.is_empty() {
+                stripped_root.to_string()
+            } else {
+                format!("{pkg_dir}/{stripped_root}")
+            };
+            add_frontend_path_candidates(&cand, files, &mut resolved);
+            if resolved.is_empty() {
+                add_frontend_path_candidates(stripped_root, files, &mut resolved);
+            }
+            return resolved;
+        }
+
+        // 3. Configured tsconfig/jsconfig/vite path aliases (check both package dir and workspace root)
+        for lookup_dir in [&pkg_dir, &String::new()] {
+            if let Some(aliases) = self.aliases_by_dir.get(lookup_dir) {
+                for (alias_pfx, target_pfx) in aliases {
+                    if let Some(rest) = clean_mod.strip_prefix(alias_pfx.as_str()) {
+                        let mapped = if lookup_dir.is_empty() {
+                            format!("{target_pfx}{rest}")
+                        } else {
+                            format!("{lookup_dir}/{target_pfx}{rest}")
+                        };
+                        if let Some(norm) = normalize_lexical_rel(Path::new(&mapped)) {
+                            add_frontend_path_candidates(&norm, files, &mut resolved);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Conventional `@/` or `~/` alias to `{pkg_dir}/src/` or `{pkg_dir}/`
+        if let Some(rest) = clean_mod
+            .strip_prefix("@/")
+            .or_else(|| clean_mod.strip_prefix("~/"))
+        {
+            for base in [
+                if pkg_dir.is_empty() {
+                    format!("src/{rest}")
+                } else {
+                    format!("{pkg_dir}/src/{rest}")
+                },
+                if pkg_dir.is_empty() {
+                    rest.to_string()
+                } else {
+                    format!("{pkg_dir}/{rest}")
+                },
+                format!("src/{rest}"),
+            ] {
+                add_frontend_path_candidates(&base, files, &mut resolved);
+            }
+            if !resolved.is_empty() {
+                return resolved;
+            }
+        }
+
+        // 5. Monorepo workspace package import (`@scope/ui` or `@scope/ui/Button`)
+        for (pkg_name, target_pkg_dir) in &self.pkg_to_dir {
+            if &clean_mod == pkg_name {
+                if let Some(exp_rules) = self.pkg_exports.get(pkg_name) {
+                    for (sub_k, target_v) in exp_rules {
+                        if sub_k == "." || sub_k.is_empty() {
+                            let mapped = if target_pkg_dir.is_empty() {
+                                target_v.clone()
+                            } else {
+                                format!("{target_pkg_dir}/{target_v}")
+                            };
+                            add_frontend_path_candidates(&mapped, files, &mut resolved);
+                        }
+                    }
+                }
+                for entry_prefix in [
+                    if target_pkg_dir.is_empty() {
+                        "src".to_string()
+                    } else {
+                        format!("{target_pkg_dir}/src")
+                    },
+                    target_pkg_dir.clone(),
+                ] {
+                    add_frontend_path_candidates(&entry_prefix, files, &mut resolved);
+                }
+            } else if let Some(subpath) = clean_mod
+                .strip_prefix(pkg_name.as_str())
+                .and_then(|s| s.strip_prefix('/'))
+            {
+                if let Some(exp_rules) = self.pkg_exports.get(pkg_name) {
+                    for (sub_k, target_v) in exp_rules {
+                        if sub_k == subpath {
+                            let mapped = if target_pkg_dir.is_empty() {
+                                target_v.clone()
+                            } else {
+                                format!("{target_pkg_dir}/{target_v}")
+                            };
+                            add_frontend_path_candidates(&mapped, files, &mut resolved);
+                        } else if !sub_k.is_empty()
+                            && sub_k != "."
+                            && let Some(rest) = subpath.strip_prefix(sub_k.as_str())
+                        {
+                            let mapped = if target_pkg_dir.is_empty() {
+                                format!("{target_v}{rest}")
+                            } else {
+                                format!("{target_pkg_dir}/{target_v}{rest}")
+                            };
+                            add_frontend_path_candidates(&mapped, files, &mut resolved);
+                        }
+                    }
+                }
+                for base in [
+                    if target_pkg_dir.is_empty() {
+                        format!("src/{subpath}")
+                    } else {
+                        format!("{target_pkg_dir}/src/{subpath}")
+                    },
+                    if target_pkg_dir.is_empty() {
+                        subpath.to_string()
+                    } else {
+                        format!("{target_pkg_dir}/{subpath}")
+                    },
+                ] {
+                    add_frontend_path_candidates(&base, files, &mut resolved);
+                }
+            }
+        }
+
+        // 6. BaseUrl fallback (`src/<clean_mod>`)
+        if resolved.is_empty() && !clean_mod.starts_with('@') {
+            let base = if pkg_dir.is_empty() {
+                format!("src/{clean_mod}")
+            } else {
+                format!("{pkg_dir}/src/{clean_mod}")
+            };
+            add_frontend_path_candidates(&base, files, &mut resolved);
+        }
+
+        resolved
+    }
+}
+
+fn add_frontend_path_candidates(
+    target_path: &str,
+    files: &BTreeMap<String, FileNode>,
+    resolved: &mut BTreeSet<String>,
+) {
+    let norm = target_path.trim_matches('/');
+    if norm.is_empty() {
+        for idx_file in FRONTEND_INDEX_FILES {
+            if files.contains_key(*idx_file) {
+                resolved.insert((*idx_file).to_string());
+            }
+        }
+        return;
+    }
+
+    // 1. Exact file match (e.g. `styles.module.css`, `logo.svg`, `helper.ts`)
+    if files.contains_key(norm) {
+        resolved.insert(norm.to_string());
+    }
+
+    // 2. TypeScript NodeNext/Bundler `.js` / `.jsx` / `.mjs` -> `.ts` / `.tsx` / `.mts` remapping
+    for (js_ext, ts_exts) in [
+        (".js", &[".ts", ".tsx", ".d.ts"][..]),
+        (".jsx", &[".tsx", ".ts"][..]),
+        (".mjs", &[".mts", ".ts"][..]),
+        (".cjs", &[".cts", ".ts"][..]),
+    ] {
+        if let Some(stem) = norm.strip_suffix(js_ext) {
+            for ts_ext in ts_exts {
+                let cand = format!("{stem}{ts_ext}");
+                if files.contains_key(&cand) {
+                    resolved.insert(cand);
+                }
+            }
+        }
+    }
+
+    // 3. Extensionless module path -> try frontend extensions
+    for ext in FRONTEND_RESOLVE_EXTS {
+        let cand = format!("{norm}{ext}");
+        if files.contains_key(&cand) {
+            resolved.insert(cand);
+        }
+    }
+
+    // 4. Directory barrel (`index.tsx`, `index.ts`, `index.jsx`, `index.js`)
+    for idx_file in FRONTEND_INDEX_FILES {
+        let cand = format!("{norm}/{idx_file}");
+        if files.contains_key(&cand) {
+            resolved.insert(cand);
+        }
+    }
+
+    // 5. Sass / SCSS partial convention (`styles/tokens` -> `styles/_tokens.scss`, `styles/_index.scss`)
+    let parent = Path::new(norm)
+        .parent()
+        .map(normalize_rel_str)
+        .unwrap_or_default();
+    if let Some(file_name) = Path::new(norm).file_name().and_then(|n| n.to_str())
+        && !file_name.starts_with('_')
+    {
+        let partial_base = if parent.is_empty() {
+            format!("_{file_name}")
+        } else {
+            format!("{parent}/_{file_name}")
+        };
+        if files.contains_key(&partial_base) {
+            resolved.insert(partial_base.clone());
+        }
+        for ext in [".scss", ".sass", ".less", ".css"] {
+            let cand = format!("{partial_base}{ext}");
+            if files.contains_key(&cand) {
+                resolved.insert(cand);
+            }
+        }
+    }
+    for idx_scss in ["_index.scss", "index.scss", "_index.sass", "index.sass"] {
+        let cand = format!("{norm}/{idx_scss}");
+        if files.contains_key(&cand) {
+            resolved.insert(cand);
+        }
+    }
+}
+
+pub fn clean_frontend_import_specifier(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("node:")
+        || trimmed.starts_with("virtual:")
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("data:")
+        || trimmed.contains('\0')
+    {
+        return None;
+    }
+    // Strip Vite query parameters such as `?raw`, `?url`, `?worker`, `?inline`, `?react`
+    let without_query = trimmed.split('?').next().unwrap_or(trimmed).trim();
+    if without_query.is_empty() {
+        None
+    } else {
+        Some(without_query.replace('\\', "/"))
     }
 }
 
@@ -3600,6 +4653,806 @@ fn rust_use_path_to_parts(path: &[String]) -> Option<(usize, String, Option<Stri
     Some((0, module, sym))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum JsToken {
+    Ident(String),
+    StringLit(String),
+    LBrace,
+    RBrace,
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    Comma,
+    Dot,
+    Semi,
+    Star,
+    Other,
+}
+
+fn push_js_other(tokens: &mut Vec<JsToken>) {
+    if !matches!(tokens.last(), Some(JsToken::Other)) {
+        tokens.push(JsToken::Other);
+    }
+}
+
+fn tokenize_frontend(source: &str) -> Vec<JsToken> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut tokens = Vec::with_capacity((len / 6).clamp(16, 65_536));
+
+    while i < len {
+        let b = bytes[i];
+        match b {
+            b' ' | b'\t' | b'\r' | b'\n' => {
+                i += 1;
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'/' => {
+                i = memchr::memchr(b'\n', &bytes[i + 2..])
+                    .map(|off| i + 2 + off)
+                    .unwrap_or(len);
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < len {
+                    if let Some(off) = memchr::memchr(b'*', &bytes[i..]) {
+                        i += off;
+                        if i + 1 < len && bytes[i + 1] == b'/' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    } else {
+                        i = len;
+                        break;
+                    }
+                }
+            }
+            b'\'' | b'"' => {
+                let (lit, next_i) = scan_js_string(source, i, b);
+                tokens.push(JsToken::StringLit(lit));
+                i = next_i;
+            }
+            b'`' => {
+                let (lit, next_i) = scan_js_template_string(source, i);
+                if !lit.is_empty() {
+                    tokens.push(JsToken::StringLit(lit));
+                }
+                i = next_i;
+            }
+            b'{' => {
+                tokens.push(JsToken::LBrace);
+                i += 1;
+            }
+            b'}' => {
+                tokens.push(JsToken::RBrace);
+                i += 1;
+            }
+            b'(' => {
+                tokens.push(JsToken::LParen);
+                i += 1;
+            }
+            b')' => {
+                tokens.push(JsToken::RParen);
+                i += 1;
+            }
+            b'[' => {
+                tokens.push(JsToken::LBracket);
+                i += 1;
+            }
+            b']' => {
+                tokens.push(JsToken::RBracket);
+                i += 1;
+            }
+            b',' => {
+                tokens.push(JsToken::Comma);
+                i += 1;
+            }
+            b'.' => {
+                tokens.push(JsToken::Dot);
+                i += 1;
+            }
+            b';' => {
+                tokens.push(JsToken::Semi);
+                i += 1;
+            }
+            b'*' => {
+                tokens.push(JsToken::Star);
+                i += 1;
+            }
+            _ if is_ident_start(b) || b == b'$' => {
+                let start = i;
+                i += 1;
+                while i < len && (is_ident_continue(bytes[i]) || bytes[i] == b'$') {
+                    i += 1;
+                }
+                tokens.push(JsToken::Ident(source[start..i].to_string()));
+            }
+            _ => {
+                push_js_other(&mut tokens);
+                i += 1;
+            }
+        }
+    }
+    tokens
+}
+
+fn scan_js_string(source: &str, quote_idx: usize, quote: u8) -> (String, usize) {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let start = quote_idx + 1;
+    let mut i = start;
+    while i < len {
+        let Some(off) = memchr::memchr3(quote, b'\\', b'\n', &bytes[i..]) else {
+            break;
+        };
+        i += off;
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(len);
+            continue;
+        }
+        return (source[start..i].to_string(), (i + 1).min(len));
+    }
+    (source[start..len].to_string(), len)
+}
+
+fn scan_js_template_string(source: &str, quote_idx: usize) -> (String, usize) {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let start = quote_idx + 1;
+    let mut i = start;
+    let mut has_interpolation = false;
+    while i < len {
+        let Some(off) = memchr::memchr3(b'`', b'\\', b'$', &bytes[i..]) else {
+            break;
+        };
+        i += off;
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(len);
+            continue;
+        }
+        if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
+            has_interpolation = true;
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'`' {
+            let lit = if has_interpolation {
+                String::new()
+            } else {
+                source[start..i].to_string()
+            };
+            return (lit, i + 1);
+        }
+        i += 1;
+    }
+    (String::new(), len)
+}
+
+/// Parses a frontend source file (`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`, `.vue`, `.svelte`)
+/// to extract ES/CJS/dynamic imports, `import type` exclusions, Barrel re-exports, Vite asset queries,
+/// `import.meta.env` / `process.env` keys, React component/hook definitions, and Vitest/Jest/Node test symbols.
+pub fn parse_frontend_source(source: &str) -> ParsedPythonFile {
+    let tokens = tokenize_frontend(source);
+    let mut imports = BTreeSet::new();
+    let mut type_checking_imports = BTreeSet::new();
+    let mut test_symbols = BTreeSet::new();
+    let mut defined_symbols = BTreeSet::new();
+    let mut data_refs = BTreeSet::new();
+    let mut markers = BTreeSet::new();
+    let mut module_markers = BTreeSet::new();
+    let mut env_vars = BTreeSet::new();
+
+    for tok in &tokens {
+        if let JsToken::StringLit(lit) = tok
+            && let Some(clean_spec) = clean_frontend_import_specifier(lit)
+            && let Some(clean_ref) = normalize_data_ref(&clean_spec)
+        {
+            data_refs.insert(clean_ref);
+        }
+    }
+
+    let n = tokens.len();
+    let mut i = 0usize;
+
+    while i < n {
+        match &tokens[i] {
+            JsToken::Ident(kw) if kw == "import" => {
+                // 1. `import.meta.env.VITE_...` or `import.meta.vitest`
+                if matches!(tokens.get(i + 1), Some(JsToken::Dot))
+                    && matches!(tokens.get(i + 2), Some(JsToken::Ident(m)) if m == "meta")
+                    && matches!(tokens.get(i + 3), Some(JsToken::Dot))
+                {
+                    if let Some(JsToken::Ident(prop)) = tokens.get(i + 4) {
+                        if prop == "vitest" {
+                            markers.insert("in_source_vitest".to_string());
+                        } else if prop == "glob"
+                            && matches!(tokens.get(i + 5), Some(JsToken::LParen))
+                        {
+                            let mut j = i + 6;
+                            while j < n && !matches!(tokens[j], JsToken::RParen) {
+                                if let JsToken::StringLit(pat) = &tokens[j] {
+                                    let trimmed = pat.trim();
+                                    if !trimmed.is_empty() {
+                                        imports.insert(ImportSpec {
+                                            level: 0,
+                                            module: format!("glob:{trimmed}"),
+                                            symbols: vec!["*".to_string()],
+                                        });
+                                    }
+                                }
+                                j += 1;
+                            }
+                            i = (j + 1).min(n);
+                            continue;
+                        } else if prop == "env"
+                            && matches!(tokens.get(i + 5), Some(JsToken::Dot))
+                            && let Some(JsToken::Ident(env_key)) = tokens.get(i + 6)
+                            && is_valid_env_var_name(env_key)
+                        {
+                            env_vars.insert(env_key.clone());
+                            i += 7;
+                            continue;
+                        }
+                    }
+                    i += 4;
+                    continue;
+                }
+                // 2. Dynamic `import('...')`
+                if matches!(tokens.get(i + 1), Some(JsToken::LParen)) {
+                    if let Some(JsToken::StringLit(spec)) = tokens.get(i + 2)
+                        && let Some(clean) = clean_frontend_import_specifier(spec)
+                    {
+                        imports.insert(ImportSpec {
+                            level: 0,
+                            module: clean,
+                            symbols: Vec::new(),
+                        });
+                    }
+                    i += 2;
+                    continue;
+                }
+                // 3. Static `import ...`
+                let (parsed_spec, is_type_only, next_i) = parse_js_import_clause(&tokens, i + 1);
+                if let Some(spec) = parsed_spec {
+                    if spec.module == "@playwright/test" || spec.module.starts_with("@playwright/") {
+                        markers.insert("playwright".to_string());
+                        module_markers.insert("e2e".to_string());
+                    } else if spec.module == "@storybook/test"
+                        || spec.module.starts_with("@storybook/testing-")
+                    {
+                        markers.insert("storybook_play".to_string());
+                    }
+                    if is_type_only {
+                        type_checking_imports.insert(spec);
+                    } else {
+                        imports.insert(spec);
+                    }
+                }
+                i = next_i;
+            }
+            JsToken::Ident(kw) if kw == "URL" => {
+                // `new URL('./worker.ts', import.meta.url)`
+                if matches!(tokens.get(i + 1), Some(JsToken::LParen))
+                    && let Some(JsToken::StringLit(spec)) = tokens.get(i + 2)
+                    && matches!(tokens.get(i + 3), Some(JsToken::Comma))
+                    && matches!(tokens.get(i + 4), Some(JsToken::Ident(im)) if im == "import")
+                    && let Some(clean) = clean_frontend_import_specifier(spec)
+                {
+                    imports.insert(ImportSpec {
+                        level: 0,
+                        module: clean,
+                        symbols: Vec::new(),
+                    });
+                    i += 5;
+                    continue;
+                }
+                i += 1;
+            }
+            JsToken::Ident(kw) if kw == "play" => {
+                // Storybook interaction test (`Primary.play = async ...` or `play: async ({ canvasElement }) => ...`)
+                if matches!(tokens.get(i + 1), Some(JsToken::Other)) {
+                    markers.insert("storybook_play".to_string());
+                    test_symbols.insert("play".to_string());
+                }
+                i += 1;
+            }
+            JsToken::Ident(kw) if kw == "export" => {
+                let (reexport_opt, is_type_only, exported_defs, reexport_links, next_i) =
+                    parse_js_export_clause(&tokens, i + 1);
+                for d in exported_defs {
+                    defined_symbols.insert(d);
+                }
+                for link in reexport_links {
+                    defined_symbols.insert(link);
+                }
+                if let Some(spec) = reexport_opt {
+                    if is_type_only {
+                        type_checking_imports.insert(spec);
+                    } else {
+                        imports.insert(spec);
+                    }
+                }
+                i = next_i;
+            }
+            JsToken::Ident(kw) if kw == "require" => {
+                if matches!(tokens.get(i + 1), Some(JsToken::LParen))
+                    && let Some(JsToken::StringLit(spec)) = tokens.get(i + 2)
+                    && let Some(clean) = clean_frontend_import_specifier(spec)
+                {
+                    imports.insert(ImportSpec {
+                        level: 0,
+                        module: clean,
+                        symbols: Vec::new(),
+                    });
+                    i += 3;
+                    continue;
+                }
+                i += 1;
+            }
+            JsToken::Ident(kw) if kw == "vi" || kw == "jest" => {
+                if matches!(tokens.get(i + 1), Some(JsToken::Dot))
+                    && let Some(JsToken::Ident(method)) = tokens.get(i + 2)
+                    && matches!(
+                        method.as_str(),
+                        "mock" | "doMock" | "importActual" | "requireActual"
+                    )
+                    && matches!(tokens.get(i + 3), Some(JsToken::LParen))
+                    && let Some(JsToken::StringLit(spec)) = tokens.get(i + 4)
+                    && let Some(clean) = clean_frontend_import_specifier(spec)
+                {
+                    imports.insert(ImportSpec {
+                        level: 0,
+                        module: clean,
+                        symbols: Vec::new(),
+                    });
+                    i += 5;
+                    continue;
+                }
+                i += 1;
+            }
+            JsToken::Ident(kw) if kw == "process" => {
+                if matches!(tokens.get(i + 1), Some(JsToken::Dot))
+                    && matches!(tokens.get(i + 2), Some(JsToken::Ident(e)) if e == "env")
+                {
+                    if matches!(tokens.get(i + 3), Some(JsToken::Dot))
+                        && let Some(JsToken::Ident(env_key)) = tokens.get(i + 4)
+                        && is_valid_env_var_name(env_key)
+                    {
+                        env_vars.insert(env_key.clone());
+                        i += 5;
+                        continue;
+                    }
+                    if matches!(tokens.get(i + 3), Some(JsToken::LBracket))
+                        && let Some(JsToken::StringLit(env_key)) = tokens.get(i + 4)
+                        && matches!(tokens.get(i + 5), Some(JsToken::RBracket))
+                        && is_valid_env_var_name(env_key)
+                    {
+                        env_vars.insert(env_key.trim().to_string());
+                        i += 6;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            JsToken::Ident(kw) if matches!(kw.as_str(), "test" | "it" | "describe") => {
+                let mut j = i + 1;
+                while j < n && matches!(tokens.get(j), Some(JsToken::Dot)) {
+                    if let Some(JsToken::Ident(modifier)) = tokens.get(j + 1) {
+                        match modifier.as_str() {
+                            "skip" | "todo" => {
+                                markers.insert(modifier.clone());
+                            }
+                            "concurrent" => {
+                                markers.insert("concurrent".to_string());
+                                module_markers.insert("parallel_safe".to_string());
+                            }
+                            "sequential" | "serial" => {
+                                markers.insert("serial".to_string());
+                                module_markers.insert("serial".to_string());
+                            }
+                            "only" => {
+                                markers.insert("only".to_string());
+                            }
+                            _ => {}
+                        }
+                        j += 2;
+                        // Handle `.each(...)` call before `('test name', ...)`
+                        if modifier == "each" && matches!(tokens.get(j), Some(JsToken::LParen)) {
+                            let mut depth = 1usize;
+                            j += 1;
+                            while j < n && depth > 0 {
+                                match &tokens[j] {
+                                    JsToken::LParen => depth += 1,
+                                    JsToken::RParen => depth -= 1,
+                                    _ => {}
+                                }
+                                j += 1;
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                if matches!(tokens.get(j), Some(JsToken::LParen))
+                    && let Some(JsToken::StringLit(name)) = tokens.get(j + 1)
+                {
+                    let trimmed = name.trim();
+                    if !trimmed.is_empty() && trimmed.len() <= 200 {
+                        test_symbols.insert(trimmed.to_string());
+                    }
+                    i = j + 2;
+                    continue;
+                }
+                i += 1;
+            }
+            JsToken::Ident(kw)
+                if matches!(kw.as_str(), "function" | "class" | "const" | "let") =>
+            {
+                if let Some(JsToken::Ident(sym_name)) = tokens.get(i + 1) {
+                    defined_symbols.insert(sym_name.clone());
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    ParsedPythonFile {
+        imports: imports.into_iter().collect(),
+        test_symbols: test_symbols.into_iter().collect(),
+        fixtures_defined: Vec::new(),
+        fixtures_used: Vec::new(),
+        defined_symbols: defined_symbols.into_iter().collect(),
+        data_refs: data_refs.into_iter().collect(),
+        markers: markers.into_iter().collect(),
+        module_markers: module_markers.into_iter().collect(),
+        rust_mods: Vec::new(),
+        type_checking_imports: type_checking_imports.into_iter().collect(),
+        env_vars_referenced: env_vars.into_iter().collect(),
+    }
+}
+
+/// Parses a CSS / SCSS / Sass / Less stylesheet to extract `@import`, `@use`, `@forward`, and `url(...)` dependencies.
+pub fn parse_css_source(source: &str) -> ParsedPythonFile {
+    let tokens = tokenize_frontend(source);
+    let mut imports = BTreeSet::new();
+    let mut data_refs = BTreeSet::new();
+    let n = tokens.len();
+    let mut i = 0usize;
+
+    while i < n {
+        match &tokens[i] {
+            JsToken::Ident(kw) if matches!(kw.as_str(), "import" | "use" | "forward") => {
+                if let Some(JsToken::StringLit(spec)) = tokens.get(i + 1) {
+                    if let Some(clean) = clean_frontend_import_specifier(spec) {
+                        let module = if clean.starts_with('.') || clean.starts_with('/') || clean.starts_with('@') || clean.starts_with('~') {
+                            clean
+                        } else {
+                            format!("./{clean}")
+                        };
+                        imports.insert(ImportSpec {
+                            level: 0,
+                            module,
+                            symbols: Vec::new(),
+                        });
+                    }
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            JsToken::Ident(kw) if kw == "url" => {
+                if matches!(tokens.get(i + 1), Some(JsToken::LParen))
+                    && let Some(JsToken::StringLit(spec)) = tokens.get(i + 2)
+                    && let Some(clean) = clean_frontend_import_specifier(spec)
+                {
+                    if let Some(clean_ref) = normalize_data_ref(&clean) {
+                        data_refs.insert(clean_ref);
+                    }
+                    let module = if clean.starts_with('.') || clean.starts_with('/') {
+                        clean
+                    } else {
+                        format!("./{clean}")
+                    };
+                    imports.insert(ImportSpec {
+                        level: 0,
+                        module,
+                        symbols: Vec::new(),
+                    });
+                    i += 3;
+                    continue;
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+
+    ParsedPythonFile {
+        imports: imports.into_iter().collect(),
+        data_refs: data_refs.into_iter().collect(),
+        ..ParsedPythonFile::default()
+    }
+}
+
+fn parse_js_import_clause(
+    tokens: &[JsToken],
+    mut i: usize,
+) -> (Option<ImportSpec>, bool, usize) {
+    let n = tokens.len();
+    // Side-effect import: `import './styles.css'`
+    if let Some(JsToken::StringLit(spec)) = tokens.get(i) {
+        let parsed = clean_frontend_import_specifier(spec).map(|module| ImportSpec {
+            level: 0,
+            module,
+            symbols: Vec::new(),
+        });
+        return (parsed, false, i + 1);
+    }
+
+    let mut top_type_only = false;
+    if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "type")
+        && !matches!(tokens.get(i + 1), Some(JsToken::Ident(f)) if f == "from")
+    {
+        top_type_only = true;
+        i += 1;
+    }
+
+    let mut value_symbols = BTreeSet::new();
+    let mut type_symbols = BTreeSet::new();
+    let mut had_named_or_default = false;
+
+    while i < n {
+        match &tokens[i] {
+            JsToken::Ident(kw) if kw == "from" => {
+                if let Some(JsToken::StringLit(spec)) = tokens.get(i + 1) {
+                    let is_type_only = top_type_only
+                        || (had_named_or_default
+                            && value_symbols.is_empty()
+                            && !type_symbols.is_empty());
+                    let syms = if is_type_only {
+                        type_symbols.into_iter().collect()
+                    } else {
+                        value_symbols.into_iter().collect()
+                    };
+                    let parsed = clean_frontend_import_specifier(spec).map(|module| ImportSpec {
+                        level: 0,
+                        module,
+                        symbols: syms,
+                    });
+                    return (parsed, is_type_only, i + 2);
+                }
+                return (None, false, i + 1);
+            }
+            JsToken::Star => {
+                had_named_or_default = true;
+                if top_type_only {
+                    type_symbols.insert("*".to_string());
+                } else {
+                    value_symbols.insert("*".to_string());
+                }
+                i += 1;
+                if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "as") {
+                    i += 2;
+                }
+            }
+            JsToken::LBrace => {
+                had_named_or_default = true;
+                i += 1;
+                while i < n && !matches!(tokens[i], JsToken::RBrace) {
+                    let mut item_type_only = top_type_only;
+                    if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "type")
+                        && matches!(tokens.get(i + 1), Some(JsToken::Ident(_)))
+                    {
+                        item_type_only = true;
+                        i += 1;
+                    }
+                    if let Some(JsToken::Ident(orig_sym)) = tokens.get(i) {
+                        let sym_to_record = orig_sym.clone();
+                        i += 1;
+                        if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "as") {
+                            i += 2;
+                        }
+                        if item_type_only {
+                            type_symbols.insert(sym_to_record);
+                        } else {
+                            value_symbols.insert(sym_to_record);
+                        }
+                    } else {
+                        i += 1;
+                    }
+                    if matches!(tokens.get(i), Some(JsToken::Comma)) {
+                        i += 1;
+                    }
+                }
+                if i < n && matches!(tokens[i], JsToken::RBrace) {
+                    i += 1;
+                }
+            }
+            JsToken::Ident(default_ident) => {
+                had_named_or_default = true;
+                let _ = default_ident;
+                if top_type_only {
+                    type_symbols.insert("default".to_string());
+                } else {
+                    value_symbols.insert("default".to_string());
+                }
+                i += 1;
+            }
+            JsToken::Comma => {
+                i += 1;
+            }
+            JsToken::Semi => {
+                return (None, false, i + 1);
+            }
+            _ => {
+                return (None, false, i + 1);
+            }
+        }
+    }
+    (None, false, i)
+}
+
+fn parse_js_export_clause(
+    tokens: &[JsToken],
+    mut i: usize,
+) -> (Option<ImportSpec>, bool, Vec<String>, Vec<String>, usize) {
+    let n = tokens.len();
+    let mut defined = Vec::new();
+    let mut reexport_links = Vec::new();
+    let mut top_type_only = false;
+
+    if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "type") {
+        if matches!(tokens.get(i + 1), Some(JsToken::LBrace | JsToken::Star)) {
+            top_type_only = true;
+            i += 1;
+        } else if let Some(JsToken::Ident(type_name)) = tokens.get(i + 1) {
+            defined.push(type_name.clone());
+            return (None, true, defined, reexport_links, i + 2);
+        }
+    }
+
+    if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "default") {
+        defined.push("default".to_string());
+        i += 1;
+        if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "function" || kw == "class")
+            && let Some(JsToken::Ident(name)) = tokens.get(i + 1)
+        {
+            defined.push(name.clone());
+            return (None, false, defined, reexport_links, i + 2);
+        }
+        return (None, false, defined, reexport_links, i);
+    }
+
+    if let Some(JsToken::Ident(kw)) = tokens.get(i) {
+        if kw == "async"
+            && matches!(tokens.get(i + 1), Some(JsToken::Ident(f)) if f == "function")
+            && let Some(JsToken::Ident(name)) = tokens.get(i + 2)
+        {
+            defined.push(name.clone());
+            return (None, false, defined, reexport_links, i + 3);
+        }
+        if matches!(
+            kw.as_str(),
+            "function" | "class" | "const" | "let" | "var" | "interface" | "enum"
+        ) && let Some(JsToken::Ident(name)) = tokens.get(i + 1)
+        {
+            defined.push(name.clone());
+            return (None, false, defined, reexport_links, i + 2);
+        }
+    }
+
+    // `export * from './sub'` or `export * as ns from './sub'`
+    if matches!(tokens.get(i), Some(JsToken::Star)) {
+        i += 1;
+        let mut alias_name: Option<String> = None;
+        if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "as")
+            && let Some(JsToken::Ident(ns)) = tokens.get(i + 1)
+        {
+            alias_name = Some(ns.clone());
+            defined.push(ns.clone());
+            i += 2;
+        }
+        if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "from")
+            && let Some(JsToken::StringLit(spec)) = tokens.get(i + 1)
+        {
+            if let Some(clean) = clean_frontend_import_specifier(spec) {
+                if let Some(ns) = alias_name
+                    && !top_type_only
+                {
+                    reexport_links.push(format!("reexport:{ns}->{clean}:*"));
+                }
+                return (
+                    Some(ImportSpec {
+                        level: 0,
+                        module: clean,
+                        symbols: vec!["*".to_string()],
+                    }),
+                    top_type_only,
+                    defined,
+                    reexport_links,
+                    i + 2,
+                );
+            }
+            return (None, top_type_only, defined, reexport_links, i + 2);
+        }
+        return (None, top_type_only, defined, reexport_links, i);
+    }
+
+    // `export { A, B as C, type D } from './sub'` or local `export { A, B }`
+    if matches!(tokens.get(i), Some(JsToken::LBrace)) {
+        i += 1;
+        let mut pairs: Vec<(String, String, bool)> = Vec::new();
+        while i < n && !matches!(tokens[i], JsToken::RBrace) {
+            let mut item_type = top_type_only;
+            if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "type")
+                && matches!(tokens.get(i + 1), Some(JsToken::Ident(_)))
+            {
+                item_type = true;
+                i += 1;
+            }
+            if let Some(JsToken::Ident(orig)) = tokens.get(i) {
+                let orig_name = orig.clone();
+                let mut exported_name = orig_name.clone();
+                i += 1;
+                if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "as")
+                    && let Some(JsToken::Ident(alias)) = tokens.get(i + 1)
+                {
+                    exported_name = alias.clone();
+                    i += 2;
+                }
+                defined.push(exported_name.clone());
+                pairs.push((orig_name, exported_name, item_type));
+            } else {
+                i += 1;
+            }
+            if matches!(tokens.get(i), Some(JsToken::Comma)) {
+                i += 1;
+            }
+        }
+        if i < n && matches!(tokens[i], JsToken::RBrace) {
+            i += 1;
+        }
+        if matches!(tokens.get(i), Some(JsToken::Ident(kw)) if kw == "from")
+            && let Some(JsToken::StringLit(spec)) = tokens.get(i + 1)
+        {
+            if let Some(clean) = clean_frontend_import_specifier(spec) {
+                let value_pairs: Vec<_> = pairs.iter().filter(|(_, _, is_t)| !*is_t).collect();
+                let is_type_only = top_type_only || (value_pairs.is_empty() && !pairs.is_empty());
+                let syms: Vec<String> = if is_type_only {
+                    pairs.iter().map(|(orig, _, _)| orig.clone()).collect()
+                } else {
+                    for (orig, exp, _) in &value_pairs {
+                        reexport_links.push(format!("reexport:{exp}->{clean}:{orig}"));
+                    }
+                    value_pairs.iter().map(|(orig, _, _)| orig.clone()).collect()
+                };
+                return (
+                    Some(ImportSpec {
+                        level: 0,
+                        module: clean,
+                        symbols: syms,
+                    }),
+                    is_type_only,
+                    defined,
+                    reexport_links,
+                    i + 2,
+                );
+            }
+            return (None, top_type_only, defined, reexport_links, i + 2);
+        }
+        return (None, top_type_only, defined, reexport_links, i);
+    }
+
+    (None, false, defined, reexport_links, i)
+}
+
 fn normalize_data_ref(lit: &str) -> Option<String> {
     let trimmed = lit.trim().trim_start_matches("./").replace('\\', "/");
     if trimmed.len() < 3
@@ -4316,5 +6169,220 @@ mod tests {
         );
         let suggestions = graph.suggest_closest_targets(&["tests/test_hybrd.py".to_string()]);
         assert!(suggestions.contains(&"tests/test_hybrid.py".to_string()));
+    }
+
+    #[test]
+    fn parses_and_resolves_react_vite_tsx_barrel_alias_css_and_type_only_imports() {
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "tsconfig.json",
+            b"{\n  \"compilerOptions\": {\n    \"paths\": {\n      \"@/*\": [\"./src/*\"]\n    }\n  }\n}\n",
+        );
+        graph.insert_file_bytes("src/test/setup.ts", b"import '@testing-library/jest-dom';\n");
+        graph.insert_file_bytes(
+            "src/types/models.ts",
+            b"export interface ButtonProps { label: string; }\n",
+        );
+        graph.insert_file_bytes("src/assets/logo.svg", b"<svg></svg>\n");
+        graph.insert_file_bytes(
+            "src/components/Button.module.css",
+            b".btn { color: blue; }\n",
+        );
+        graph.insert_file_bytes(
+            "src/components/Button.tsx",
+            b"import type { ButtonProps } from '@/types/models';\nimport styles from './Button.module.css';\nimport logoSvg from '@/assets/logo.svg?raw';\nexport function Button(props: ButtonProps) {\n  const api = import.meta.env.VITE_FRONTEND_API_URL;\n  return `${styles.btn}:${logoSvg}:${api}:${props.label}`;\n}\n",
+        );
+        graph.insert_file_bytes(
+            "src/components/Modal.tsx",
+            b"export function Modal() { return 'modal'; }\n",
+        );
+        graph.insert_file_bytes(
+            "src/components/index.ts",
+            b"export { Button } from './Button';\nexport { Modal } from './Modal';\nexport type { ButtonProps } from '@/types/models';\n",
+        );
+        graph.insert_file_bytes(
+            "src/__tests__/__snapshots__/Button.test.tsx.snap",
+            b"exports[`Button renders 1`] = `\"btn\"`;\n",
+        );
+        graph.insert_file_bytes(
+            "src/__tests__/Button.test.tsx",
+            b"import { Button } from '@/components';\ndescribe('Button suite', () => {\n  it.concurrent('renders primary button', () => {\n    expect(Button({ label: 'Click' })).toBeTruthy();\n  });\n});\n",
+        );
+        graph.insert_file_bytes(
+            "src/__tests__/Modal.test.tsx",
+            b"import { Modal } from '@/components';\ntest('renders modal dialog', () => {\n  expect(Modal()).toBe('modal');\n});\n",
+        );
+        graph.recompute_edges();
+
+        // 1. Barrel tree-shaking: editing `Button.tsx` affects `Button.test.tsx`, NOT `Modal.test.tsx`!
+        let affected_btn: Vec<String> = graph
+            .affected_tests(&["src/components/Button.tsx".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(affected_btn, vec!["src/__tests__/Button.test.tsx".to_string()]);
+
+        // 2. CSS Module & Vite `?raw` SVG asset changes propagate to `Button.test.tsx`!
+        let affected_css: Vec<String> = graph
+            .affected_tests(&["src/components/Button.module.css".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(affected_css, vec!["src/__tests__/Button.test.tsx".to_string()]);
+        let affected_svg: Vec<String> = graph
+            .affected_tests(&["src/assets/logo.svg".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(affected_svg, vec!["src/__tests__/Button.test.tsx".to_string()]);
+
+        // 3. `import type` / `export type` changes (`src/types/models.ts`) do NOT invalidate runtime tests!
+        let affected_types = graph.affected_tests(&["src/types/models.ts".to_string()]);
+        assert!(affected_types.is_empty());
+
+        // 4. Snapshot file change affects `Button.test.tsx`!
+        let affected_snap: Vec<String> = graph
+            .affected_tests(&["src/__tests__/__snapshots__/Button.test.tsx.snap".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            affected_snap,
+            vec!["src/__tests__/Button.test.tsx".to_string()]
+        );
+
+        // 5. Global frontend setup file (`src/test/setup.ts`) affects all frontend tests!
+        let affected_setup: Vec<String> = graph
+            .affected_tests(&["src/test/setup.ts".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            affected_setup,
+            vec![
+                "src/__tests__/Button.test.tsx".to_string(),
+                "src/__tests__/Modal.test.tsx".to_string(),
+            ]
+        );
+
+        // 6. Changing `VITE_FRONTEND_API_URL` referenced via `import.meta.env.VITE_FRONTEND_API_URL` updates Merkle `dep_hash`!
+        let hash_before = graph.dep_hash_for_test["src/__tests__/Button.test.tsx"].clone();
+        unsafe {
+            std::env::set_var("VITE_FRONTEND_API_URL", "https://api.example.com");
+        }
+        graph.refresh_referenced_env_hashes();
+        let hash_after = graph.dep_hash_for_test["src/__tests__/Button.test.tsx"].clone();
+        unsafe {
+            std::env::remove_var("VITE_FRONTEND_API_URL");
+        }
+        assert_ne!(hash_before, hash_after);
+
+        let info = graph.file_graph_info("src/components/Button.tsx").unwrap();
+        assert_eq!(info.language, "react_tsx");
+    }
+
+    #[test]
+    fn resolves_typescript_esm_js_extension_imports_in_own_vscode_extension() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace = Workspace::new(repo_root, Vec::new(), Vec::new()).unwrap();
+        let graph = DependencyGraph::build(&workspace, &MemoryPolicy::default()).unwrap();
+        let affected: Vec<String> = graph
+            .affected_tests(&["vscode-extension/src/resultFormatter.ts".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert!(
+            affected.contains(&"vscode-extension/test/nativeTools.test.ts".to_string()),
+            "expected nativeTools.test.ts in affected: {affected:?}"
+        );
+    }
+
+    #[test]
+    fn resolves_scss_partials_subpath_imports_package_exports_glob_worker_and_storybook() {
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "package.json",
+            br##"{
+  "name": "@acme/design-system",
+  "imports": {
+    "#internal/*": "./src/internal/*"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./card": {
+      "import": "./src/components/Card.tsx"
+    }
+  }
+}"##,
+        );
+        graph.insert_file_bytes(
+            "tsconfig.json",
+            b"{\n  \"extends\": \"./tsconfig.app.json\"\n}\n",
+        );
+        graph.insert_file_bytes(
+            "tsconfig.app.json",
+            b"{\n  \"compilerOptions\": {\n    \"paths\": {\n      \"@ui/*\": [\"./src/components/*\"]\n    }\n  }\n}\n",
+        );
+        graph.insert_file_bytes("src/styles/_tokens.scss", b"$primary: #0055ff;\n");
+        graph.insert_file_bytes(
+            "src/components/Card.module.scss",
+            b"@use '../styles/tokens';\n.card { color: tokens.$primary; }\n",
+        );
+        graph.insert_file_bytes(
+            "src/internal/format.ts",
+            b"export function formatTitle(s: string) { return s.toUpperCase(); }\n",
+        );
+        graph.insert_file_bytes(
+            "src/workers/render.worker.ts",
+            b"export const WORKER_READY = true;\n",
+        );
+        graph.insert_file_bytes("src/plugins/chart.ts", b"export const chartPlugin = 1;\n");
+        graph.insert_file_bytes(
+            "src/components/Card.tsx",
+            b"import styles from './Card.module.scss';\nimport { formatTitle } from '#internal/format';\nconst plugins = import.meta.glob('../plugins/*.ts');\nconst worker = new Worker(new URL('../workers/render.worker.ts', import.meta.url));\nexport function Card(title: string) {\n  return `${styles.card}:${formatTitle(title)}:${Object.keys(plugins).length}:${worker}`;\n}\n",
+        );
+        graph.insert_file_bytes(
+            "src/components/Card.stories.tsx",
+            b"import { Card } from '@ui/Card';\nexport default { component: Card };\nexport const Primary = {\n  play: async () => {\n    Card('Hello');\n  },\n};\n",
+        );
+        graph.insert_file_bytes(
+            "e2e/card.e2e.ts",
+            b"import { test, expect } from '@playwright/test';\nimport { Card } from '@acme/design-system/card';\ntest('renders card in browser', async () => {\n  expect(Card('E2E')).toBeTruthy();\n});\n",
+        );
+        graph.recompute_edges();
+
+        // 1. Multi-hop SCSS partial chain: `_tokens.scss` -> `Card.module.scss` -> `Card.tsx` -> `Card.stories.tsx` & `e2e/card.e2e.ts`!
+        let affected_scss: Vec<String> = graph
+            .affected_tests(&["src/styles/_tokens.scss".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            affected_scss,
+            vec![
+                "e2e/card.e2e.ts".to_string(),
+                "src/components/Card.stories.tsx".to_string(),
+            ]
+        );
+
+        // 2. `#internal/format` subpath import propagates to both tests!
+        let affected_subpath: Vec<String> = graph
+            .affected_tests(&["src/internal/format.ts".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(affected_subpath.len(), 2);
+
+        // 3. `import.meta.glob('../plugins/*.ts')` and `new URL('../workers/render.worker.ts', import.meta.url)` propagate!
+        let affected_glob = graph.affected_tests(&["src/plugins/chart.ts".to_string()]);
+        assert_eq!(affected_glob.len(), 2);
+        let affected_worker =
+            graph.affected_tests(&["src/workers/render.worker.ts".to_string()]);
+        assert_eq!(affected_worker.len(), 2);
+
+        // 4. Playwright E2E test has `playwright` and `e2e` markers automatically attached
+        let e2e_node = &graph.files["e2e/card.e2e.ts"];
+        assert!(e2e_node.parsed.markers.contains(&"playwright".to_string()));
+        assert!(e2e_node.parsed.module_markers.contains(&"e2e".to_string()));
     }
 }

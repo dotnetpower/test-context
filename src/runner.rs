@@ -161,6 +161,14 @@ fn test_resource_keys(graph: &DependencyGraph, test_file: &str) -> BTreeSet<Stri
         .collect();
     if test_file.ends_with(".rs") {
         keys.insert("cargo_build".to_string());
+    } else if crate::ast_graph::is_frontend_source_path(test_file)
+        && node
+            .parsed
+            .markers
+            .iter()
+            .any(|m| matches!(m.as_str(), "e2e" | "playwright" | "browser"))
+    {
+        keys.insert("playwright".to_string());
     }
     keys
 }
@@ -1212,17 +1220,30 @@ impl ManagedRoot {
         let root = guard.workspace.root.clone();
         let pytest_cmd = guard.spec.effective_pytest_cmd();
         let cargo_cmd = guard.spec.effective_cargo_cmd();
+        let frontend_test_cmd = guard.spec.effective_frontend_test_cmd();
         let indexed_rust_files = guard
             .graph
             .files
             .keys()
             .filter(|k| k.ends_with(".rs"))
             .count();
+        let indexed_frontend_files = guard
+            .graph
+            .files
+            .keys()
+            .filter(|k| crate::ast_graph::is_frontend_source_path(k))
+            .count();
         let total_rust_test_files = guard
             .graph
             .dep_hash_for_test
             .keys()
             .filter(|k| k.ends_with(".rs"))
+            .count();
+        let total_frontend_test_files = guard
+            .graph
+            .dep_hash_for_test
+            .keys()
+            .filter(|k| crate::ast_graph::is_frontend_source_path(k))
             .count();
         let total_python_test_files = guard
             .graph
@@ -1256,11 +1277,14 @@ impl ManagedRoot {
             "root": root,
             "pytest_cmd": pytest_cmd,
             "cargo_cmd": cargo_cmd,
+            "frontend_test_cmd": frontend_test_cmd,
             "indexed_python_files": guard.graph.files.len(),
             "indexed_rust_files": indexed_rust_files,
+            "indexed_frontend_files": indexed_frontend_files,
             "total_test_files": total_tests,
             "total_python_test_files": total_python_test_files,
             "total_rust_test_files": total_rust_test_files,
+            "total_frontend_test_files": total_frontend_test_files,
             "cached_passed_files": cached_passed,
             "cached_failed_files": cached_failed,
             "uncached_or_stale_files": uncached,
@@ -1394,7 +1418,7 @@ impl ManagedRoot {
                     .trim_start_matches("./")
                     .trim_end_matches('/')
                     .replace('\\', "/");
-                if norm.ends_with(".py") {
+                if norm.ends_with(".py") || crate::ast_graph::is_frontend_source_path(&norm) {
                     set.insert(norm);
                 } else {
                     let prefix = if norm.is_empty() || norm == "." {
@@ -1403,7 +1427,9 @@ impl ManagedRoot {
                         format!("{norm}/")
                     };
                     for k in guard.graph.files.keys() {
-                        if k.ends_with(".py") && (prefix.is_empty() || k.starts_with(&prefix)) {
+                        if (k.ends_with(".py") || crate::ast_graph::is_frontend_source_path(k))
+                            && (prefix.is_empty() || k.starts_with(&prefix))
+                        {
                             set.insert(k.clone());
                         }
                     }
@@ -1455,7 +1481,7 @@ impl ManagedRoot {
         let mut uncached = Vec::new();
         let mut expected_shas = BTreeMap::new();
         for f in py_files {
-            if !f.ends_with(".py") {
+            if !f.ends_with(".py") && !crate::ast_graph::is_frontend_source_path(f) {
                 continue;
             }
             let Some(node) = guard.graph.files.get(f) else {
@@ -1719,7 +1745,8 @@ impl ManagedRoot {
                         .module_markers
                         .iter()
                         .any(|marker| marker == "node_cache_safe")
-                        || (tf.ends_with(".rs")
+                        || ((tf.ends_with(".rs")
+                            || crate::ast_graph::is_frontend_source_path(tf))
                             && !node
                                 .parsed
                                 .markers
@@ -2138,33 +2165,164 @@ fn execute_ruff_check(
     rel_files: &[String],
     fix: bool,
 ) -> BTreeMap<String, Vec<RuffDiagnostic>> {
-    let by_file: BTreeMap<String, Vec<RuffDiagnostic>> = BTreeMap::new();
+    let mut by_file: BTreeMap<String, Vec<RuffDiagnostic>> = BTreeMap::new();
     if rel_files.is_empty() {
         return by_file;
     }
-    let Some(ruff_cmd) = spec.effective_ruff_cmd() else {
-        return by_file;
-    };
-    let Some((program, base_args)) = ruff_cmd.split_first() else {
-        return by_file;
-    };
-    let mut command = Command::new(program);
-    command.current_dir(&spec.root);
-    command.args(base_args);
-    command.arg("check");
-    if fix {
-        command.arg("--fix");
+    let py_files: Vec<String> = rel_files
+        .iter()
+        .filter(|f| f.ends_with(".py"))
+        .cloned()
+        .collect();
+    let fe_files: Vec<String> = rel_files
+        .iter()
+        .filter(|f| crate::ast_graph::is_frontend_source_path(f))
+        .cloned()
+        .collect();
+
+    if !py_files.is_empty()
+        && let Some(ruff_cmd) = spec.effective_ruff_cmd()
+        && let Some((program, base_args)) = ruff_cmd.split_first()
+    {
+        let mut command = Command::new(program);
+        command.current_dir(&spec.root);
+        command.args(base_args);
+        command.arg("check");
+        if fix {
+            command.arg("--fix");
+        }
+        command.arg("--output-format=json");
+        command.arg("--no-cache");
+        for f in &py_files {
+            command.arg(f);
+        }
+        if let Ok(output) =
+            run_command_with_timeout(&mut command, Duration::from_secs(15), 2 * 1024 * 1024)
+        {
+            by_file.extend(parse_ruff_json_output(
+                &output.stdout,
+                &spec.root,
+                &py_files,
+            ));
+        }
     }
-    command.arg("--output-format=json");
-    command.arg("--no-cache");
-    for f in rel_files {
-        command.arg(f);
+
+    if !fe_files.is_empty() {
+        by_file.extend(execute_eslint_check(spec, &fe_files, fix));
     }
-    let Ok(output) = run_command_with_timeout(&mut command, Duration::from_secs(15), 2 * 1024 * 1024)
-    else {
+
+    by_file
+}
+
+fn execute_eslint_check(
+    spec: &Spec,
+    fe_files: &[String],
+    fix: bool,
+) -> BTreeMap<String, Vec<RuffDiagnostic>> {
+    let mut by_file: BTreeMap<String, Vec<RuffDiagnostic>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for f in fe_files {
+        let pkg_dir = if let Some((first, _)) = f.split_once('/')
+            && spec.root.join(first).join("package.json").is_file()
+        {
+            first.to_string()
+        } else {
+            String::new()
+        };
+        groups.entry(pkg_dir).or_default().push(f.clone());
+    }
+    for (pkg_dir, group) in groups {
+        let Some((eslint_bin, workdir)) =
+            crate::catalog::detect_eslint_cmd_for_dir(&spec.root, &pkg_dir)
+        else {
+            continue;
+        };
+        let mut command = Command::new(eslint_bin);
+        command.current_dir(&workdir);
+        command.arg("--format=json");
+        if fix {
+            command.arg("--fix");
+        }
+        for f in &group {
+            let arg_path = if !pkg_dir.is_empty() {
+                f.strip_prefix(&format!("{pkg_dir}/")).unwrap_or(f)
+            } else {
+                f.as_str()
+            };
+            command.arg(arg_path);
+        }
+        if let Ok(output) =
+            run_command_with_timeout(&mut command, Duration::from_secs(20), 2 * 1024 * 1024)
+        {
+            by_file.extend(parse_eslint_json_output(&output.stdout, &spec.root, &group));
+        }
+    }
+    by_file
+}
+
+pub fn parse_eslint_json_output(
+    stdout: &[u8],
+    workspace_root: &Path,
+    known_rel_files: &[String],
+) -> BTreeMap<String, Vec<RuffDiagnostic>> {
+    let mut by_file: BTreeMap<String, Vec<RuffDiagnostic>> = BTreeMap::new();
+    let Ok(items) = serde_json::from_slice::<Vec<serde_json::Value>>(stdout) else {
         return by_file;
     };
-    parse_ruff_json_output(&output.stdout, &spec.root, rel_files)
+    let root_str = workspace_root.to_string_lossy().replace('\\', "/");
+    let root_prefix = format!("{}/", root_str.trim_end_matches('/'));
+
+    for item in items {
+        let raw_file = item
+            .get("filePath")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .replace('\\', "/");
+        let rel_file = if let Some(stripped) = raw_file.strip_prefix(&root_prefix) {
+            stripped.to_string()
+        } else {
+            let clean = raw_file.trim_start_matches("./");
+            known_rel_files
+                .iter()
+                .find(|k| raw_file.ends_with(k.as_str()) || k.ends_with(clean))
+                .cloned()
+                .unwrap_or_else(|| clean.to_string())
+        };
+        let Some(messages) = item.get("messages").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for msg in messages {
+            let code = msg
+                .get("ruleId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("eslint")
+                .to_string();
+            let message = msg
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let row = msg
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1) as usize;
+            let column = msg
+                .get("column")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1) as usize;
+            let fixable = msg.get("fix").is_some_and(|v| !v.is_null());
+            by_file.entry(rel_file.clone()).or_default().push(RuffDiagnostic {
+                file: rel_file.clone(),
+                row,
+                column,
+                code,
+                message,
+                fixable,
+                fix_message: None,
+            });
+        }
+    }
+    by_file
 }
 
 pub fn parse_ruff_json_output(
@@ -2301,6 +2459,7 @@ fn environment_fingerprint_with_python(spec: &Spec, include_python: bool) -> Str
         "PYTEST_ADDOPTS".to_string(),
         "RUSTFLAGS".to_string(),
         "CARGO_TARGET_DIR".to_string(),
+        "NODE_ENV".to_string(),
     ];
     if let Some(extra) = std::env::var_os("TCTX_ENV_KEYS") {
         env_keys.extend(
@@ -2335,10 +2494,10 @@ fn pytest_plugin_manifest(spec: &Spec) -> Vec<String> {
 }
 
 fn pytest_plugin_manifest_for_targets(spec: &Spec, targets: &[String]) -> Vec<String> {
-    if targets
-        .iter()
-        .any(|t| !t.split("::").next().unwrap_or(t).ends_with(".rs"))
-    {
+    if targets.iter().any(|t| {
+        let f = t.split("::").next().unwrap_or(t);
+        !f.ends_with(".rs") && !crate::ast_graph::is_frontend_source_path(f)
+    }) {
         pytest_plugin_manifest(spec)
     } else {
         Vec::new()
@@ -2584,13 +2743,24 @@ fn execute_pytest_batch(
         .filter(|t| t.split("::").next().unwrap_or(t).ends_with(".rs"))
         .cloned()
         .collect();
+    let fe_targets: Vec<String> = invocation_targets
+        .iter()
+        .filter(|t| {
+            let f = t.split("::").next().unwrap_or(t);
+            crate::ast_graph::is_frontend_source_path(f)
+        })
+        .cloned()
+        .collect();
     let py_targets: Vec<String> = invocation_targets
         .iter()
-        .filter(|t| !t.split("::").next().unwrap_or(t).ends_with(".rs"))
+        .filter(|t| {
+            let f = t.split("::").next().unwrap_or(t);
+            !f.ends_with(".rs") && !crate::ast_graph::is_frontend_source_path(f)
+        })
         .cloned()
         .collect();
 
-    if !rs_targets.is_empty() && py_targets.is_empty() {
+    if !rs_targets.is_empty() && fe_targets.is_empty() && py_targets.is_empty() {
         return execute_cargo_test_batch(
             spec,
             &rs_targets,
@@ -2603,21 +2773,12 @@ fn execute_pytest_batch(
             active_pgids,
             environment_hash,
         );
-    } else if !rs_targets.is_empty() && !py_targets.is_empty() {
-        let rs_hashes: BTreeMap<String, String> = dep_hashes
-            .iter()
-            .filter(|(k, _)| k.ends_with(".rs"))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let py_hashes: BTreeMap<String, String> = dep_hashes
-            .iter()
-            .filter(|(k, _)| !k.ends_with(".rs"))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let (mut rs_recs, rs_out) = execute_cargo_test_batch(
+    }
+    if !fe_targets.is_empty() && rs_targets.is_empty() && py_targets.is_empty() {
+        return execute_frontend_test_batch(
             spec,
-            &rs_targets,
-            &rs_hashes,
+            &fe_targets,
+            dep_hashes,
             k_expr,
             mark_expr,
             extra_args,
@@ -2625,30 +2786,87 @@ fn execute_pytest_batch(
             active_pgid,
             active_pgids,
             environment_hash,
-        )?;
-        let (mut py_recs, py_out) = execute_pytest_batch(
-            spec,
-            &py_targets,
-            &py_hashes,
-            k_expr,
-            mark_expr,
-            extra_args,
-            source_label,
-            zygote_slot,
-            active_pgid,
-            active_pgids,
-            preload_modules,
-            environment_hash,
-            pytest_plugins,
-            capture_dynamic_dependencies,
-        )?;
-        rs_recs.append(&mut py_recs);
-        let combined = match (rs_out.trim().is_empty(), py_out.trim().is_empty()) {
-            (true, _) => py_out,
-            (_, true) => rs_out,
-            (false, false) => format!("{}\n{}", rs_out.trim(), py_out.trim()),
-        };
-        return Ok((rs_recs, combined));
+        );
+    }
+    if !rs_targets.is_empty() || !fe_targets.is_empty() {
+        let mut combined_records = Vec::new();
+        let mut combined_outputs = Vec::new();
+        if !rs_targets.is_empty() {
+            let rs_hashes: BTreeMap<String, String> = dep_hashes
+                .iter()
+                .filter(|(k, _)| k.ends_with(".rs"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let (mut recs, out) = execute_cargo_test_batch(
+                spec,
+                &rs_targets,
+                &rs_hashes,
+                k_expr,
+                mark_expr,
+                extra_args,
+                source_label,
+                active_pgid,
+                active_pgids,
+                environment_hash,
+            )?;
+            combined_records.append(&mut recs);
+            if !out.trim().is_empty() {
+                combined_outputs.push(out);
+            }
+        }
+        if !fe_targets.is_empty() {
+            let fe_hashes: BTreeMap<String, String> = dep_hashes
+                .iter()
+                .filter(|(k, _)| crate::ast_graph::is_frontend_source_path(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let (mut recs, out) = execute_frontend_test_batch(
+                spec,
+                &fe_targets,
+                &fe_hashes,
+                k_expr,
+                mark_expr,
+                extra_args,
+                source_label,
+                active_pgid,
+                active_pgids,
+                environment_hash,
+            )?;
+            combined_records.append(&mut recs);
+            if !out.trim().is_empty() {
+                combined_outputs.push(out);
+            }
+        }
+        if !py_targets.is_empty() {
+            let py_hashes: BTreeMap<String, String> = dep_hashes
+                .iter()
+                .filter(|(k, _)| {
+                    !k.ends_with(".rs") && !crate::ast_graph::is_frontend_source_path(k)
+                })
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let (mut recs, out) = execute_pytest_batch(
+                spec,
+                &py_targets,
+                &py_hashes,
+                k_expr,
+                mark_expr,
+                extra_args,
+                source_label,
+                zygote_slot,
+                active_pgid,
+                active_pgids,
+                preload_modules,
+                environment_hash,
+                pytest_plugins,
+                capture_dynamic_dependencies,
+            )?;
+            combined_records.append(&mut recs);
+            if !out.trim().is_empty() {
+                combined_outputs.push(out);
+            }
+        }
+        return Ok((combined_records, combined_outputs.join("\n")));
     }
 
     let run_started_unix_ms = now_unix_ms();
@@ -3415,6 +3633,770 @@ fn execute_cargo_test_batch(
     Ok((records, all_outputs.join("\n")))
 }
 
+fn parse_vitest_jest_json_output(
+    json_bytes: &[u8],
+    known_files: &BTreeMap<String, String>,
+) -> BTreeMap<String, FileXmlStats> {
+    let mut stats_by_file: BTreeMap<String, FileXmlStats> = BTreeMap::new();
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(json_bytes) else {
+        return stats_by_file;
+    };
+    let Some(test_results) = val.get("testResults").and_then(serde_json::Value::as_array) else {
+        return stats_by_file;
+    };
+
+    for file_res in test_results {
+        let raw_name = file_res
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .replace('\\', "/");
+        let Some(matched_file) = match_testcase_to_file(Some(&raw_name), "", known_files) else {
+            continue;
+        };
+        let entry = stats_by_file.entry(matched_file.clone()).or_default();
+        let file_start = file_res
+            .get("startTime")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let file_end = file_res
+            .get("endTime")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let file_dur = file_end.saturating_sub(file_start);
+
+        if let Some(assertions) = file_res
+            .get("assertionResults")
+            .and_then(serde_json::Value::as_array)
+        {
+            for case in assertions {
+                let title = case
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                let full_name = case
+                    .get("fullName")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(title)
+                    .trim();
+                let status = case
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("passed");
+                let dur_ms = case
+                    .get("duration")
+                    .and_then(serde_json::Value::as_f64)
+                    .map(|d| d.max(0.0).round() as u64)
+                    .unwrap_or(1)
+                    .max(1);
+                entry.duration_ms = entry.duration_ms.saturating_add(dur_ms);
+
+                let fail_msg = case
+                    .get("failureMessages")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                let snip = truncate_str(&fail_msg, 2048);
+
+                let outcome = match status {
+                    "passed" => {
+                        entry.passed += 1;
+                        TestOutcome::Passed
+                    }
+                    "failed" => {
+                        entry.failed += 1;
+                        TestOutcome::Failed
+                    }
+                    "skipped" | "pending" | "todo" | "disabled" => {
+                        entry.skipped += 1;
+                        TestOutcome::Skipped
+                    }
+                    _ => {
+                        entry.errors += 1;
+                        TestOutcome::Error
+                    }
+                };
+
+                let primary_id = if title.is_empty() {
+                    matched_file.clone()
+                } else {
+                    format!("{matched_file}::{title}")
+                };
+                if !outcome.is_green() && !entry.failed_nodeids.contains(&primary_id) {
+                    entry.failed_nodeids.push(primary_id.clone());
+                }
+                entry.node_results.insert(
+                    primary_id.clone(),
+                    CachedNodeResult {
+                        nodeid: primary_id.clone(),
+                        outcome,
+                        duration_ms: dur_ms,
+                        output_snippet: snip.clone(),
+                    },
+                );
+                if !full_name.is_empty() && full_name != title {
+                    let full_id = format!("{matched_file}::{full_name}");
+                    entry.node_results.insert(
+                        full_id.clone(),
+                        CachedNodeResult {
+                            nodeid: full_id,
+                            outcome,
+                            duration_ms: dur_ms,
+                            output_snippet: snip,
+                        },
+                    );
+                }
+            }
+        }
+        if entry.duration_ms == 0 && file_dur > 0 {
+            entry.duration_ms = file_dur;
+        }
+        let file_status = file_res
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if entry.passed == 0
+            && entry.failed == 0
+            && entry.skipped == 0
+            && file_status == "failed"
+        {
+            entry.errors += 1;
+            entry.failed_nodeids.push(matched_file);
+        }
+    }
+
+    stats_by_file
+}
+
+fn parse_node_test_output(
+    combined_out: &str,
+    test_file: &str,
+    duration_ms: u64,
+    overall_success: bool,
+) -> FileXmlStats {
+    let mut stats = FileXmlStats {
+        duration_ms: duration_ms.max(1),
+        ..FileXmlStats::default()
+    };
+    let mut cases: Vec<(String, TestOutcome)> = Vec::new();
+
+    for raw_line in combined_out.lines() {
+        let line = raw_line.trim();
+        let (is_ok, rest) = if let Some(r) = line.strip_prefix("ok ") {
+            (true, r)
+        } else if let Some(r) = line.strip_prefix("not ok ") {
+            (false, r)
+        } else {
+            continue;
+        };
+        let Some((_, title_part)) = rest.split_once(" - ") else {
+            continue;
+        };
+        let (clean_title, directive) = match title_part.split_once(" # ") {
+            Some((t, dir)) => (t.trim(), dir.trim().to_ascii_lowercase()),
+            None => (title_part.trim(), String::new()),
+        };
+        if clean_title.is_empty() {
+            continue;
+        }
+        let outcome = if directive.starts_with("skip") || directive.starts_with("todo") {
+            stats.skipped += 1;
+            TestOutcome::Skipped
+        } else if is_ok {
+            stats.passed += 1;
+            TestOutcome::Passed
+        } else {
+            stats.failed += 1;
+            TestOutcome::Failed
+        };
+        cases.push((clean_title.to_string(), outcome));
+    }
+
+    let case_count = cases.len().max(1) as u64;
+    let per_case_ms = (duration_ms / case_count).max(1);
+    let snippet = truncate_str(combined_out, 2048);
+
+    for (title, outcome) in cases {
+        let nodeid = format!("{test_file}::{title}");
+        if outcome == TestOutcome::Failed && !stats.failed_nodeids.contains(&nodeid) {
+            stats.failed_nodeids.push(nodeid.clone());
+        }
+        stats.node_results.insert(
+            nodeid.clone(),
+            CachedNodeResult {
+                nodeid,
+                outcome,
+                duration_ms: per_case_ms,
+                output_snippet: if outcome.is_green() {
+                    String::new()
+                } else {
+                    snippet.clone()
+                },
+            },
+        );
+    }
+
+    if stats.passed == 0 && stats.failed == 0 && stats.skipped == 0 && !overall_success {
+        if combined_out.contains("SyntaxError")
+            || combined_out.contains("Cannot find module")
+            || combined_out.contains("ERR_MODULE_NOT_FOUND")
+            || combined_out.contains("TransformError")
+            || combined_out.contains("TS2")
+        {
+            stats.errors = 1;
+        } else {
+            stats.failed = 1;
+        }
+        stats.failed_nodeids.push(test_file.to_string());
+    }
+
+    stats
+}
+
+fn resolve_node_test_runnable_path(workspace_root: &Path, test_file: &str) -> String {
+    if let Some(stem) = test_file
+        .strip_suffix(".ts")
+        .or_else(|| test_file.strip_suffix(".tsx"))
+    {
+        // Check if a compiled JS counterpart exists under `out/` or `dist/` (e.g. `vscode-extension/test/x.test.ts` -> `vscode-extension/out/test/x.test.js`)
+        if let Some((pkg_prefix, rel_inside)) = stem.split_once('/') {
+            for out_dir in ["out", "dist", "build"] {
+                let cand = format!("{pkg_prefix}/{out_dir}/{rel_inside}.js");
+                if workspace_root.join(&cand).is_file() {
+                    return cand;
+                }
+            }
+        }
+        for out_dir in ["out", "dist", "build"] {
+            let cand = format!("{out_dir}/{stem}.js");
+            if workspace_root.join(&cand).is_file() {
+                return cand;
+            }
+        }
+    }
+    test_file.to_string()
+}
+
+const NODE_JSONL_REPORTER: &str = "data:text/javascript,export default async function*(s){for await(const e of s)if(e.type===\"test:pass\"||e.type===\"test:fail\")yield JSON.stringify({t:e.type,f:e.data.file,n:e.data.name,d:e.data.details?.duration_ms,s:e.data.skip,todo:e.data.todo})+\"\\n\";}";
+
+fn parse_node_jsonl_batch_output(
+    stdout_str: &str,
+    runnable_to_source: &BTreeMap<String, String>,
+    known_files: &BTreeMap<String, String>,
+) -> BTreeMap<String, FileXmlStats> {
+    let mut stats_by_file: BTreeMap<String, FileXmlStats> = BTreeMap::new();
+    for raw_line in stdout_str.lines() {
+        let line = raw_line.trim();
+        if !line.starts_with('{') || !line.ends_with('}') {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(event_type) = val.get("t").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let raw_file = val
+            .get("f")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .replace('\\', "/");
+        if raw_file.is_empty() {
+            continue;
+        }
+        let matched_file = runnable_to_source
+            .iter()
+            .find(|(runnable, _)| raw_file.ends_with(runnable.as_str()))
+            .map(|(_, src)| src.clone())
+            .or_else(|| match_testcase_to_file(Some(&raw_file), "", known_files));
+        let Some(test_file) = matched_file else {
+            continue;
+        };
+        let title = val
+            .get("n")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if title.is_empty() || title == raw_file || title.ends_with(".js") || title.ends_with(".ts")
+        {
+            continue;
+        }
+        let dur_ms = val
+            .get("d")
+            .and_then(serde_json::Value::as_f64)
+            .map(|d| d.max(0.0).round() as u64)
+            .unwrap_or(1)
+            .max(1);
+        let is_skip = val
+            .get("s")
+            .is_some_and(|v| !v.is_null() && v != &serde_json::Value::Bool(false))
+            || val
+                .get("todo")
+                .is_some_and(|v| !v.is_null() && v != &serde_json::Value::Bool(false));
+
+        let entry = stats_by_file.entry(test_file.clone()).or_default();
+        entry.duration_ms = entry.duration_ms.saturating_add(dur_ms);
+        let outcome = if is_skip {
+            entry.skipped += 1;
+            TestOutcome::Skipped
+        } else if event_type == "test:pass" {
+            entry.passed += 1;
+            TestOutcome::Passed
+        } else {
+            entry.failed += 1;
+            TestOutcome::Failed
+        };
+        let nodeid = format!("{test_file}::{title}");
+        if outcome == TestOutcome::Failed && !entry.failed_nodeids.contains(&nodeid) {
+            entry.failed_nodeids.push(nodeid.clone());
+        }
+        entry.node_results.insert(
+            nodeid.clone(),
+            CachedNodeResult {
+                nodeid,
+                outcome,
+                duration_ms: dur_ms,
+                output_snippet: String::new(),
+            },
+        );
+    }
+    stats_by_file
+}
+
+fn frontend_workdir_key(root: &Path, test_file: &str) -> String {
+    if let Some((first, rest)) = test_file.split_once('/') {
+        if matches!(first, "packages" | "apps" | "services")
+            && let Some((second, _)) = rest.split_once('/')
+        {
+            let sub = format!("{first}/{second}");
+            if root.join(&sub).join("package.json").is_file() {
+                return sub;
+            }
+        }
+        if root.join(first).join("package.json").is_file() {
+            return first.to_string();
+        }
+    }
+    String::new()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_frontend_test_batch(
+    spec: &Spec,
+    invocation_targets: &[String],
+    dep_hashes: &BTreeMap<String, String>,
+    k_expr: Option<&str>,
+    _mark_expr: Option<&str>,
+    extra_args: &[String],
+    source_label: &str,
+    active_pgid: Option<&AtomicI32>,
+    active_pgids: Option<&Mutex<BTreeSet<i32>>>,
+    environment_hash: &str,
+) -> Result<(Vec<CachedTestRecord>, String)> {
+    let run_started_unix_ms = now_unix_ms();
+    let fe_cmd = spec.effective_frontend_test_cmd();
+    let Some((program, base_args)) = fe_cmd.split_first() else {
+        return Err(invalid("empty frontend_test_cmd").into());
+    };
+    let timeout = Duration::from_secs(spec.policy.pytest_timeout_secs);
+    let is_vitest = program.ends_with("vitest") || base_args.iter().any(|a| a.contains("vitest"));
+    let is_jest = program.ends_with("jest") || base_args.iter().any(|a| a.contains("jest"));
+
+    let explicit_node_filter: Option<String> = invocation_targets.iter().find_map(|t| {
+        let (_, node) = t.split_once("::")?;
+        Some(node.to_string())
+    });
+    let name_filter = explicit_node_filter.or_else(|| k_expr.map(ToOwned::to_owned));
+
+    if is_vitest || is_jest {
+        let mut pkg_groups: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for (tf, dh) in dep_hashes {
+            let pkg_dir = frontend_workdir_key(&spec.root, tf);
+            pkg_groups
+                .entry(pkg_dir)
+                .or_default()
+                .insert(tf.clone(), dh.clone());
+        }
+        let mut records = Vec::new();
+        let mut all_snippets = Vec::new();
+
+        for (pkg_dir, group_hashes) in pkg_groups {
+            let (group_cmd, workdir) =
+                crate::catalog::detect_frontend_runner_for_dir(&spec.root, &pkg_dir, &fe_cmd);
+            let Some((grp_prog, grp_base)) = group_cmd.split_first() else {
+                continue;
+            };
+            let grp_vitest =
+                grp_prog.ends_with("vitest") || grp_base.iter().any(|a| a.contains("vitest"));
+            let tmp_dir = tempfile::tempdir()?;
+            let json_path = tmp_dir.path().join("fe-report.json");
+            let mut command = Command::new(grp_prog);
+            command.current_dir(&workdir);
+            command.args(grp_base);
+            if grp_vitest {
+                command.arg("--reporter=json");
+                command.arg(format!("--outputFile={}", json_path.display()));
+            } else {
+                command.arg("--json");
+                command.arg(format!("--outputFile={}", json_path.display()));
+                command.arg("--runTestsByPath");
+            }
+            if let Some(ref f) = name_filter
+                && !f.trim().is_empty()
+            {
+                command.arg("-t").arg(f);
+            }
+            for arg in extra_args {
+                command.arg(arg);
+            }
+            for test_file in group_hashes.keys() {
+                let rel_arg = if !pkg_dir.is_empty() && workdir != spec.root {
+                    test_file
+                        .strip_prefix(&format!("{pkg_dir}/"))
+                        .unwrap_or(test_file)
+                } else {
+                    test_file.as_str()
+                };
+                command.arg(rel_arg);
+            }
+
+            let output = run_command_with_timeout_tracked(
+                &mut command,
+                timeout,
+                2 * 1024 * 1024,
+                active_pgid,
+                active_pgids,
+            )?;
+            if output.timed_out {
+                return Err(invalid(format!(
+                    "frontend test execution timed out after {}s",
+                    spec.policy.pytest_timeout_secs
+                ))
+                .into());
+            }
+            if output.cancelled {
+                return Err(invalid(
+                    "TEST_CANCELLED: frontend test child process group was terminated",
+                )
+                .into());
+            }
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let combined_out = match (stdout_str.trim().is_empty(), stderr_str.trim().is_empty()) {
+                (true, _) => stderr_str.to_string(),
+                (_, true) => stdout_str.to_string(),
+                (false, false) => format!("{}\n{}", stdout_str.trim(), stderr_str.trim()),
+            };
+            let snippet = truncate_str(&combined_out, 8192);
+            if !snippet.trim().is_empty() {
+                all_snippets.push(snippet.clone());
+            }
+            let json_bytes = std::fs::read(&json_path).unwrap_or_default();
+            let per_file = parse_vitest_jest_json_output(&json_bytes, &group_hashes);
+            let overall_success = output.status.success();
+            let now = now_unix_ms();
+            let per_file_fallback_ms =
+                (output.duration_ms / (group_hashes.len().max(1) as u64)).max(1);
+
+            for (test_file, dep_hash) in &group_hashes {
+                if let Some(stats) = per_file.get(test_file) {
+                    let outcome = if stats.failed > 0 {
+                        TestOutcome::Failed
+                    } else if stats.errors > 0 {
+                        TestOutcome::Error
+                    } else if stats.passed > 0 && stats.skipped == 0 {
+                        TestOutcome::Passed
+                    } else if stats.skipped > 0 && overall_success {
+                        TestOutcome::Skipped
+                    } else if overall_success {
+                        TestOutcome::Passed
+                    } else {
+                        TestOutcome::Failed
+                    };
+                    records.push(CachedTestRecord {
+                        test_file: test_file.clone(),
+                        dep_hash: dep_hash.clone(),
+                        outcome,
+                        passed: stats.passed,
+                        failed: stats.failed,
+                        skipped: stats.skipped,
+                        errors: stats.errors,
+                        duration_ms: stats.duration_ms.max(1),
+                        failed_nodeids: stats.failed_nodeids.clone(),
+                        output_snippet: if outcome.is_green() {
+                            String::new()
+                        } else {
+                            snippet.clone()
+                        },
+                        updated_unix_ms: now,
+                        source: source_label.to_string(),
+                        environment_hash: environment_hash.to_string(),
+                        tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+                        runner_mode: if grp_vitest {
+                            "vitest".to_string()
+                        } else {
+                            "jest".to_string()
+                        },
+                        started_unix_ms: run_started_unix_ms,
+                        completed_unix_ms: now,
+                        dynamic_dependencies: Vec::new(),
+                        dynamic_dependencies_complete: true,
+                        node_results: stats.node_results.clone(),
+                    });
+                } else {
+                    let stats = parse_node_test_output(
+                        &combined_out,
+                        test_file,
+                        per_file_fallback_ms,
+                        overall_success,
+                    );
+                    let outcome = if stats.failed > 0 {
+                        TestOutcome::Failed
+                    } else if stats.errors > 0 {
+                        TestOutcome::Error
+                    } else if stats.passed > 0 {
+                        TestOutcome::Passed
+                    } else if overall_success {
+                        TestOutcome::Skipped
+                    } else {
+                        TestOutcome::Failed
+                    };
+                    records.push(CachedTestRecord {
+                        test_file: test_file.clone(),
+                        dep_hash: dep_hash.clone(),
+                        outcome,
+                        passed: stats.passed,
+                        failed: stats.failed,
+                        skipped: stats.skipped,
+                        errors: stats.errors,
+                        duration_ms: stats.duration_ms,
+                        failed_nodeids: stats.failed_nodeids,
+                        output_snippet: if outcome.is_green() {
+                            String::new()
+                        } else {
+                            snippet.clone()
+                        },
+                        updated_unix_ms: now,
+                        source: source_label.to_string(),
+                        environment_hash: environment_hash.to_string(),
+                        tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+                        runner_mode: if grp_vitest {
+                            "vitest".to_string()
+                        } else {
+                            "jest".to_string()
+                        },
+                        started_unix_ms: run_started_unix_ms,
+                        completed_unix_ms: now,
+                        dynamic_dependencies: Vec::new(),
+                        dynamic_dependencies_complete: true,
+                        node_results: stats.node_results,
+                    });
+                }
+            }
+        }
+        return Ok((records, all_snippets.join("\n")));
+    }
+
+    // Multi-file single-process `node --test` batch execution with inline JSONL demultiplexing
+    if dep_hashes.len() > 1 {
+        let mut runnable_to_source = BTreeMap::new();
+        let mut command = Command::new(program);
+        command.current_dir(&spec.root);
+        command.args(base_args);
+        command.arg(format!("--test-reporter={NODE_JSONL_REPORTER}"));
+        if let Some(ref f) = name_filter
+            && !f.trim().is_empty()
+        {
+            command.arg(format!("--test-name-pattern={f}"));
+        }
+        for arg in extra_args {
+            command.arg(arg);
+        }
+        for test_file in dep_hashes.keys() {
+            let runnable = resolve_node_test_runnable_path(&spec.root, test_file);
+            runnable_to_source.insert(runnable.clone(), test_file.clone());
+            command.arg(&runnable);
+        }
+        if let Ok(output) = run_command_with_timeout_tracked(
+            &mut command,
+            timeout,
+            2 * 1024 * 1024,
+            active_pgid,
+            active_pgids,
+        ) {
+            if output.timed_out {
+                return Err(invalid(format!(
+                    "node --test execution timed out after {}s",
+                    spec.policy.pytest_timeout_secs
+                ))
+                .into());
+            }
+            if output.cancelled {
+                return Err(invalid(
+                    "TEST_CANCELLED: node --test child process group was terminated",
+                )
+                .into());
+            }
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let mut per_file =
+                parse_node_jsonl_batch_output(&stdout_str, &runnable_to_source, dep_hashes);
+            if per_file.len() == dep_hashes.len() {
+                let overall_success = output.status.success();
+                let snippet = truncate_str(stderr_str.trim(), 8192);
+                let now = now_unix_ms();
+                let mut records = Vec::new();
+                for (test_file, dep_hash) in dep_hashes {
+                    let stats = per_file.remove(test_file).unwrap_or_default();
+                    let outcome = if stats.failed > 0 {
+                        TestOutcome::Failed
+                    } else if stats.errors > 0 {
+                        TestOutcome::Error
+                    } else if stats.passed > 0 && stats.skipped == 0 {
+                        TestOutcome::Passed
+                    } else if stats.skipped > 0 && overall_success {
+                        TestOutcome::Skipped
+                    } else if overall_success {
+                        TestOutcome::Passed
+                    } else {
+                        TestOutcome::Failed
+                    };
+                    records.push(CachedTestRecord {
+                        test_file: test_file.clone(),
+                        dep_hash: dep_hash.clone(),
+                        outcome,
+                        passed: stats.passed,
+                        failed: stats.failed,
+                        skipped: stats.skipped,
+                        errors: stats.errors,
+                        duration_ms: stats.duration_ms.max(1),
+                        failed_nodeids: stats.failed_nodeids,
+                        output_snippet: if outcome.is_green() {
+                            String::new()
+                        } else {
+                            snippet.clone()
+                        },
+                        updated_unix_ms: now,
+                        source: source_label.to_string(),
+                        environment_hash: environment_hash.to_string(),
+                        tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+                        runner_mode: "node_test_batch".to_string(),
+                        started_unix_ms: run_started_unix_ms,
+                        completed_unix_ms: now,
+                        dynamic_dependencies: Vec::new(),
+                        dynamic_dependencies_complete: true,
+                        node_results: stats.node_results,
+                    });
+                }
+                return Ok((records, snippet));
+            }
+        }
+    }
+
+    // Fallback: Node.js built-in test runner (`node --test`) per file
+    let mut records = Vec::new();
+    let mut all_outputs = Vec::new();
+    for (test_file, dep_hash) in dep_hashes {
+        let file_started = now_unix_ms();
+        let runnable = resolve_node_test_runnable_path(&spec.root, test_file);
+        let mut command = Command::new(program);
+        command.current_dir(&spec.root);
+        command.args(base_args);
+        command.arg("--test-reporter=tap");
+        if let Some(ref f) = name_filter
+            && !f.trim().is_empty()
+        {
+            command.arg(format!("--test-name-pattern={f}"));
+        }
+        for arg in extra_args {
+            command.arg(arg);
+        }
+        command.arg(&runnable);
+
+        let output = run_command_with_timeout_tracked(
+            &mut command,
+            timeout,
+            2 * 1024 * 1024,
+            active_pgid,
+            active_pgids,
+        )?;
+        if output.timed_out {
+            return Err(invalid(format!(
+                "node --test execution timed out after {}s",
+                spec.policy.pytest_timeout_secs
+            ))
+            .into());
+        }
+        if output.cancelled {
+            return Err(
+                invalid("TEST_CANCELLED: node --test child process group was terminated").into(),
+            );
+        }
+        let stdout_str = String::from_utf8_lossy(&output.stdout);
+        let stderr_str = String::from_utf8_lossy(&output.stderr);
+        let combined_out = match (stdout_str.trim().is_empty(), stderr_str.trim().is_empty()) {
+            (true, _) => stderr_str.to_string(),
+            (_, true) => stdout_str.to_string(),
+            (false, false) => format!("{}\n{}", stdout_str.trim(), stderr_str.trim()),
+        };
+        let snippet = truncate_str(&combined_out, 8192);
+        if !snippet.trim().is_empty() {
+            all_outputs.push(snippet.clone());
+        }
+        let overall_success = output.status.success();
+        let stats =
+            parse_node_test_output(&combined_out, test_file, output.duration_ms, overall_success);
+        let outcome = if stats.failed > 0 {
+            TestOutcome::Failed
+        } else if stats.errors > 0 {
+            TestOutcome::Error
+        } else if stats.passed > 0 && stats.skipped == 0 {
+            TestOutcome::Passed
+        } else if stats.skipped > 0 && overall_success {
+            TestOutcome::Skipped
+        } else if overall_success {
+            TestOutcome::Passed
+        } else {
+            TestOutcome::Failed
+        };
+        let now = now_unix_ms();
+        records.push(CachedTestRecord {
+            test_file: test_file.clone(),
+            dep_hash: dep_hash.clone(),
+            outcome,
+            passed: stats.passed,
+            failed: stats.failed,
+            skipped: stats.skipped,
+            errors: stats.errors,
+            duration_ms: stats.duration_ms,
+            failed_nodeids: stats.failed_nodeids,
+            output_snippet: if outcome.is_green() {
+                String::new()
+            } else {
+                snippet
+            },
+            updated_unix_ms: now,
+            source: source_label.to_string(),
+            environment_hash: environment_hash.to_string(),
+            tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+            runner_mode: "node_test".to_string(),
+            started_unix_ms: file_started,
+            completed_unix_ms: now,
+            dynamic_dependencies: Vec::new(),
+            dynamic_dependencies_complete: true,
+            node_results: stats.node_results,
+        });
+    }
+
+    Ok((records, all_outputs.join("\n")))
+}
+
 fn truncate_str(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -4007,5 +4989,155 @@ test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         );
         assert_eq!(diags[1].code, "F821");
         assert!(!diags[1].fixable);
+    }
+
+    #[test]
+    fn parses_vitest_jest_json_and_node_tap_test_outputs() {
+        let mut known = BTreeMap::new();
+        known.insert(
+            "src/__tests__/Button.test.tsx".to_string(),
+            "hash_btn".to_string(),
+        );
+        let vitest_json = br#"{
+  "numTotalTests": 3,
+  "testResults": [
+    {
+      "name": "/repo/src/__tests__/Button.test.tsx",
+      "status": "failed",
+      "startTime": 1000,
+      "endTime": 1045,
+      "assertionResults": [
+        {
+          "title": "renders primary button",
+          "fullName": "Button suite renders primary button",
+          "status": "passed",
+          "duration": 12.4,
+          "failureMessages": []
+        },
+        {
+          "title": "fires onClick handler",
+          "fullName": "Button suite fires onClick handler",
+          "status": "failed",
+          "duration": 8.1,
+          "failureMessages": ["AssertionError: expected 0 to be 1"]
+        },
+        {
+          "title": "supports dark theme",
+          "fullName": "Button suite supports dark theme",
+          "status": "todo",
+          "duration": 0.0,
+          "failureMessages": []
+        }
+      ]
+    }
+  ]
+}"#;
+        let parsed = parse_vitest_jest_json_output(vitest_json, &known);
+        let st = &parsed["src/__tests__/Button.test.tsx"];
+        assert_eq!(st.passed, 1);
+        assert_eq!(st.failed, 1);
+        assert_eq!(st.skipped, 1);
+        assert_eq!(
+            st.failed_nodeids,
+            vec!["src/__tests__/Button.test.tsx::fires onClick handler".to_string()]
+        );
+        assert_eq!(
+            st.node_results["src/__tests__/Button.test.tsx::renders primary button"].outcome,
+            TestOutcome::Passed
+        );
+        assert_eq!(
+            st.node_results
+                ["src/__tests__/Button.test.tsx::Button suite renders primary button"]
+                .outcome,
+            TestOutcome::Passed
+        );
+
+        let tap_out = r#"
+TAP version 13
+# Subtest: formats instant_cache_hit output
+ok 1 - formats instant_cache_hit output
+# Subtest: handles missing root
+not ok 2 - handles missing root
+# Subtest: skipped browser check
+ok 3 - skipped browser check # SKIP no display
+1..3
+"#;
+        let tap_stats =
+            parse_node_test_output(tap_out, "vscode-extension/test/nativeTools.test.ts", 30, false);
+        assert_eq!(tap_stats.passed, 1);
+        assert_eq!(tap_stats.failed, 1);
+        assert_eq!(tap_stats.skipped, 1);
+        assert_eq!(
+            tap_stats.failed_nodeids,
+            vec!["vscode-extension/test/nativeTools.test.ts::handles missing root".to_string()]
+        );
+    }
+
+    #[test]
+    fn parses_eslint_json_and_node_jsonl_batch_outputs() {
+        let eslint_json = br#"[
+  {
+    "filePath": "/repo/vscode-extension/src/resultFormatter.ts",
+    "messages": [
+      {
+        "ruleId": "@typescript-eslint/no-unused-vars",
+        "severity": 2,
+        "message": "'unusedVal' is assigned a value but never used.",
+        "line": 14,
+        "column": 9,
+        "fix": { "range": [100, 115], "text": "" }
+      }
+    ]
+  }
+]"#;
+        let known_fe = vec!["vscode-extension/src/resultFormatter.ts".to_string()];
+        let eslint_map =
+            parse_eslint_json_output(eslint_json, Path::new("/repo"), &known_fe);
+        let diags = &eslint_map["vscode-extension/src/resultFormatter.ts"];
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "@typescript-eslint/no-unused-vars");
+        assert_eq!(diags[0].row, 14);
+        assert_eq!(diags[0].column, 9);
+        assert!(diags[0].fixable);
+
+        let jsonl = r#"{"t":"test:pass","f":"/repo/vscode-extension/out/test/manifest.test.js","n":"manifest metadata valid","d":4.2}
+{"t":"test:fail","f":"/repo/vscode-extension/out/test/nativeTools.test.js","n":"formats status","d":1.8}
+{"t":"test:pass","f":"/repo/vscode-extension/out/test/nativeTools.test.js","n":"skipped check","d":0.1,"s":true}
+"#;
+        let mut runnable_to_src = BTreeMap::new();
+        runnable_to_src.insert(
+            "vscode-extension/out/test/manifest.test.js".to_string(),
+            "vscode-extension/test/manifest.test.ts".to_string(),
+        );
+        runnable_to_src.insert(
+            "vscode-extension/out/test/nativeTools.test.js".to_string(),
+            "vscode-extension/test/nativeTools.test.ts".to_string(),
+        );
+        let mut known = BTreeMap::new();
+        known.insert(
+            "vscode-extension/test/manifest.test.ts".to_string(),
+            "h1".to_string(),
+        );
+        known.insert(
+            "vscode-extension/test/nativeTools.test.ts".to_string(),
+            "h2".to_string(),
+        );
+        let batch_stats = parse_node_jsonl_batch_output(jsonl, &runnable_to_src, &known);
+        assert_eq!(
+            batch_stats["vscode-extension/test/manifest.test.ts"].passed,
+            1
+        );
+        assert_eq!(
+            batch_stats["vscode-extension/test/nativeTools.test.ts"].failed,
+            1
+        );
+        assert_eq!(
+            batch_stats["vscode-extension/test/nativeTools.test.ts"].skipped,
+            1
+        );
+        assert_eq!(
+            batch_stats["vscode-extension/test/nativeTools.test.ts"].failed_nodeids,
+            vec!["vscode-extension/test/nativeTools.test.ts::formats status".to_string()]
+        );
     }
 }

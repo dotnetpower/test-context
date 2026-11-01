@@ -60,6 +60,111 @@ impl Spec {
     pub fn effective_ruff_cmd(&self) -> Option<Vec<String>> {
         detect_ruff_cmd(&self.root, self.managed_parent.as_deref())
     }
+
+    pub fn effective_frontend_test_cmd(&self) -> Vec<String> {
+        detect_frontend_test_cmd(&self.root, self.managed_parent.as_deref())
+    }
+}
+
+pub fn detect_frontend_test_cmd(root: &Path, managed_parent: Option<&Path>) -> Vec<String> {
+    if let Some(env_bin) = std::env::var_os("TCTX_FRONTEND_TEST_BIN") {
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let bin = p.to_string_lossy().into_owned();
+            if name.contains("vitest") {
+                return vec![bin, "run".to_string()];
+            }
+            return vec![bin];
+        }
+    }
+    let mut search_roots = vec![root.to_path_buf()];
+    for sub in ["frontend", "web", "client", "app", "ui", "vscode-extension"] {
+        let d = root.join(sub);
+        if d.is_dir() {
+            search_roots.push(d);
+        }
+    }
+    for container in ["packages", "apps", "services"] {
+        let dir = root.join(container);
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let sub = entry.path();
+                if sub.is_dir() {
+                    search_roots.push(sub);
+                }
+            }
+        }
+    }
+    if let Some(parent) = managed_parent {
+        search_roots.push(parent.to_path_buf());
+    }
+    for sr in &search_roots {
+        let vitest = sr.join("node_modules/.bin/vitest");
+        if vitest.is_file() {
+            return vec![vitest.to_string_lossy().into_owned(), "run".to_string()];
+        }
+        let jest = sr.join("node_modules/.bin/jest");
+        if jest.is_file() {
+            return vec![jest.to_string_lossy().into_owned()];
+        }
+    }
+    vec!["node".to_string(), "--test".to_string()]
+}
+
+pub fn detect_frontend_runner_for_dir(
+    root: &Path,
+    pkg_dir: &str,
+    fallback_cmd: &[String],
+) -> (Vec<String>, PathBuf) {
+    if !pkg_dir.is_empty() {
+        let sub_root = root.join(pkg_dir);
+        let vitest = sub_root.join("node_modules/.bin/vitest");
+        if vitest.is_file() {
+            return (
+                vec![vitest.to_string_lossy().into_owned(), "run".to_string()],
+                sub_root,
+            );
+        }
+        let jest = sub_root.join("node_modules/.bin/jest");
+        if jest.is_file() {
+            return (vec![jest.to_string_lossy().into_owned()], sub_root);
+        }
+    }
+    (fallback_cmd.to_vec(), root.to_path_buf())
+}
+
+pub fn detect_eslint_cmd_for_dir(root: &Path, pkg_dir: &str) -> Option<(PathBuf, PathBuf)> {
+    if let Some(env_bin) = std::env::var_os("TCTX_ESLINT_BIN") {
+        if env_bin == "none" || env_bin == "0" {
+            return None;
+        }
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            let workdir = if pkg_dir.is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(pkg_dir)
+            };
+            return Some((p, workdir));
+        }
+    }
+    if !pkg_dir.is_empty() {
+        let sub_root = root.join(pkg_dir);
+        let sub_eslint = sub_root.join("node_modules/.bin/eslint");
+        if sub_eslint.is_file() {
+            return Some((sub_eslint, sub_root));
+        }
+    }
+    let root_eslint = root.join("node_modules/.bin/eslint");
+    if root_eslint.is_file() {
+        return Some((root_eslint, root.to_path_buf()));
+    }
+    None
 }
 
 pub fn detect_cargo_cmd(_root: &Path) -> Vec<String> {
