@@ -6,7 +6,7 @@ StartLimitBurst=3
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/tctx daemon
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10

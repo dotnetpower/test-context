@@ -13,7 +13,7 @@ import { resolveRegisteredRootAfterRefresh, resolveWslRoot } from './rootResolve
 import type { DaemonRequest, JsonValue, WorkspaceSpec } from './types.js';
 import { classifyOutcome, type UsageEvent } from './usage.js';
 
-const REGISTRY_CACHE_MS = 5_000;
+const REGISTRY_CACHE_MS = 300_000;
 
 export const NATIVE_TOOL_NAMES = [
   'test-context-native_testRun',
@@ -73,6 +73,7 @@ export interface ToolDefinition<T> {
 class WorkspaceRegistry {
   private cached: WorkspaceSpec[] | undefined;
   private cachedAt = 0;
+  private inFlight: Promise<WorkspaceSpec[]> | undefined;
 
   public constructor(private readonly client: DaemonClient) {}
 
@@ -83,28 +84,41 @@ class WorkspaceRegistry {
     if (!refresh && this.cached && Date.now() - this.cachedAt < REGISTRY_CACHE_MS) {
       return this.cached;
     }
-    const result = await this.client.request<unknown>(
-      request(null, 'test_workspaces', {}),
-      token,
-    );
-    if (!Array.isArray(result)) {
-      throw new Error('Test Context daemon returned an invalid workspace registry.');
+    if (!refresh && this.inFlight) {
+      return this.inFlight;
     }
-    const workspaces = result.map(parseWorkspaceSpec);
-    this.cached = workspaces;
-    this.cachedAt = Date.now();
-    return workspaces;
+    const pending = (async (): Promise<WorkspaceSpec[]> => {
+      const result = await this.client.request<unknown>(
+        request(null, 'test_workspaces', {}),
+        token,
+      );
+      if (!Array.isArray(result)) {
+        throw new Error('Test Context daemon returned an invalid workspace registry.');
+      }
+      const workspaces = result.map(parseWorkspaceSpec);
+      this.cached = workspaces;
+      this.cachedAt = Date.now();
+      return workspaces;
+    })().finally(() => {
+      if (this.inFlight === pending) {
+        this.inFlight = undefined;
+      }
+    });
+    this.inFlight = pending;
+    return pending;
   }
 
   public invalidate(): void {
     this.cached = undefined;
     this.cachedAt = 0;
+    this.inFlight = undefined;
   }
 }
 
 export class NativeToolBridge implements vscode.Disposable {
   private readonly registry: WorkspaceRegistry;
   private readonly disposables: vscode.Disposable[] = [];
+  private lastResolvedRoot: string | undefined;
 
   public constructor(
     private readonly client: DaemonClient,
@@ -154,8 +168,16 @@ export class NativeToolBridge implements vscode.Disposable {
     let root: string | null = null;
     try {
       root = definition.needsRoot
-        ? await this.resolveRoot((input as RootInput).root, token)
+        ? await this.resolveRoot(
+            (input as RootInput).root,
+            token,
+            true,
+            extractInputPathHints(input),
+          )
         : null;
+      if (root) {
+        this.lastResolvedRoot = root;
+      }
       const result = await this.client.requestTraced<JsonValue>(
         request(root, definition.operation, definition.arguments(input)),
         token,
@@ -216,12 +238,21 @@ export class NativeToolBridge implements vscode.Disposable {
     explicit: string | undefined,
     token: vscode.CancellationToken,
     allowPreparation = true,
+    inputHints: readonly string[] = [],
   ): Promise<string> {
     ensureTrustedWorkspace();
-    const candidates = workspaceCandidates();
+    const candidates = workspaceCandidates(inputHints, this.lastResolvedRoot);
     const workspaces = await this.registry.list(token);
     if (this.client.usesWslBridge) {
-      return resolveWslRoot(workspaces, explicit);
+      try {
+        return resolveWslRoot(workspaces, explicit, candidates);
+      } catch (error: unknown) {
+        if (!(error instanceof Error) || error.name !== 'RootResolutionError') {
+          throw error;
+        }
+        const refreshed = await this.registry.list(token, true);
+        return resolveWslRoot(refreshed, explicit, candidates);
+      }
     }
     return resolveRegisteredRootAfterRefresh(
       workspaces,
@@ -382,22 +413,73 @@ function ensureTrustedWorkspace(): void {
   }
 }
 
-function workspaceCandidates(): string[] {
+function extractInputPathHints(input: unknown): string[] {
+  if (typeof input !== 'object' || input === null) {
+    return [];
+  }
+  const rec = input as Record<string, unknown>;
+  const hints: string[] = [];
+  if (typeof rec.file === 'string' && rec.file.trim().length > 0) {
+    hints.push(rec.file.split('::')[0]!.trim());
+  }
+  for (const key of ['targets', 'files'] as const) {
+    const arr = rec[key];
+    if (Array.isArray(arr)) {
+      for (const item of arr) {
+        if (typeof item === 'string' && item.trim().length > 0) {
+          hints.push(item.split('::')[0]!.trim());
+        }
+      }
+    }
+  }
+  return hints;
+}
+
+function uriCandidatePaths(uri: vscode.Uri): string[] {
+  const out: string[] = [];
+  if (uri.scheme === 'file' && uri.fsPath) {
+    out.push(resolve(uri.fsPath));
+  }
+  if (uri.path && uri.path.startsWith('/')) {
+    out.push(uri.path);
+  }
+  return out;
+}
+
+function workspaceCandidates(
+  inputHints: readonly string[] = [],
+  lastResolvedRoot?: string,
+): string[] {
   const candidates: string[] = [];
+  const pushUnique = (p: string): void => {
+    if (p && !candidates.includes(p)) {
+      candidates.push(p);
+    }
+  };
+  for (const hint of inputHints) {
+    if (hint.startsWith('/') || hint.startsWith('\\\\') || /^[a-zA-Z]:[\\/]/u.test(hint)) {
+      pushUnique(hint);
+    }
+  }
   const activeUri = vscode.window.activeTextEditor?.document.uri;
-  if (activeUri?.scheme === 'file') {
+  if (activeUri) {
     const folder = vscode.workspace.getWorkspaceFolder(activeUri);
     if (folder) {
-      candidates.push(resolve(folder.uri.fsPath));
+      for (const p of uriCandidatePaths(folder.uri)) {
+        pushUnique(p);
+      }
+    }
+    for (const p of uriCandidatePaths(activeUri)) {
+      pushUnique(p);
     }
   }
   for (const folder of vscode.workspace.workspaceFolders ?? []) {
-    if (folder.uri.scheme === 'file') {
-      const path = resolve(folder.uri.fsPath);
-      if (!candidates.includes(path)) {
-        candidates.push(path);
-      }
+    for (const p of uriCandidatePaths(folder.uri)) {
+      pushUnique(p);
     }
+  }
+  if (lastResolvedRoot) {
+    pushUnique(lastResolvedRoot);
   }
   return candidates;
 }

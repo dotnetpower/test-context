@@ -238,6 +238,10 @@ impl Workspace {
         let Some(file_name) = rel.file_name().and_then(|n| n.to_str()) else {
             return false;
         };
+        self.matches_permitted_filename_or_glob(rel, file_name)
+    }
+
+    fn matches_permitted_filename_or_glob(&self, rel: &Path, file_name: &str) -> bool {
         self.include_matcher.is_match(rel)
             || self.include_matcher.is_match(Path::new(file_name))
             || PYTEST_CONFIG_FILES.contains(&file_name)
@@ -314,7 +318,11 @@ impl Workspace {
                         continue;
                     }
                     stack.push(path);
-                } else if file_type.is_file() && self.is_permitted_rel(rel) {
+                } else if file_type.is_file()
+                    && let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                    && !(self.default_excludes && is_excluded_dir_name(file_name))
+                    && self.matches_permitted_filename_or_glob(rel, file_name)
+                {
                     let meta = match entry.metadata() {
                         Ok(m) => m,
                         Err(_) => continue,
@@ -561,9 +569,11 @@ pub fn run_command_with_timeout_tracked(
     }
     if let Some(active) = active_pgids
         && let Ok(pgid) = i32::try_from(pid)
-        && let Ok(mut guard) = active.lock()
     {
-        guard.insert(pgid);
+        active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(pgid);
     }
     struct PgidReset<'a> {
         single: Option<&'a AtomicI32>,
@@ -577,9 +587,11 @@ pub fn run_command_with_timeout_tracked(
             }
             if let Some(active) = self.many
                 && let Ok(pgid) = i32::try_from(self.pid)
-                && let Ok(mut guard) = active.lock()
             {
-                guard.remove(&pgid);
+                active
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&pgid);
             }
         }
     }
@@ -595,6 +607,7 @@ pub fn run_command_with_timeout_tracked(
     let stderr_handle = std::thread::spawn(move || drain_bounded(stderr_pipe, max_output_bytes));
 
     let mut timed_out = false;
+    let mut poll_sleep = Duration::from_micros(250);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -611,8 +624,18 @@ pub fn run_command_with_timeout_tracked(
             let _ = child.kill();
             break child.wait()?;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(poll_sleep);
+        poll_sleep = (poll_sleep * 2).min(Duration::from_millis(10));
     };
+    // Ensure any orphaned descendant in the child's process group that inherited stdout/stderr is terminated
+    // so stdout_handle.join() and stderr_handle.join() cannot block indefinitely.
+    if let Ok(pgid) = i32::try_from(pid)
+        && pgid > 0
+    {
+        unsafe {
+            let _ = libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
 
     let stdout = stdout_handle.join().unwrap_or_default();
     let stderr = stderr_handle.join().unwrap_or_default();

@@ -261,22 +261,43 @@ pub struct ManagedRoot {
 impl ManagedRoot {
     pub fn load(spec: Spec) -> Result<Arc<Self>> {
         let workspace = spec.workspace()?;
-        let mut graph = DependencyGraph::build(&workspace, &spec.policy)?;
-        let cache = RootCache::load_or_new(&workspace.root);
-        let mut runtime_changed = false;
+        let bg_enabled = spec.policy.background_enabled;
+        let (graph_res, cache, dirty) = std::thread::scope(|scope| {
+            let ws_ref = &workspace;
+            let pol_ref = &spec.policy;
+            let graph_handle = scope.spawn(move || DependencyGraph::build_unindexed(ws_ref, pol_ref));
+            let cache_handle = scope.spawn(move || RootCache::load_or_new(&ws_ref.root));
+            let dirty_handle = scope.spawn(move || {
+                if bg_enabled {
+                    git_dirty_files(&ws_ref.root).unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            });
+            (
+                graph_handle
+                    .join()
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        invalid("parallel AST build panicked").into()
+                    })
+                    .and_then(|res| res),
+                cache_handle
+                    .join()
+                    .unwrap_or_else(|_| RootCache::new(workspace.root.clone())),
+                dirty_handle.join().unwrap_or_default(),
+            )
+        });
+        let mut graph = graph_res?;
         for record in cache.latest_by_file.values() {
-            runtime_changed |= graph.apply_runtime_dependencies(
+            let _ = graph.apply_runtime_dependencies(
                 &workspace,
                 &spec.policy,
                 &record.test_file,
                 &record.dynamic_dependencies,
             );
         }
-        if runtime_changed {
-            graph.recompute_edges();
-        }
-        let env_hash = environment_fingerprint_for_graph(&spec, &graph);
-        graph.apply_environment_hash(env_hash);
+        graph.environment_hash = environment_fingerprint_for_graph(&spec, &graph);
+        graph.recompute_edges();
 
         // Queue background execution for dirty git files (or all uncached tests when suite <= 32 files)
         let mut pending_queue = VecDeque::new();
@@ -291,7 +312,6 @@ impl ManagedRoot {
             if py_files.len() <= 64 {
                 pending_ruff_files.extend(py_files);
             }
-            let dirty = git_dirty_files(&workspace.root).unwrap_or_default();
             for f in &dirty {
                 let norm = f.trim().trim_start_matches("./").replace('\\', "/");
                 if norm.ends_with(".py") && graph.files.contains_key(&norm) {
@@ -422,7 +442,7 @@ impl ManagedRoot {
         }
         *arc.watcher
             .lock()
-            .map_err(|_| invalid("watcher mutex poisoned"))? = Some(watcher);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(watcher);
 
         if spec.policy.background_enabled {
             Self::spawn_background_worker(&arc)?;
@@ -431,18 +451,29 @@ impl ManagedRoot {
         Ok(arc)
     }
 
-    pub fn last_activity_elapsed(&self) -> Duration {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, RootState> {
         self.state
             .lock()
-            .map(|g| g.last_activity.elapsed())
-            .unwrap_or_default()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn wait_state_timeout<'a>(
+        &'a self,
+        guard: std::sync::MutexGuard<'a, RootState>,
+        dur: Duration,
+    ) -> std::sync::MutexGuard<'a, RootState> {
+        match self.condvar.wait_timeout(guard, dur) {
+            Ok((next_guard, _)) => next_guard,
+            Err(poisoned) => poisoned.into_inner().0,
+        }
+    }
+
+    pub fn last_activity_elapsed(&self) -> Duration {
+        self.lock_state().last_activity.elapsed()
     }
 
     pub fn indexed_file_count(&self) -> usize {
-        self.state
-            .lock()
-            .map(|guard| guard.graph.files.len())
-            .unwrap_or(usize::MAX)
+        self.lock_state().graph.files.len()
     }
 
     pub fn is_evictable(&self) -> bool {
@@ -450,17 +481,14 @@ impl ManagedRoot {
             && self
                 .active_pgids
                 .lock()
-                .map(|pgids| pgids.is_empty())
-                .unwrap_or(false)
-            && self
-                .state
-                .lock()
-                .map(|guard| {
-                    !guard.background_running
-                        && guard.in_flight.is_empty()
-                        && guard.pending_queue.is_empty()
-                })
-                .unwrap_or(false)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_empty()
+            && {
+                let guard = self.lock_state();
+                !guard.background_running
+                    && guard.in_flight.is_empty()
+                    && guard.pending_queue.is_empty()
+            }
     }
 
     pub fn reclaim_idle_zygote(&self) -> bool {
@@ -471,14 +499,13 @@ impl ManagedRoot {
             .unwrap_or(60);
         self.zygote
             .lock()
-            .map(|mut manager| manager.shutdown_if_idle(Duration::from_secs(timeout_secs)))
-            .unwrap_or(false)
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutdown_if_idle(Duration::from_secs(timeout_secs))
     }
 
     pub fn flush_pending_cache(&self) {
-        if let Ok(mut guard) = self.state.lock()
-            && guard.cache.has_pending_events()
-        {
+        let mut guard = self.lock_state();
+        if guard.cache.has_pending_events() {
             match guard.cache.save() {
                 Ok(()) => guard.cache.persistence_error = None,
                 Err(error) => guard.cache.persistence_error = Some(error.to_string()),
@@ -490,22 +517,28 @@ impl ManagedRoot {
         self.stopped.store(true, Ordering::SeqCst);
         self.cancel_active();
         self.condvar.notify_all();
-        if let Ok(mut w) = self.watcher.lock() {
-            *w = None;
-        }
-        if let Ok(mut worker) = self.background_worker.lock()
-            && let Some(handle) = worker.take()
+        *self
+            .watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        if let Some(handle) = self
+            .background_worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
         {
             let _ = handle.join();
         }
-        if let Ok(mut guard) = self.state.lock()
-            && let Err(error) = guard.cache.save()
         {
-            guard.cache.persistence_error = Some(error.to_string());
+            let mut guard = self.lock_state();
+            if let Err(error) = guard.cache.save() {
+                guard.cache.persistence_error = Some(error.to_string());
+            }
         }
-        if let Ok(mut z) = self.zygote.lock() {
-            *z = ZygoteManager::default();
-        }
+        *self
+            .zygote
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ZygoteManager::default();
     }
 
     fn enqueue_affected_locked(guard: &mut RootState, affected: Vec<AffectedTest>) {
@@ -558,7 +591,7 @@ impl ManagedRoot {
         let mut slot = this
             .background_worker
             .lock()
-            .map_err(|_| invalid("background worker mutex poisoned"))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         *slot = Some(handle);
         Ok(())
     }
@@ -568,255 +601,272 @@ impl ManagedRoot {
             if self.stopped.load(Ordering::SeqCst) {
                 return;
             }
-            if !background_capacity_available(
-                self.state
-                    .lock()
-                    .map(|guard| guard.spec.policy.background_max_load_ratio_percent)
-                    .unwrap_or(75),
-            ) {
-                if let Ok(mut guard) = self.state.lock() {
-                    guard.background_runs_deferred_load =
-                        guard.background_runs_deferred_load.saturating_add(1);
-                }
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
+            let step = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.background_step();
+            }));
+            if step.is_err() {
+                let mut guard = self.lock_state();
+                guard.in_flight.clear();
+                guard.background_running = false;
+                guard.background_resources.clear();
+                guard.last_background_error =
+                    Some("background worker recovered from an internal panic".to_string());
+                self.condvar.notify_all();
+                std::thread::sleep(Duration::from_millis(100));
             }
-            let batch: Vec<(String, String)>;
-            let spec: Spec;
-            let preload_modules: Vec<String>;
-            let environment_hash: String;
-            let capture_dynamic_dependencies: bool;
+        }
+    }
+
+    fn background_step(&self) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        if !background_capacity_available(
+            self.lock_state()
+                .spec
+                .policy
+                .background_max_load_ratio_percent,
+        ) {
+            let mut guard = self.lock_state();
+            guard.background_runs_deferred_load =
+                guard.background_runs_deferred_load.saturating_add(1);
+            drop(guard);
+            std::thread::sleep(Duration::from_millis(250));
+            return;
+        }
+        let batch: Vec<(String, String)>;
+        let spec: Spec;
+        let preload_modules: Vec<String>;
+        let environment_hash: String;
+        let capture_dynamic_dependencies: bool;
+        {
+            let mut guard = self.lock_state();
+            self.drain_fs_events_locked(&mut guard);
+            while guard.pending_queue.is_empty()
+                && guard.pending_ruff_files.is_empty()
+                && !self.stopped.load(Ordering::SeqCst)
             {
-                let mut guard = self.state.lock().expect("state lock");
-                self.drain_fs_events_locked(&mut guard);
-                while guard.pending_queue.is_empty()
-                    && guard.pending_ruff_files.is_empty()
-                    && !self.stopped.load(Ordering::SeqCst)
-                {
-                    guard.background_running = false;
-                    let (next_guard, _) = self
-                        .condvar
-                        .wait_timeout(guard, Duration::from_secs(2))
-                        .expect("condvar wait");
-                    guard = next_guard;
-                    if !self.stopped.load(Ordering::SeqCst) {
-                        // Coalesce burst file saves over a 40ms debounce window before recomputing graph
-                        drop(guard);
-                        std::thread::sleep(Duration::from_millis(40));
-                        guard = self.state.lock().expect("state lock");
-                        self.drain_fs_events_locked(&mut guard);
-                    }
+                guard.background_running = false;
+                guard = self.wait_state_timeout(guard, Duration::from_secs(2));
+                if !self.stopped.load(Ordering::SeqCst) {
+                    // Coalesce burst file saves over a 40ms debounce window before recomputing graph
+                    drop(guard);
+                    std::thread::sleep(Duration::from_millis(40));
+                    guard = self.lock_state();
+                    self.drain_fs_events_locked(&mut guard);
                 }
-                if self.stopped.load(Ordering::SeqCst) {
+            }
+            if self.stopped.load(Ordering::SeqCst) {
+                return;
+            }
+            if !guard.pending_ruff_files.is_empty() {
+                let ruff_files: Vec<String> =
+                    std::mem::take(&mut guard.pending_ruff_files).into_iter().collect();
+                drop(guard);
+                self.ensure_ruff_cached_unlocked(&ruff_files);
+                self.condvar.notify_all();
+                guard = self.lock_state();
+                if guard.pending_queue.is_empty() {
+                    guard.background_running = false;
                     return;
                 }
-                if !guard.pending_ruff_files.is_empty() {
-                    let ruff_files: Vec<String> =
-                        std::mem::take(&mut guard.pending_ruff_files).into_iter().collect();
-                    Self::ensure_ruff_cached_locked(&mut guard, &ruff_files);
-                    self.condvar.notify_all();
-                    if guard.pending_queue.is_empty() {
-                        guard.background_running = false;
-                        continue;
-                    }
-                }
-                let max_batch = guard.spec.policy.background_batch_size.max(1);
-                let mut sorted: Vec<String> = guard.pending_queue.drain(..).collect();
-                let prediction_rank: BTreeMap<String, usize> = guard
-                    .cache
-                    .predicted_affected_tests(&sorted)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(rank, test_file)| (test_file, rank))
-                    .collect();
-                if guard.background_batches % 4 == 3 {
-                    sorted.sort_by_key(|test_file| {
-                        (
-                            prediction_rank
-                                .get(test_file)
-                                .copied()
-                                .unwrap_or(usize::MAX),
-                            std::cmp::Reverse(
-                                guard
-                                    .cache
-                                    .latest_by_file
-                                    .get(test_file)
-                                    .map(|record| record.duration_ms)
-                                    .unwrap_or(0),
-                            ),
-                        )
-                    });
-                } else {
-                    sorted.sort_by_key(|test_file| {
-                        (
-                            prediction_rank
-                                .get(test_file)
-                                .copied()
-                                .unwrap_or(usize::MAX),
+            }
+            let max_batch = guard.spec.policy.background_batch_size.max(1);
+            let mut sorted: Vec<String> = guard.pending_queue.drain(..).collect();
+            let prediction_rank: BTreeMap<String, usize> = guard
+                .cache
+                .predicted_affected_tests(&sorted)
+                .into_iter()
+                .enumerate()
+                .map(|(rank, test_file)| (test_file, rank))
+                .collect();
+            if guard.background_batches % 4 == 3 {
+                sorted.sort_by_key(|test_file| {
+                    (
+                        prediction_rank
+                            .get(test_file)
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                        std::cmp::Reverse(
                             guard
                                 .cache
                                 .latest_by_file
                                 .get(test_file)
                                 .map(|record| record.duration_ms)
                                 .unwrap_or(0),
-                        )
-                    });
-                }
-                guard.pending_queue.extend(sorted);
-                let mut selected = Vec::new();
-                while selected.len() < max_batch {
-                    let Some(test_file) = guard.pending_queue.pop_front() else {
-                        break;
-                    };
-                    let Some(dep_hash) = guard.graph.dep_hash_for_test.get(&test_file).cloned()
-                    else {
-                        continue;
-                    };
-                    // Skip if already cached or currently in flight
-                    if guard.cache.get_matching(&test_file, &dep_hash).is_some() {
-                        continue;
-                    }
-                    let flight_key = flight_key(&test_file, &dep_hash);
-                    if guard.in_flight.insert(flight_key) {
-                        selected.push((test_file, dep_hash));
-                    }
-                }
-                if selected.is_empty() {
-                    guard.background_running = false;
-                    continue;
-                }
-                guard.background_running = true;
-                guard.background_batches = guard.background_batches.saturating_add(1);
-                guard.background_resources = selected
-                    .iter()
-                    .flat_map(|(test_file, _)| {
-                        test_resource_keys(&guard.graph, test_file).into_iter()
-                    })
-                    .collect();
-                spec = guard.spec.clone();
-                let has_py = selected.iter().any(|(tf, _)| tf.ends_with(".py"));
-                preload_modules = if has_py {
-                    guard.graph.external_preload_modules_for_tests(
-                        &selected
-                            .iter()
-                            .map(|(test_file, _)| test_file.clone())
-                            .collect::<Vec<_>>(),
+                        ),
                     )
-                } else {
-                    Vec::new()
-                };
-                batch = selected;
-                environment_hash = guard.graph.environment_hash.clone();
-                capture_dynamic_dependencies = batch.iter().any(|(test_file, dep_hash)| {
-                    guard
-                        .cache
-                        .get_matching(test_file, dep_hash)
-                        .is_none_or(|record| !record.dynamic_dependencies_complete)
+                });
+            } else {
+                sorted.sort_by_key(|test_file| {
+                    (
+                        prediction_rank
+                            .get(test_file)
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                        guard
+                            .cache
+                            .latest_by_file
+                            .get(test_file)
+                            .map(|record| record.duration_ms)
+                            .unwrap_or(0),
+                    )
                 });
             }
-
-            let files_only: Vec<String> = batch.iter().map(|(f, _)| f.clone()).collect();
-            let batch_map: BTreeMap<String, String> = batch.iter().cloned().collect();
-            let plugins = pytest_plugin_manifest_for_targets(&spec, &files_only);
-            let exec_res = execute_pytest_batch(
-                &spec,
-                &files_only,
-                &batch_map,
-                None,
-                None,
-                &[],
-                "background",
-                Some(&self.zygote),
-                Some(&self.active_pgid),
-                Some(&self.active_pgids),
-                &preload_modules,
-                &environment_hash,
-                &plugins,
-                capture_dynamic_dependencies,
-            );
-            if self.cancel_requested.swap(false, Ordering::AcqRel) {
-                let mut guard = self.state.lock().expect("state lock");
-                for (test_file, dep_hash) in &batch {
-                    guard.in_flight.remove(&flight_key(test_file, dep_hash));
+            guard.pending_queue.extend(sorted);
+            let mut selected = Vec::new();
+            while selected.len() < max_batch {
+                let Some(test_file) = guard.pending_queue.pop_front() else {
+                    break;
+                };
+                let Some(dep_hash) = guard.graph.dep_hash_for_test.get(&test_file).cloned()
+                else {
+                    continue;
+                };
+                // Skip if already cached or currently in flight
+                if guard.cache.get_matching(&test_file, &dep_hash).is_some() {
+                    continue;
                 }
-                guard.last_background_error =
-                    Some("TEST_CANCELLED: background pytest was terminated".to_string());
-                guard.background_running = !guard.pending_queue.is_empty();
-                guard.background_resources.clear();
-                self.condvar.notify_all();
-                continue;
+                let flight_key = flight_key(&test_file, &dep_hash);
+                if guard.in_flight.insert(flight_key) {
+                    selected.push((test_file, dep_hash));
+                }
             }
-            let exec_res = exec_res.map(|(mut records, raw)| {
-                records.shrink_to_fit();
-                (records, raw)
+            if selected.is_empty() {
+                guard.background_running = false;
+                return;
+            }
+            guard.background_running = true;
+            guard.background_batches = guard.background_batches.saturating_add(1);
+            guard.background_resources = selected
+                .iter()
+                .flat_map(|(test_file, _)| {
+                    test_resource_keys(&guard.graph, test_file).into_iter()
+                })
+                .collect();
+            spec = guard.spec.clone();
+            let has_py = selected.iter().any(|(tf, _)| tf.ends_with(".py"));
+            preload_modules = if has_py {
+                guard.graph.external_preload_modules_for_tests(
+                    &selected
+                        .iter()
+                        .map(|(test_file, _)| test_file.clone())
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                Vec::new()
+            };
+            batch = selected;
+            environment_hash = guard.graph.environment_hash.clone();
+            capture_dynamic_dependencies = batch.iter().any(|(test_file, dep_hash)| {
+                guard
+                    .cache
+                    .get_matching(test_file, dep_hash)
+                    .is_none_or(|record| !record.dynamic_dependencies_complete)
             });
+        }
 
-            {
-                let mut guard = self.state.lock().expect("state lock");
-                for (test_file, dep_hash) in &batch {
-                    guard.in_flight.remove(&flight_key(test_file, dep_hash));
-                }
-                Self::reconcile_live_files_locked(&mut guard, Some(&files_only));
-                let unstable: BTreeSet<String> = batch
-                    .iter()
-                    .filter(|(test_file, expected_hash)| {
-                        guard.graph.dep_hash_for_test.get(test_file) != Some(expected_hash)
-                    })
-                    .map(|(test_file, _)| test_file.clone())
-                    .collect();
-                for test_file in unstable.iter().rev() {
-                    if background_eligible_with_cache(&guard, test_file) {
-                        guard.pending_queue.retain(|queued| queued != test_file);
-                        guard.pending_queue.push_front(test_file.clone());
-                    }
-                }
-                match exec_res {
-                    Ok((mut records, _raw_out)) => {
-                        let workspace = guard.workspace.clone();
-                        let policy_snapshot = guard.spec.policy.clone();
-                        let mut runtime_changed = false;
-                        for record in &records {
-                            runtime_changed |= guard.graph.apply_runtime_dependencies(
-                                &workspace,
-                                &policy_snapshot,
-                                &record.test_file,
-                                &record.dynamic_dependencies,
-                            );
-                        }
-                        if runtime_changed {
-                            guard.graph.recompute_edges();
-                            for record in &mut records {
-                                if let Some(dep_hash) =
-                                    guard.graph.dep_hash_for_test.get(&record.test_file)
-                                {
-                                    record.dep_hash.clone_from(dep_hash);
-                                }
-                            }
-                        }
-                        let policy = guard.spec.policy.clone();
-                        for rec in records {
-                            if !unstable.contains(&rec.test_file) {
-                                guard.cache.insert(rec, &policy);
-                            }
-                        }
-                        guard.cache.total_background_runs =
-                            guard.cache.total_background_runs.saturating_add(1);
-                        guard.last_background_error = None;
-                        match guard.cache.save() {
-                            Ok(()) => guard.cache.persistence_error = None,
-                            Err(error) => {
-                                guard.cache.persistence_error = Some(error.to_string());
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        guard.last_background_error = Some(err.to_string());
-                    }
-                }
-                guard.background_running = !guard.pending_queue.is_empty();
-                guard.background_resources.clear();
-                self.condvar.notify_all();
+        let files_only: Vec<String> = batch.iter().map(|(f, _)| f.clone()).collect();
+        let batch_map: BTreeMap<String, String> = batch.iter().cloned().collect();
+        let plugins = pytest_plugin_manifest_for_targets(&spec, &files_only);
+        let exec_res = execute_pytest_batch(
+            &spec,
+            &files_only,
+            &batch_map,
+            None,
+            None,
+            &[],
+            "background",
+            Some(&self.zygote),
+            Some(&self.active_pgid),
+            Some(&self.active_pgids),
+            &preload_modules,
+            &environment_hash,
+            &plugins,
+            capture_dynamic_dependencies,
+        );
+        if self.cancel_requested.swap(false, Ordering::AcqRel) {
+            let mut guard = self.lock_state();
+            for (test_file, dep_hash) in &batch {
+                guard.in_flight.remove(&flight_key(test_file, dep_hash));
             }
+            guard.last_background_error =
+                Some("TEST_CANCELLED: background pytest was terminated".to_string());
+            guard.background_running = !guard.pending_queue.is_empty();
+            guard.background_resources.clear();
+            self.condvar.notify_all();
+            return;
+        }
+        let exec_res = exec_res.map(|(mut records, raw)| {
+            records.shrink_to_fit();
+            (records, raw)
+        });
+
+        {
+            let mut guard = self.lock_state();
+            for (test_file, dep_hash) in &batch {
+                guard.in_flight.remove(&flight_key(test_file, dep_hash));
+            }
+            Self::reconcile_live_files_locked(&mut guard, Some(&files_only));
+            let unstable: BTreeSet<String> = batch
+                .iter()
+                .filter(|(test_file, expected_hash)| {
+                    guard.graph.dep_hash_for_test.get(test_file) != Some(expected_hash)
+                })
+                .map(|(test_file, _)| test_file.clone())
+                .collect();
+            for test_file in unstable.iter().rev() {
+                if background_eligible_with_cache(&guard, test_file) {
+                    guard.pending_queue.retain(|queued| queued != test_file);
+                    guard.pending_queue.push_front(test_file.clone());
+                }
+            }
+            match exec_res {
+                Ok((mut records, _raw_out)) => {
+                    let workspace = guard.workspace.clone();
+                    let policy_snapshot = guard.spec.policy.clone();
+                    let mut runtime_changed = false;
+                    for record in &records {
+                        runtime_changed |= guard.graph.apply_runtime_dependencies(
+                            &workspace,
+                            &policy_snapshot,
+                            &record.test_file,
+                            &record.dynamic_dependencies,
+                        );
+                    }
+                    if runtime_changed {
+                        guard.graph.recompute_edges();
+                        for record in &mut records {
+                            if let Some(dep_hash) =
+                                guard.graph.dep_hash_for_test.get(&record.test_file)
+                            {
+                                record.dep_hash.clone_from(dep_hash);
+                            }
+                        }
+                    }
+                    let policy = guard.spec.policy.clone();
+                    for rec in records {
+                        if !unstable.contains(&rec.test_file) {
+                            guard.cache.insert(rec, &policy);
+                        }
+                    }
+                    guard.cache.total_background_runs =
+                        guard.cache.total_background_runs.saturating_add(1);
+                    guard.last_background_error = None;
+                    match guard.cache.save() {
+                        Ok(()) => guard.cache.persistence_error = None,
+                        Err(error) => {
+                            guard.cache.persistence_error = Some(error.to_string());
+                        }
+                    }
+                }
+                Err(err) => {
+                    guard.last_background_error = Some(err.to_string());
+                }
+            }
+            guard.background_running = !guard.pending_queue.is_empty();
+            guard.background_resources.clear();
+            self.condvar.notify_all();
         }
     }
 
@@ -961,8 +1011,10 @@ impl ManagedRoot {
 
     fn ingest_explicit_paths_locked(guard: &mut RootState, raw_paths: &[String]) {
         let mut added_any = false;
+        let root_path = guard.workspace.root.clone();
         for raw in raw_paths {
-            let file_part = raw.split("::").next().unwrap_or(raw);
+            let norm_target = normalize_target_for_root(&root_path, raw);
+            let file_part = norm_target.split("::").next().unwrap_or(&norm_target);
             let norm = file_part
                 .trim()
                 .trim_start_matches("./")
@@ -999,11 +1051,11 @@ impl ManagedRoot {
     }
 
     fn maybe_safety_reconcile_locked(guard: &mut RootState) {
-        if guard.last_safety_scan.elapsed() >= Duration::from_secs(60) {
+        if guard.last_safety_scan.elapsed() >= Duration::from_secs(300) {
             Self::reconcile_live_files_locked(guard, None);
             guard.last_safety_scan = Instant::now();
         }
-        if guard.last_environment_check.elapsed() >= Duration::from_secs(60) {
+        if guard.last_environment_check.elapsed() >= Duration::from_secs(300) {
             let environment_hash = environment_fingerprint_for_graph(&guard.spec, &guard.graph);
             guard.graph.apply_environment_hash(environment_hash);
             guard.last_environment_check = Instant::now();
@@ -1136,13 +1188,19 @@ impl ManagedRoot {
     }
 
     pub fn sync(&self, wait_background: bool) -> Result<serde_json::Value> {
-        {
-            let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+        let (workspace, spec) = {
+            let mut guard = self.lock_state();
             guard.last_activity = Instant::now();
-            guard.graph = DependencyGraph::build(&guard.workspace, &guard.spec.policy)?;
+            (guard.workspace.clone(), guard.spec.clone())
+        };
+        let mut new_graph = DependencyGraph::build(&workspace, &spec.policy)?;
+        let environment_hash = environment_fingerprint_for_graph(&spec, &new_graph);
+        new_graph.apply_environment_hash(environment_hash);
+        {
+            let mut guard = self.lock_state();
+            guard.last_activity = Instant::now();
+            guard.graph = new_graph;
             guard.generation = guard.generation.saturating_add(1);
-            let environment_hash = environment_fingerprint_for_graph(&guard.spec, &guard.graph);
-            guard.graph.apply_environment_hash(environment_hash);
             if guard.spec.policy.background_enabled {
                 let candidates: Vec<(String, String)> = guard
                     .graph
@@ -1164,17 +1222,13 @@ impl ManagedRoot {
 
         if wait_background {
             let deadline = Instant::now() + Duration::from_secs(60);
-            let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+            let mut guard = self.lock_state();
             while (!guard.pending_queue.is_empty()
                 || !guard.in_flight.is_empty()
                 || !guard.pending_ruff_files.is_empty())
                 && Instant::now() < deadline
             {
-                let (next_guard, _) = self
-                    .condvar
-                    .wait_timeout(guard, Duration::from_millis(100))
-                    .map_err(|_| invalid("mutex poisoned"))?;
-                guard = next_guard;
+                guard = self.wait_state_timeout(guard, Duration::from_millis(100));
             }
         }
 
@@ -1182,9 +1236,10 @@ impl ManagedRoot {
     }
 
     pub fn invalidate(&self, files: &[String]) -> Result<serde_json::Value> {
-        let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+        let mut guard = self.lock_state();
         guard.last_activity = Instant::now();
-        let removed = if files.is_empty() {
+        let norm_files = normalize_targets_for_root(&guard.workspace.root, files);
+        let removed = if norm_files.is_empty() {
             let count = guard.cache.invalidate_all();
             if guard.spec.policy.background_enabled {
                 let all_tests: Vec<String> =
@@ -1201,7 +1256,7 @@ impl ManagedRoot {
             }
             count
         } else {
-            let resolved = guard.graph.resolve_target_test_files(files);
+            let resolved = guard.graph.resolve_target_test_files(&norm_files);
             let mut count = 0usize;
             for test_file in resolved {
                 count += guard.cache.invalidate_file(&test_file);
@@ -1227,7 +1282,7 @@ impl ManagedRoot {
     }
 
     pub fn status(&self) -> serde_json::Value {
-        let mut guard = self.state.lock().expect("state lock");
+        let mut guard = self.lock_state();
         self.drain_fs_events_locked(&mut guard);
         let total_tests = guard.graph.dep_hash_for_test.len();
         let mut cached_passed = 0usize;
@@ -1339,50 +1394,63 @@ impl ManagedRoot {
         let zygote = self
             .zygote
             .lock()
-            .map(|manager| manager.status())
-            .unwrap_or_else(|_| serde_json::json!({"ready":false,"error":"mutex_poisoned"}));
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .status();
         let mut payload = payload;
         payload["zygote"] = zygote;
         payload
     }
 
     pub fn graph_info(&self, file: &str) -> Result<FileGraphInfo> {
-        let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+        let mut guard = self.lock_state();
         guard.last_activity = Instant::now();
         self.drain_fs_events_locked(&mut guard);
-        Self::ingest_explicit_paths_locked(&mut guard, &[file.to_string()]);
+        let norm_file = normalize_target_for_root(&guard.workspace.root, file);
+        Self::ingest_explicit_paths_locked(&mut guard, std::slice::from_ref(&norm_file));
         Self::maybe_safety_reconcile_locked(&mut guard);
-        guard.graph.file_graph_info(file).ok_or_else(|| {
+        guard.graph.file_graph_info(&norm_file).ok_or_else(|| {
+            let suggestions = guard
+                .graph
+                .suggest_closest_targets(std::slice::from_ref(&norm_file));
+            let hint = if suggestions.is_empty() {
+                String::new()
+            } else {
+                format!("; did_you_mean=[{}]", suggestions.join(", "))
+            };
             invalid(format!(
-                "file is not indexed in the Python AST graph: {file}"
+                "file is not indexed in the TCTX polyglot AST graph: {norm_file}{hint}"
             ))
             .into()
         })
     }
 
     pub fn affected(&self, files: &[String], use_git_diff: bool) -> Result<serde_json::Value> {
-        let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
-        guard.last_activity = Instant::now();
-        self.drain_fs_events_locked(&mut guard);
-        Self::ingest_explicit_paths_locked(&mut guard, files);
-        Self::maybe_safety_reconcile_locked(&mut guard);
+        let workspace_root = {
+            let mut guard = self.lock_state();
+            guard.last_activity = Instant::now();
+            self.drain_fs_events_locked(&mut guard);
+            Self::ingest_explicit_paths_locked(&mut guard, files);
+            Self::maybe_safety_reconcile_locked(&mut guard);
+            guard.workspace.root.clone()
+        };
 
         let changed_files = if !files.is_empty() {
-            files.to_vec()
+            normalize_targets_for_root(&workspace_root, files)
         } else if use_git_diff {
-            git_dirty_files(&guard.workspace.root).unwrap_or_default()
+            git_dirty_files(&workspace_root).unwrap_or_default()
         } else {
             Vec::new()
         };
 
         let lint_changed: Vec<String> = changed_files
             .iter()
-            .map(|f| f.trim().trim_start_matches("./").replace('\\', "/"))
+            .map(|f| normalize_target_for_root(&workspace_root, f))
             .filter(|f| f.ends_with(".py") || crate::ast_graph::is_frontend_source_path(f))
             .collect();
         if !lint_changed.is_empty() {
-            Self::ensure_ruff_cached_locked(&mut guard, &lint_changed);
+            self.ensure_ruff_cached_unlocked(&lint_changed);
         }
+        let guard = self.lock_state();
         let ruff_diagnostics = Self::collect_ruff_diagnostics_locked(&guard, &lint_changed);
 
         let affected_modules = guard.graph.affected_modules(&changed_files);
@@ -1432,74 +1500,81 @@ impl ManagedRoot {
     }
 
     pub fn check_ruff(&self, files: &[String], fix: bool) -> Result<serde_json::Value> {
-        let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
-        guard.last_activity = Instant::now();
-        self.drain_fs_events_locked(&mut guard);
-        Self::ingest_explicit_paths_locked(&mut guard, files);
-        Self::maybe_safety_reconcile_locked(&mut guard);
+        let (workspace_root, spec_snapshot, target_py_files) = {
+            let mut guard = self.lock_state();
+            guard.last_activity = Instant::now();
+            self.drain_fs_events_locked(&mut guard);
+            Self::ingest_explicit_paths_locked(&mut guard, files);
+            Self::maybe_safety_reconcile_locked(&mut guard);
+            let root_path = guard.workspace.root.clone();
+            let norm_files = normalize_targets_for_root(&root_path, files);
 
-        let target_py_files: Vec<String> = if !files.is_empty() {
-            let mut set = BTreeSet::new();
-            for raw in files {
-                let norm = raw
-                    .split("::")
-                    .next()
-                    .unwrap_or(raw)
-                    .trim()
-                    .trim_start_matches("./")
-                    .trim_end_matches('/')
-                    .replace('\\', "/");
-                if norm.ends_with(".py")
-                    || norm.ends_with(".rs")
-                    || crate::ast_graph::is_frontend_source_path(&norm)
-                {
-                    set.insert(norm);
-                } else {
-                    let prefix = if norm.is_empty() || norm == "." {
-                        String::new()
+            let target_py_files: Vec<String> = if !norm_files.is_empty() {
+                let mut set = BTreeSet::new();
+                for raw in &norm_files {
+                    let norm = raw
+                        .split("::")
+                        .next()
+                        .unwrap_or(raw)
+                        .trim()
+                        .trim_start_matches("./")
+                        .trim_end_matches('/')
+                        .replace('\\', "/");
+                    if norm.ends_with(".py")
+                        || norm.ends_with(".rs")
+                        || crate::ast_graph::is_frontend_source_path(&norm)
+                    {
+                        set.insert(norm);
                     } else {
-                        format!("{norm}/")
-                    };
-                    for k in guard.graph.files.keys() {
-                        if (k.ends_with(".py")
-                            || k.ends_with(".rs")
-                            || crate::ast_graph::is_frontend_source_path(k))
-                            && (prefix.is_empty() || k.starts_with(&prefix))
-                        {
-                            set.insert(k.clone());
+                        let prefix = if norm.is_empty() || norm == "." {
+                            String::new()
+                        } else {
+                            format!("{norm}/")
+                        };
+                        for k in guard.graph.files.keys() {
+                            if (k.ends_with(".py")
+                                || k.ends_with(".rs")
+                                || crate::ast_graph::is_frontend_source_path(k))
+                                && (prefix.is_empty() || k.starts_with(&prefix))
+                            {
+                                set.insert(k.clone());
+                            }
                         }
                     }
                 }
-            }
-            set.into_iter().collect()
-        } else {
-            let dirty: Vec<String> = git_dirty_files(&guard.workspace.root)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|f| f.trim().trim_start_matches("./").replace('\\', "/"))
-                .filter(|f| {
-                    (f.ends_with(".py") || crate::ast_graph::is_frontend_source_path(f))
-                        && guard.graph.files.contains_key(f)
-                })
-                .collect();
-            if !dirty.is_empty() {
-                dirty
+                set.into_iter().collect()
             } else {
-                guard
-                    .graph
-                    .files
-                    .keys()
-                    .filter(|k| k.ends_with(".py"))
-                    .cloned()
-                    .collect()
-            }
+                let dirty: Vec<String> = git_dirty_files(&root_path)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|f| f.trim().trim_start_matches("./").replace('\\', "/"))
+                    .filter(|f| {
+                        (f.ends_with(".py") || crate::ast_graph::is_frontend_source_path(f))
+                            && guard.graph.files.contains_key(f)
+                    })
+                    .collect();
+                if !dirty.is_empty() {
+                    dirty
+                } else {
+                    guard
+                        .graph
+                        .files
+                        .keys()
+                        .filter(|k| k.ends_with(".py"))
+                        .cloned()
+                        .collect()
+                }
+            };
+            (root_path, guard.spec.clone(), target_py_files)
         };
 
         if fix && !target_py_files.is_empty() {
-            let _ = execute_ruff_check(&guard.spec, &target_py_files, true);
+            let _ = execute_ruff_check(&spec_snapshot, &target_py_files, true);
+            let mut guard = self.lock_state();
             Self::reconcile_live_files_locked(&mut guard, None);
         }
-        Self::ensure_ruff_cached_locked(&mut guard, &target_py_files);
+        self.ensure_ruff_cached_unlocked(&target_py_files);
+        let guard = self.lock_state();
         let diagnostics = Self::collect_ruff_diagnostics_locked(&guard, &target_py_files);
         let status = if diagnostics.is_empty() {
             "passed"
@@ -1507,7 +1582,7 @@ impl ManagedRoot {
             "failed"
         };
         Ok(serde_json::json!({
-            "root": guard.workspace.root,
+            "root": workspace_root,
             "status": status,
             "fixed": fix,
             "checked_files_count": target_py_files.len(),
@@ -1517,7 +1592,7 @@ impl ManagedRoot {
     }
 
     pub fn explain_failures(&self) -> Result<serde_json::Value> {
-        let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+        let mut guard = self.lock_state();
         guard.last_activity = Instant::now();
         self.drain_fs_events_locked(&mut guard);
         let dirty = git_dirty_files(&guard.workspace.root).unwrap_or_default();
@@ -1551,12 +1626,12 @@ impl ManagedRoot {
     }
 
     pub fn export_cache_bundle(&self) -> Result<serde_json::Value> {
-        let guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+        let guard = self.lock_state();
         Ok(guard.cache.export_bundle())
     }
 
     pub fn import_cache_bundle(&self, bundle: &serde_json::Value) -> Result<serde_json::Value> {
-        let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+        let mut guard = self.lock_state();
         let policy = guard.spec.policy.clone();
         let imported = guard.cache.import_bundle(bundle, &policy);
         let _ = guard.cache.save();
@@ -1566,29 +1641,34 @@ impl ManagedRoot {
         }))
     }
 
-    fn ensure_ruff_cached_locked(guard: &mut RootState, py_files: &[String]) {
-        let mut uncached = Vec::new();
-        let mut expected_shas = BTreeMap::new();
-        for f in py_files {
-            if !f.ends_with(".py")
-                && !f.ends_with(".rs")
-                && !crate::ast_graph::is_frontend_source_path(f)
-            {
-                continue;
+    fn ensure_ruff_cached_unlocked(&self, py_files: &[String]) {
+        let (spec, uncached, expected_shas) = {
+            let guard = self.lock_state();
+            let mut uncached = Vec::new();
+            let mut expected_shas = BTreeMap::new();
+            for f in py_files {
+                if !f.ends_with(".py")
+                    && !f.ends_with(".rs")
+                    && !crate::ast_graph::is_frontend_source_path(f)
+                {
+                    continue;
+                }
+                let Some(node) = guard.graph.files.get(f) else {
+                    continue;
+                };
+                let key = flight_key(f, &node.sha256);
+                if !guard.ruff_cache.contains_key(&key) {
+                    uncached.push(f.clone());
+                    expected_shas.insert(f.clone(), node.sha256.clone());
+                }
             }
-            let Some(node) = guard.graph.files.get(f) else {
-                continue;
-            };
-            let key = flight_key(f, &node.sha256);
-            if !guard.ruff_cache.contains_key(&key) {
-                uncached.push(f.clone());
-                expected_shas.insert(f.clone(), node.sha256.clone());
-            }
-        }
+            (guard.spec.clone(), uncached, expected_shas)
+        };
         if uncached.is_empty() {
             return;
         }
-        let by_file = execute_ruff_check(&guard.spec, &uncached, false);
+        let by_file = execute_ruff_check(&spec, &uncached, false);
+        let mut guard = self.lock_state();
         for (file, sha) in expected_shas {
             let diags = by_file.get(&file).cloned().unwrap_or_default();
             guard.ruff_cache.insert(flight_key(&file, &sha), diags);
@@ -1660,15 +1740,16 @@ impl ManagedRoot {
         let target_test_files: Vec<String>;
         let ruff_diagnostics: Vec<RuffDiagnostic>;
 
+        let norm_targets: Vec<String>;
         {
-            let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+            let mut guard = self.lock_state();
             guard.last_activity = Instant::now();
             self.drain_fs_events_locked(&mut guard);
-            Self::ingest_explicit_paths_locked(&mut guard, &req.targets);
+            norm_targets = normalize_targets_for_root(&guard.workspace.root, &req.targets);
+            Self::ingest_explicit_paths_locked(&mut guard, &norm_targets);
 
             if req.ruff_fix {
-                let mut fix_py: Vec<String> = req
-                    .targets
+                let mut fix_py: Vec<String> = norm_targets
                     .iter()
                     .map(|t| {
                         t.split("::")
@@ -1690,20 +1771,46 @@ impl ManagedRoot {
                         .collect();
                 }
                 if !fix_py.is_empty() {
-                    let _ = execute_ruff_check(&guard.spec, &fix_py, true);
+                    let spec_for_fix = guard.spec.clone();
+                    drop(guard);
+                    let _ = execute_ruff_check(&spec_for_fix, &fix_py, true);
+                    guard = self.lock_state();
                     for f in &fix_py {
                         guard.ruff_cache.remove(f);
                     }
                 }
             }
 
-            // 1. Resolve target test files (and reconcile live files on disk)
+            // 1. Resolve target test files (and reconcile live files on disk).
+            // In large workspaces (> 64 test files), if `targets` is omitted and no `-k`/`-m` filter is set,
+            // automatically scope to tests affected by current git dirty files so an omitted `targets` argument
+            // in Copilot does not accidentally trigger a multi-thousand-file full suite run.
             Self::maybe_safety_reconcile_locked(&mut guard);
-            let initial_targets = guard.graph.resolve_target_test_files(&req.targets);
+            let effective_targets: Vec<String> = if norm_targets.is_empty()
+                && req.k.is_none()
+                && req.mark.is_none()
+                && guard.graph.dep_hash_for_test.len() > 64
+            {
+                let dirty = git_dirty_files(&guard.workspace.root).unwrap_or_default();
+                let affected: Vec<String> = guard
+                    .graph
+                    .affected_tests(&dirty)
+                    .into_iter()
+                    .map(|a| a.test_file)
+                    .collect();
+                if affected.is_empty() {
+                    norm_targets.clone()
+                } else {
+                    affected
+                }
+            } else {
+                norm_targets.clone()
+            };
+            let initial_targets = guard.graph.resolve_target_test_files(&effective_targets);
             let structure_changed =
                 Self::reconcile_live_files_locked(&mut guard, Some(&initial_targets));
             target_test_files = if structure_changed {
-                guard.graph.resolve_target_test_files(&req.targets)
+                guard.graph.resolve_target_test_files(&effective_targets)
             } else {
                 initial_targets
             };
@@ -1711,6 +1818,7 @@ impl ManagedRoot {
             environment_hash = guard.graph.environment_hash.clone();
             parallel_delta = guard.spec.policy.parallel_delta_enabled
                 && target_test_files.len() > 1
+                && !target_test_files.iter().any(|tf| tf.ends_with(".rs"))
                 && target_test_files.iter().all(|test_file| {
                     guard.graph.files.get(test_file).is_some_and(|node| {
                         node.parsed
@@ -1729,8 +1837,8 @@ impl ManagedRoot {
             });
 
             if target_test_files.is_empty() {
-                if !req.targets.is_empty() {
-                    let suggestions = guard.graph.suggest_closest_targets(&req.targets);
+                if !norm_targets.is_empty() {
+                    let suggestions = guard.graph.suggest_closest_targets(&norm_targets);
                     let hint = if suggestions.is_empty() {
                         String::new()
                     } else {
@@ -1738,7 +1846,7 @@ impl ManagedRoot {
                     };
                     return Err(invalid(format!(
                         "NO_TESTS_MATCHED targets={}; check pytest python_files/testpaths or cargo test targets configuration or target spelling{hint}",
-                        req.targets.join(",")
+                        norm_targets.join(",")
                     ))
                     .into());
                 }
@@ -1778,11 +1886,7 @@ impl ManagedRoot {
             while !requested_resources.is_disjoint(&guard.background_resources)
                 && Instant::now() < resource_deadline
             {
-                let (next_guard, _) = self
-                    .condvar
-                    .wait_timeout(guard, Duration::from_millis(50))
-                    .map_err(|_| invalid("mutex poisoned"))?;
-                guard = next_guard;
+                guard = self.wait_state_timeout(guard, Duration::from_millis(50));
             }
             if !requested_resources.is_disjoint(&guard.background_resources) {
                 return Err(invalid(format!(
@@ -1812,11 +1916,7 @@ impl ManagedRoot {
                         break;
                     }
                     joined_bg_count = joined_bg_count.saturating_add(1);
-                    let (next_guard, _) = self
-                        .condvar
-                        .wait_timeout(guard, Duration::from_millis(50))
-                        .map_err(|_| invalid("mutex poisoned"))?;
-                    guard = next_guard;
+                    guard = self.wait_state_timeout(guard, Duration::from_millis(50));
                 }
             }
 
@@ -1825,8 +1925,7 @@ impl ManagedRoot {
                 let Some(dep_hash) = guard.graph.dep_hash_for_test.get(tf).cloned() else {
                     continue;
                 };
-                let requested_nodeids: Vec<String> = req
-                    .targets
+                let requested_nodeids: Vec<String> = norm_targets
                     .iter()
                     .filter_map(|t| {
                         let (file_part, _) = t.split_once("::")?;
@@ -1959,7 +2058,7 @@ impl ManagedRoot {
             };
 
             let mut ruff_scope: BTreeSet<String> = BTreeSet::new();
-            for raw in &req.targets {
+            for raw in &norm_targets {
                 let norm = raw
                     .split("::")
                     .next()
@@ -1986,7 +2085,7 @@ impl ManagedRoot {
                 }
             }
             let ruff_scope_vec: Vec<String> = ruff_scope.into_iter().collect();
-            if req.ruff_fix || !guard.pending_ruff_files.is_empty() {
+            let to_check_unlocked: Vec<String> = if req.ruff_fix || !guard.pending_ruff_files.is_empty() {
                 let pending: Vec<String> = guard
                     .pending_ruff_files
                     .iter()
@@ -1996,15 +2095,19 @@ impl ManagedRoot {
                 for f in &pending {
                     guard.pending_ruff_files.remove(f);
                 }
-                let to_check = if req.ruff_fix {
-                    &ruff_scope_vec
+                if req.ruff_fix {
+                    ruff_scope_vec.clone()
                 } else {
-                    &pending
-                };
-                if !to_check.is_empty() {
-                    Self::ensure_ruff_cached_locked(&mut guard, to_check);
+                    pending
                 }
+            } else {
+                Vec::new()
+            };
+            drop(guard);
+            if !to_check_unlocked.is_empty() {
+                self.ensure_ruff_cached_unlocked(&to_check_unlocked);
             }
+            let guard = self.lock_state();
             ruff_diagnostics = Self::collect_ruff_diagnostics_locked(&guard, &ruff_scope_vec);
         }
 
@@ -2013,8 +2116,8 @@ impl ManagedRoot {
         let mut delta_stdout = String::new();
         if !to_execute.is_empty() {
             // If user passed explicit nodeids (`tests/test_a.py::test_x`) for files in `to_execute`, pass those nodeids
-            let invocation_targets: Vec<String> = if req.targets.iter().any(|t| t.contains("::")) {
-                req.targets
+            let invocation_targets: Vec<String> = if norm_targets.iter().any(|t| t.contains("::")) {
+                norm_targets
                     .iter()
                     .filter(|t| {
                         let f = t.split("::").next().unwrap_or(t).trim_start_matches("./");
@@ -2060,16 +2163,26 @@ impl ManagedRoot {
                 )
             };
             if self.cancel_requested.swap(false, Ordering::AcqRel) {
-                let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+                let mut guard = self.lock_state();
                 for (test_file, dep_hash) in &dep_hashes_for_exec {
                     guard.in_flight.remove(&flight_key(test_file, dep_hash));
                 }
                 self.condvar.notify_all();
                 return Err(invalid("TEST_CANCELLED: pytest process group was terminated").into());
             }
-            let (mut records, raw_out) = exec_res?;
+            let (mut records, raw_out) = match exec_res {
+                Ok(pair) => pair,
+                Err(err) => {
+                    let mut guard = self.lock_state();
+                    for (tf, dh) in &dep_hashes_for_exec {
+                        guard.in_flight.remove(&flight_key(tf, dh));
+                    }
+                    self.condvar.notify_all();
+                    return Err(err);
+                }
+            };
 
-            let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+            let mut guard = self.lock_state();
             for (tf, dh) in &dep_hashes_for_exec {
                 guard.in_flight.remove(&flight_key(tf, dh));
             }
@@ -2176,7 +2289,7 @@ impl ManagedRoot {
             "passed".to_string()
         };
         if status == "passed" && learn_invocation {
-            let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+            let mut guard = self.lock_state();
             guard.cache.record_invocation(&target_test_files);
         }
         let mode = if executed_summaries.is_empty() {
@@ -2218,8 +2331,13 @@ impl ManagedRoot {
                 output_parts.push(cached_out.trim().to_string());
             }
         }
-        if !delta_stdout.trim().is_empty() {
-            output_parts.push(delta_stdout.trim().to_string());
+        let effective_delta_stdout = if status == "passed" && skipped == 0 {
+            compact_passed_delta_stdout(&delta_stdout)
+        } else {
+            delta_stdout.trim().to_string()
+        };
+        if !effective_delta_stdout.is_empty() {
+            output_parts.push(effective_delta_stdout);
         }
         if skipped > 0 {
             output_parts.push(format!(
@@ -2238,7 +2356,7 @@ impl ManagedRoot {
         let mut structured_failures = Vec::new();
         let mut suspected_culprit_files = BTreeSet::new();
         let mut untested_modified_files = Vec::new();
-        let mut flaky_tests = Vec::new();
+        let flaky_tests: Vec<String>;
         let missing_prerequisites = if skipped > 0 {
             extract_missing_prerequisites(&stdout_summary)
         } else {
@@ -2246,7 +2364,8 @@ impl ManagedRoot {
         };
         let warnings_summary = extract_warnings_summary(&stdout_summary);
 
-        if let Ok(guard) = self.state.lock() {
+        {
+            let guard = self.lock_state();
             flaky_tests = guard.cache.flaky_test_files();
             if status == "failed" {
                 let dirty = git_dirty_files(&guard.workspace.root).unwrap_or_default();
@@ -2397,6 +2516,7 @@ fn execute_clippy_check(
     command.current_dir(&spec.root);
     command.args(base_args);
     command.arg("clippy");
+    command.arg("--no-deps");
     if fix {
         command.arg("--fix");
         command.arg("--allow-dirty");
@@ -2904,15 +3024,19 @@ fn python_runtime_identity(spec: &Spec) -> (String, Vec<String>) {
         )
     };
     let python = crate::zygote::resolve_python_bin(&spec.effective_pytest_cmd());
+    let bin_mtime = file_stamp(&python);
     let cache_key = format!(
-        "{}\0{}",
+        "{}\0{:?}\0{}",
         python.to_string_lossy(),
+        bin_mtime,
         spec.effective_pytest_cmd().join("\0")
     );
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Ok(guard) = cache.lock()
-        && let Some(cached) = guard.get(&cache_key)
-        && cached.captured.elapsed() < Duration::from_secs(60)
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&cache_key)
+        && cached.captured.elapsed() < Duration::from_secs(600)
     {
         return (cached.identity.clone(), cached.plugins.clone());
     }
@@ -2957,8 +3081,10 @@ print(json.dumps({'identity':[sys.version,sys.executable,platform.platform(),pyt
         .collect();
     plugins.sort();
     plugins.dedup();
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
             cache_key,
             CachedPythonRuntime {
                 captured: Instant::now(),
@@ -2966,7 +3092,6 @@ print(json.dumps({'identity':[sys.version,sys.executable,platform.platform(),pyt
                 plugins: plugins.clone(),
             },
         );
-    }
     (identity, plugins)
 }
 
@@ -2982,8 +3107,9 @@ fn git_dirty_files(root: &Path) -> Result<Vec<String>> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut files = Vec::new();
     for line in text.lines() {
-        if line.len() > 3 {
-            let path_part = line[3..].trim();
+        if let Some(path_part) = line.get(3..).map(str::trim)
+            && !path_part.is_empty()
+        {
             let actual = path_part.split(" -> ").last().unwrap_or(path_part);
             files.push(actual.to_string());
         }
@@ -3833,8 +3959,109 @@ fn execute_cargo_test_batch(
         }
     }
 
+    // When a crate has multiple cargo test invocations (e.g. `--lib` unit tests plus one or more
+    // `--test <name>` integration tests), pre-compile all targeted artifacts in a single multi-core
+    // `cargo test --no-run` pass so Cargo's jobserver builds and links them concurrently once.
+    let mut files_by_crate: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for test_file in dep_hashes.keys() {
+        files_by_crate
+            .entry(crate::ast_graph::rust_crate_dir(test_file))
+            .or_default()
+            .push(test_file.clone());
+    }
+    let mut precompiled_failed_crates: BTreeMap<String, (String, u64)> = BTreeMap::new();
+    for (crate_dir, crate_files) in &files_by_crate {
+        let lib_count = lib_groups.get(crate_dir).map_or(0, Vec::len);
+        let indiv_count = crate_files.len().saturating_sub(if lib_count > 1 { lib_count } else { 0 });
+        let total_invocations = usize::from(lib_count > 1) + indiv_count;
+        if total_invocations < 2 {
+            continue;
+        }
+        let workdir = if crate_dir.is_empty() {
+            spec.root.clone()
+        } else {
+            spec.root.join(crate_dir)
+        };
+        let mut need_lib = lib_count > 0;
+        let mut need_bins = false;
+        let mut specific_bins = BTreeSet::new();
+        let mut specific_tests = BTreeSet::new();
+        for tf in crate_files {
+            if crate::ast_graph::is_rust_integration_test_path(tf) {
+                if let Some(stem) = Path::new(tf).file_stem().and_then(|s| s.to_str()) {
+                    specific_tests.insert(stem.to_string());
+                }
+            } else if tf.ends_with("src/main.rs") || tf == "src/main.rs" {
+                need_bins = true;
+            } else if let Some((_, bin_rel)) = tf.rsplit_once("src/bin/")
+                && let Some(stem) = Path::new(bin_rel).file_stem().and_then(|s| s.to_str())
+            {
+                specific_bins.insert(stem.to_string());
+            } else if workdir.join("src/lib.rs").is_file() {
+                need_lib = true;
+            } else {
+                need_bins = true;
+            }
+        }
+        let mut command = Command::new(program);
+        command.current_dir(&workdir);
+        command.args(base_args);
+        command.arg("test").arg("--no-run");
+        if need_lib {
+            command.arg("--lib");
+        }
+        if need_bins {
+            command.arg("--bins");
+        }
+        for bin_name in &specific_bins {
+            command.arg("--bin").arg(bin_name);
+        }
+        for test_name in &specific_tests {
+            command.arg("--test").arg(test_name);
+        }
+        for arg in extra_args {
+            if arg == "--" {
+                break;
+            }
+            command.arg(arg);
+        }
+        let output = run_command_with_timeout_tracked(
+            &mut command,
+            timeout,
+            2 * 1024 * 1024,
+            active_pgid,
+            active_pgids,
+        )?;
+        if output.timed_out {
+            return Err(invalid(format!(
+                "cargo test compilation timed out after {}s",
+                spec.policy.pytest_timeout_secs
+            ))
+            .into());
+        }
+        if output.cancelled {
+            return Err(
+                invalid("TEST_CANCELLED: cargo test child process group was terminated").into(),
+            );
+        }
+        if !output.status.success() {
+            let stdout_str = String::from_utf8_lossy(&output.stdout);
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            let combined_out = match (stdout_str.trim().is_empty(), stderr_str.trim().is_empty()) {
+                (true, _) => stderr_str.to_string(),
+                (_, true) => stdout_str.to_string(),
+                (false, false) => format!("{}\n{}", stdout_str.trim(), stderr_str.trim()),
+            };
+            precompiled_failed_crates.insert(crate_dir.clone(), (combined_out, output.duration_ms));
+        }
+    }
+
     for (crate_dir, group_files) in lib_groups {
         if group_files.len() <= 1 {
+            individual_files.extend(group_files);
+            continue;
+        }
+        if precompiled_failed_crates.contains_key(&crate_dir) {
             individual_files.extend(group_files);
             continue;
         }
@@ -3856,8 +4083,23 @@ fn execute_cargo_test_batch(
         for arg in extra_args {
             command.arg(arg);
         }
+        let mut harness_args = Vec::new();
         if mark_expr.is_some_and(|m| m == "ignore" || m == "ignored") {
-            command.arg("--").arg("--ignored");
+            harness_args.push("--ignored".to_string());
+        }
+        if k_expr.is_none_or(|k| k.trim().is_empty())
+            && !extra_args.iter().any(|a| a == "--")
+            && let Some(module_filters) = group_files
+                .iter()
+                .map(|tf| rust_module_filter_for_file(tf))
+                .collect::<Option<Vec<String>>>()
+            && !module_filters.is_empty()
+        {
+            harness_args.extend(module_filters);
+        }
+        if !harness_args.is_empty() {
+            command.arg("--");
+            command.args(&harness_args);
         }
         let output = run_command_with_timeout_tracked(
             &mut command,
@@ -3954,6 +4196,41 @@ fn execute_cargo_test_batch(
         };
         let run_started_unix_ms = now_unix_ms();
         let crate_dir = crate::ast_graph::rust_crate_dir(test_file);
+        if let Some((combined_out, dur_ms)) = precompiled_failed_crates.get(&crate_dir) {
+            let snippet = truncate_str(combined_out, 8192);
+            if !all_outputs.contains(&snippet) && !snippet.trim().is_empty() {
+                all_outputs.push(snippet.clone());
+            }
+            let stats = parse_cargo_test_output(combined_out, test_file, *dur_ms, false);
+            let now = now_unix_ms();
+            records.push(CachedTestRecord {
+                test_file: test_file.clone(),
+                dep_hash: dep_hash.clone(),
+                outcome: if stats.errors > 0 {
+                    TestOutcome::Error
+                } else {
+                    TestOutcome::Failed
+                },
+                passed: stats.passed,
+                failed: stats.failed,
+                skipped: stats.skipped,
+                errors: stats.errors,
+                duration_ms: stats.duration_ms.max(1),
+                failed_nodeids: stats.failed_nodeids,
+                output_snippet: snippet,
+                updated_unix_ms: now,
+                source: source_label.to_string(),
+                environment_hash: environment_hash.to_string(),
+                tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+                runner_mode: "cargo_test".to_string(),
+                started_unix_ms: run_started_unix_ms,
+                completed_unix_ms: now,
+                dynamic_dependencies: Vec::new(),
+                dynamic_dependencies_complete: true,
+                node_results: stats.node_results,
+            });
+            continue;
+        }
         let workdir = if crate_dir.is_empty() {
             spec.root.clone()
         } else {
@@ -5214,6 +5491,64 @@ pub fn extract_missing_prerequisites(output: &str) -> Vec<String> {
     prereqs.into_iter().take(8).collect()
 }
 
+pub fn normalize_target_for_root(root: &Path, raw: &str) -> String {
+    let trimmed = raw.trim();
+    let (file_part, node_part) = match trimmed.split_once("::") {
+        Some((f, n)) => (f.trim(), Some(n.trim())),
+        None => (trimmed, None),
+    };
+    let norm_slashes = file_part.replace('\\', "/");
+    let root_str = root.to_string_lossy().replace('\\', "/");
+    let root_trimmed = root_str.trim_end_matches('/');
+    let root_prefix = format!("{root_trimmed}/");
+    let rel_file = if norm_slashes == root_trimmed {
+        ".".to_string()
+    } else if let Some(stripped) = norm_slashes.strip_prefix(&root_prefix) {
+        stripped.trim_start_matches("./").to_string()
+    } else {
+        norm_slashes.trim_start_matches("./").to_string()
+    };
+    match node_part {
+        Some(node) if !node.is_empty() => format!("{rel_file}::{node}"),
+        _ => rel_file,
+    }
+}
+
+pub fn normalize_targets_for_root(root: &Path, raw_targets: &[String]) -> Vec<String> {
+    raw_targets
+        .iter()
+        .map(|raw| normalize_target_for_root(root, raw))
+        .collect()
+}
+
+pub fn compact_passed_delta_stdout(raw: &str) -> String {
+    let mut kept = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if (trimmed.starts_with("test ") && trimmed.ends_with(" ... ok"))
+            || (trimmed.starts_with("running ") && trimmed.ends_with(" tests"))
+            || trimmed == "running 1 test"
+            || trimmed.starts_with("test result: ok.")
+            || trimmed.starts_with("Compiling ")
+            || trimmed.starts_with("Finished `")
+            || trimmed.starts_with("Running unittests ")
+            || trimmed.starts_with("Running tests/")
+            || trimmed.starts_with("Doc-tests ")
+            || (trimmed.starts_with("=== ")
+                && trimmed.ends_with(" ===")
+                && trimmed.contains(" passed"))
+            || trimmed.chars().all(|c| c == '.' || c == ' ')
+        {
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
 pub fn extract_warnings_summary(output: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     for line in output.lines() {
@@ -6147,5 +6482,38 @@ ok 3 - skipped browser check # SKIP no display
         let sarif = format_sarif_report(&dummy_resp);
         assert_eq!(sarif["version"].as_str(), Some("2.1.0"));
         assert_eq!(sarif["runs"][0]["results"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn normalizes_workspace_absolute_targets_and_compacts_passed_boilerplate() {
+        let root = Path::new("/home/user/dev/test-context");
+        assert_eq!(
+            normalize_target_for_root(root, "/home/user/dev/test-context/src/daemon.rs"),
+            "src/daemon.rs"
+        );
+        assert_eq!(
+            normalize_target_for_root(
+                root,
+                "/home/user/dev/test-context/src/daemon.rs::daemon_hub_recovers"
+            ),
+            "src/daemon.rs::daemon_hub_recovers"
+        );
+        assert_eq!(
+            normalize_target_for_root(root, "./src/ast_graph.rs"),
+            "src/ast_graph.rs"
+        );
+
+        let verbose_pass = concat!(
+            "running 3 tests\n",
+            "test a::test_one ... ok\n",
+            "test a::test_two ... ok\n",
+            "warning: DeprecationWarning: legacy call\n",
+            "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s\n",
+            "Compiling sample v0.1.0 (/repo)\n",
+            "    Finished `test` profile [unoptimized] target(s) in 0.42s\n",
+            "     Running unittests src/lib.rs (target/debug/deps/sample-123)\n",
+        );
+        let compacted = compact_passed_delta_stdout(verbose_pass);
+        assert_eq!(compacted, "warning: DeprecationWarning: legacy call");
     }
 }

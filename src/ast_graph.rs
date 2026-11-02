@@ -120,6 +120,7 @@ pub struct DependencyGraph {
     pub reverse_imports: BTreeMap<String, BTreeSet<String>>,
     pub conftest_for_test: BTreeMap<String, Vec<String>>,
     pub file_index_to_path: Vec<String>,
+    pub path_to_id: BTreeMap<String, u32>,
     pub transitive_dep_ids_for_test: BTreeMap<String, Vec<u32>>,
     pub dep_hash_for_test: BTreeMap<String, String>,
     pub config_hashes: BTreeMap<String, String>,
@@ -144,6 +145,7 @@ impl DependencyGraph {
             reverse_imports: BTreeMap::new(),
             conftest_for_test: BTreeMap::new(),
             file_index_to_path: Vec::new(),
+            path_to_id: BTreeMap::new(),
             transitive_dep_ids_for_test: BTreeMap::new(),
             dep_hash_for_test: BTreeMap::new(),
             config_hashes: BTreeMap::new(),
@@ -197,8 +199,38 @@ impl DependencyGraph {
             return;
         }
         self.environment_hash = environment_hash;
-        let all_files: Vec<String> = self.files.keys().cloned().collect();
-        self.recompute_hashes_for_changed(&all_files);
+        if self.file_index_to_path.len() != self.files.len() {
+            self.recompute_edges();
+        } else {
+            self.recompute_all_test_hashes();
+        }
+    }
+
+    fn build_all_node_hash_bytes(&self) -> Vec<Vec<u8>> {
+        self.file_index_to_path
+            .iter()
+            .map(|dep_path| {
+                self.files
+                    .get(dep_path)
+                    .map(|dep_node| build_node_hash_bytes(dep_path, dep_node))
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    fn recompute_all_test_hashes(&mut self) {
+        let base_hasher = self.build_base_hasher();
+        let node_digests = self.build_all_node_hash_bytes();
+        for (test_path, reachable_ids) in &self.transitive_dep_ids_for_test {
+            let mut hasher = base_hasher.clone();
+            for &dep_id in reachable_ids {
+                if let Some(bytes) = node_digests.get(dep_id as usize) {
+                    hasher.update(bytes);
+                }
+            }
+            let dep_hash = hex_encode(&hasher.finalize());
+            self.dep_hash_for_test.insert(test_path.clone(), dep_hash);
+        }
     }
 
     pub fn apply_runtime_dependencies(
@@ -247,27 +279,94 @@ impl DependencyGraph {
     }
 
     pub fn build(workspace: &Workspace, policy: &MemoryPolicy) -> Result<Self> {
+        let mut graph = Self::build_unindexed(workspace, policy)?;
+        graph.recompute_edges();
+        Ok(graph)
+    }
+
+    pub fn build_unindexed(workspace: &Workspace, policy: &MemoryPolicy) -> Result<Self> {
         let inventory = workspace.files_limited(policy)?;
         let mut graph = Self::new();
         graph.test_file_patterns = workspace.pytest_file_patterns();
         graph.testpaths = workspace.pytest_testpaths();
         let mut total_bytes = 0usize;
-        for rel_path in &inventory.files {
-            let full_path = workspace.root.join(rel_path);
-            let stamp = file_stamp(&full_path);
-            let bytes = match workspace.read_known_with_limit(rel_path, policy.max_file_bytes) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            total_bytes = total_bytes.saturating_add(bytes.len());
-            if total_bytes > policy.max_source_bytes {
-                return Err(invalid("workspace exceeds max_source_bytes policy limit").into());
+
+        if inventory.files.len() >= 64 {
+            let workers = std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+                .clamp(2, 8);
+            let chunk_size = inventory.files.len().div_ceil(workers);
+            let patterns = &graph.test_file_patterns;
+            let testpaths = &graph.testpaths;
+            let max_file_bytes = policy.max_file_bytes;
+            let chunk_results: Vec<Vec<(FileNode, usize)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = inventory
+                    .files
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for rel_path in chunk {
+                                let full_path = workspace.root.join(rel_path);
+                                let stamp = file_stamp(&full_path);
+                                let Ok(bytes) =
+                                    workspace.read_known_with_limit(rel_path, max_file_bytes)
+                                else {
+                                    continue;
+                                };
+                                let rel_str = normalize_rel_str(rel_path);
+                                let node = build_file_node_from_bytes(
+                                    &rel_str,
+                                    &bytes,
+                                    stamp,
+                                    patterns,
+                                    testpaths,
+                                );
+                                out.push((node, bytes.len()));
+                            }
+                            out
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok())
+                    .collect()
+            });
+            for chunk in chunk_results {
+                for (node, byte_len) in chunk {
+                    total_bytes = total_bytes.saturating_add(byte_len);
+                    if total_bytes > policy.max_source_bytes {
+                        return Err(
+                            invalid("workspace exceeds max_source_bytes policy limit").into()
+                        );
+                    }
+                    if node.is_config {
+                        graph
+                            .config_hashes
+                            .insert(node.path.clone(), node.sha256.clone());
+                    }
+                    graph.files.insert(node.path.clone(), node);
+                }
             }
-            let rel_str = normalize_rel_str(rel_path);
-            graph.insert_file_bytes_with_stamp(&rel_str, &bytes, stamp);
+        } else {
+            for rel_path in &inventory.files {
+                let full_path = workspace.root.join(rel_path);
+                let stamp = file_stamp(&full_path);
+                let bytes = match workspace.read_known_with_limit(rel_path, policy.max_file_bytes) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                total_bytes = total_bytes.saturating_add(bytes.len());
+                if total_bytes > policy.max_source_bytes {
+                    return Err(invalid("workspace exceeds max_source_bytes policy limit").into());
+                }
+                let rel_str = normalize_rel_str(rel_path);
+                graph.insert_file_bytes_with_stamp(&rel_str, &bytes, stamp);
+            }
         }
         graph.discover_referenced_data_files(workspace, policy);
-        graph.recompute_edges();
         Ok(graph)
     }
 
@@ -325,222 +424,33 @@ impl DependencyGraph {
         bytes: &[u8],
         stamp: Option<FileStamp>,
     ) -> bool {
-        let sha = sha256_hex(bytes);
-        let semantic_sha = semantic_sha256_for_source(rel_str, bytes);
-        let file_name = Path::new(rel_str)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        if PYTEST_CONFIG_FILES.contains(&file_name)
-            || RUST_CONFIG_FILES.contains(&file_name)
-            || FRONTEND_CONFIG_FILES.contains(&file_name)
-            || POLYGLOT_CONFIG_FILES.contains(&file_name)
-            || file_name.ends_with(".csproj")
-        {
+        let node = build_file_node_from_bytes(
+            rel_str,
+            bytes,
+            stamp,
+            &self.test_file_patterns,
+            &self.testpaths,
+        );
+        if node.is_config {
             let is_new = !self.config_hashes.contains_key(rel_str);
-            self.config_hashes.insert(rel_str.to_string(), sha.clone());
-            let parsed = if matches!(
-                file_name,
-                "Cargo.toml"
-                    | "pyproject.toml"
-                    | "package.json"
-                    | "tsconfig.json"
-                    | "tsconfig.app.json"
-                    | "tsconfig.node.json"
-                    | "jsconfig.json"
-                    | "go.mod"
-            ) || file_name.starts_with("vite.config.")
-                || file_name.starts_with("vitest.config.")
-                || file_name.starts_with("vitest.workspace.")
-            {
-                parse_manifest_metadata(&String::from_utf8_lossy(bytes), file_name)
-            } else {
-                ParsedPythonFile::default()
-            };
+            self.config_hashes
+                .insert(rel_str.to_string(), node.sha256.clone());
             let structure_changed = match self.files.get(rel_str) {
-                Some(existing) => existing.parsed != parsed,
+                Some(existing) => existing.parsed != node.parsed,
                 None => true,
             };
-            self.files.insert(
-                rel_str.to_string(),
-                FileNode {
-                    path: rel_str.to_string(),
-                    sha256: sha.clone(),
-                    semantic_sha256: sha,
-                    stamp,
-                    is_test: false,
-                    is_conftest: false,
-                    is_config: true,
-                    parsed,
-                },
-            );
+            self.files.insert(rel_str.to_string(), node);
             return is_new || structure_changed;
         }
-        if file_name.ends_with(".rs") {
-            let source = String::from_utf8_lossy(bytes);
-            let parsed = parse_rust_source(&source);
-            let is_conftest = is_rust_common_test_helper(rel_str);
-            let is_test = !is_conftest
-                && (!parsed.test_symbols.is_empty() || is_rust_integration_test_path(rel_str));
-            let structure_changed = match self.files.get(rel_str) {
-                Some(existing) => {
-                    existing.is_test != is_test
-                        || existing.is_conftest != is_conftest
-                        || existing.parsed != parsed
-                }
-                None => true,
-            };
-            self.files.insert(
-                rel_str.to_string(),
-                FileNode {
-                    path: rel_str.to_string(),
-                    sha256: sha,
-                    semantic_sha256: semantic_sha,
-                    stamp,
-                    is_test,
-                    is_conftest,
-                    is_config: false,
-                    parsed,
-                },
-            );
-            return structure_changed;
-        }
-        if is_frontend_source_path(rel_str) {
-            let source = String::from_utf8_lossy(bytes);
-            let mut parsed = parse_frontend_source(&source);
-            if is_playwright_e2e_path(rel_str) {
-                if !parsed.markers.iter().any(|m| m == "playwright") {
-                    parsed.markers.push("playwright".to_string());
-                }
-                if !parsed.module_markers.iter().any(|m| m == "e2e") {
-                    parsed.module_markers.push("e2e".to_string());
-                }
-            } else if is_cypress_test_path(rel_str) {
-                if !parsed.markers.iter().any(|m| m == "cypress") {
-                    parsed.markers.push("cypress".to_string());
-                }
-                if !parsed.module_markers.iter().any(|m| m == "e2e") {
-                    parsed.module_markers.push("e2e".to_string());
-                }
-            }
-            let is_conftest = is_frontend_setup_file(rel_str);
-            let is_test = !is_conftest
-                && (is_frontend_test_path(rel_str)
-                    || parsed.markers.iter().any(|m| m == "in_source_vitest")
-                    || (is_storybook_story_path(rel_str)
-                        && parsed.markers.iter().any(|m| m == "storybook_play")));
-            let structure_changed = match self.files.get(rel_str) {
-                Some(existing) => {
-                    existing.is_test != is_test
-                        || existing.is_conftest != is_conftest
-                        || existing.parsed != parsed
-                }
-                None => true,
-            };
-            self.files.insert(
-                rel_str.to_string(),
-                FileNode {
-                    path: rel_str.to_string(),
-                    sha256: sha,
-                    semantic_sha256: semantic_sha,
-                    stamp,
-                    is_test,
-                    is_conftest,
-                    is_config: false,
-                    parsed,
-                },
-            );
-            return structure_changed;
-        }
-        if is_stylesheet_path(rel_str) {
-            let source = String::from_utf8_lossy(bytes);
-            let parsed = parse_css_source(&source);
-            let structure_changed = match self.files.get(rel_str) {
-                Some(existing) => existing.parsed != parsed,
-                None => true,
-            };
-            self.files.insert(
-                rel_str.to_string(),
-                FileNode {
-                    path: rel_str.to_string(),
-                    sha256: sha,
-                    semantic_sha256: semantic_sha,
-                    stamp,
-                    is_test: false,
-                    is_conftest: false,
-                    is_config: false,
-                    parsed,
-                },
-            );
-            return structure_changed;
-        }
-        if is_polyglot_source_path(rel_str) {
-            let source = String::from_utf8_lossy(bytes);
-            let parsed = parse_polyglot_source(rel_str, &source);
-            let is_test = is_polyglot_test_path(rel_str, &parsed);
-            let structure_changed = match self.files.get(rel_str) {
-                Some(existing) => existing.is_test != is_test || existing.parsed != parsed,
-                None => true,
-            };
-            self.files.insert(
-                rel_str.to_string(),
-                FileNode {
-                    path: rel_str.to_string(),
-                    sha256: sha,
-                    semantic_sha256: semantic_sha,
-                    stamp,
-                    is_test,
-                    is_conftest: false,
-                    is_config: false,
-                    parsed,
-                },
-            );
-            return structure_changed;
-        }
-        if !file_name.ends_with(".py") {
-            let is_new = !self.files.contains_key(rel_str);
-            self.files.insert(
-                rel_str.to_string(),
-                FileNode {
-                    path: rel_str.to_string(),
-                    sha256: sha.clone(),
-                    semantic_sha256: sha,
-                    stamp,
-                    is_test: false,
-                    is_conftest: false,
-                    is_config: false,
-                    parsed: ParsedPythonFile::default(),
-                },
-            );
-            return is_new;
-        }
-        let source = String::from_utf8_lossy(bytes);
-        let parsed = parse_python_source(&source);
-        let is_conftest = file_name == "conftest.py";
-        let is_test = !is_conftest
-            && matches_test_filename(file_name, &self.test_file_patterns)
-            && matches_test_path(rel_str, &self.testpaths);
         let structure_changed = match self.files.get(rel_str) {
             Some(existing) => {
-                existing.is_test != is_test
-                    || existing.is_conftest != is_conftest
-                    || existing.parsed != parsed
+                existing.is_test != node.is_test
+                    || existing.is_conftest != node.is_conftest
+                    || existing.parsed != node.parsed
             }
             None => true,
         };
-        self.files.insert(
-            rel_str.to_string(),
-            FileNode {
-                path: rel_str.to_string(),
-                sha256: sha,
-                semantic_sha256: semantic_sha,
-                stamp,
-                is_test,
-                is_conftest,
-                is_config: false,
-                parsed,
-            },
-        );
+        self.files.insert(rel_str.to_string(), node);
         structure_changed
     }
 
@@ -613,14 +523,14 @@ impl DependencyGraph {
         self.reverse_imports.clear();
         self.conftest_for_test.clear();
         self.file_index_to_path.clear();
+        self.path_to_id.clear();
         self.transitive_dep_ids_for_test.clear();
         self.dep_hash_for_test.clear();
 
-        let mut path_to_id: BTreeMap<String, u32> = BTreeMap::new();
         for (idx, path) in self.files.keys().enumerate() {
             let id = u32::try_from(idx).unwrap_or(u32::MAX);
             self.file_index_to_path.push(path.clone());
-            path_to_id.insert(path.clone(), id);
+            self.path_to_id.insert(path.clone(), id);
         }
 
         let module_index = ModuleIndex::build(&self.files);
@@ -628,37 +538,90 @@ impl DependencyGraph {
         let rust_index = RustModuleIndex::build(&self.files);
         let frontend_index = FrontendModuleIndex::build(&self.files);
 
-        for (path, node) in &self.files {
-            if node.is_config {
-                continue;
+        if self.files.len() >= 128 {
+            let entries: Vec<(&String, &FileNode)> = self
+                .files
+                .iter()
+                .filter(|(_, node)| !node.is_config)
+                .collect();
+            let workers = std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+                .clamp(2, 8);
+            let chunk_size = entries.len().div_ceil(workers).max(1);
+            let files_ref = &self.files;
+            let mod_ref = &module_index;
+            let rs_ref = &rust_index;
+            let fe_ref = &frontend_index;
+            let fix_ref = &fixture_providers;
+            let rt_ref = &self.runtime_deps_for_test;
+            let chunk_deps: Vec<Vec<(String, BTreeSet<String>)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = entries
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            chunk
+                                .iter()
+                                .map(|&(path, node)| {
+                                    let deps = compute_direct_dependencies(
+                                        path, node, files_ref, mod_ref, rs_ref, fe_ref, fix_ref,
+                                        rt_ref,
+                                    );
+                                    (path.clone(), deps)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok())
+                    .collect()
+            });
+            for chunk in chunk_deps {
+                for (path, deps) in chunk {
+                    for dep in &deps {
+                        self.reverse_imports
+                            .entry(dep.clone())
+                            .or_default()
+                            .insert(path.clone());
+                    }
+                    self.direct_imports.insert(path, deps);
+                }
             }
-            let deps = compute_direct_dependencies(
-                path,
-                node,
-                &self.files,
-                &module_index,
-                &rust_index,
-                &frontend_index,
-                &fixture_providers,
-                &self.runtime_deps_for_test,
-            );
-            for dep in &deps {
-                self.reverse_imports
-                    .entry(dep.clone())
-                    .or_default()
-                    .insert(path.clone());
+        } else {
+            for (path, node) in &self.files {
+                if node.is_config {
+                    continue;
+                }
+                let deps = compute_direct_dependencies(
+                    path,
+                    node,
+                    &self.files,
+                    &module_index,
+                    &rust_index,
+                    &frontend_index,
+                    &fixture_providers,
+                    &self.runtime_deps_for_test,
+                );
+                for dep in &deps {
+                    self.reverse_imports
+                        .entry(dep.clone())
+                        .or_default()
+                        .insert(path.clone());
+                }
+                self.direct_imports.insert(path.clone(), deps);
             }
-            self.direct_imports.insert(path.clone(), deps);
         }
 
         // Build compact adjacency list in terms of u32 file IDs
         let num_files = self.file_index_to_path.len();
         let mut adj: Vec<Vec<u32>> = vec![Vec::new(); num_files];
         for (src, targets) in &self.direct_imports {
-            if let Some(&src_id) = path_to_id.get(src) {
+            if let Some(&src_id) = self.path_to_id.get(src) {
                 adj[src_id as usize] = targets
                     .iter()
-                    .filter_map(|t| path_to_id.get(t).copied())
+                    .filter_map(|t| self.path_to_id.get(t).copied())
                     .collect();
             }
         }
@@ -679,62 +642,151 @@ impl DependencyGraph {
 
         let base_hasher = self.build_base_hasher();
         self.last_env_ref_digest = self.compute_env_ref_digest();
+        let node_digests = self.build_all_node_hash_bytes();
 
-        let mut visited_stamp = vec![0u32; num_files];
-        let mut epoch = 0u32;
-        let mut queue = VecDeque::new();
-
-        for test_path in test_files {
-            epoch = epoch.wrapping_add(1);
-            if epoch == 0 {
-                visited_stamp.fill(0);
-                epoch = 1;
-            }
-            let ancestor_conftests = ancestor_conftests_for(&test_path, &conftests);
-            let mut reachable_ids = Vec::new();
-            queue.clear();
-
-            if let Some(&test_id) = path_to_id.get(&test_path) {
-                visited_stamp[test_id as usize] = epoch;
-                reachable_ids.push(test_id);
-                queue.push_back(test_id);
-            }
-            for cf in &ancestor_conftests {
-                if let Some(&cf_id) = path_to_id.get(cf)
-                    && visited_stamp[cf_id as usize] != epoch
-                    && self.is_conftest_used_by_test(cf, &test_path)
-                {
-                    visited_stamp[cf_id as usize] = epoch;
-                    reachable_ids.push(cf_id);
-                    queue.push_back(cf_id);
+        if test_files.len() >= 64 {
+            let workers = std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+                .clamp(2, 8);
+            let chunk_size = test_files.len().div_ceil(workers).max(1);
+            let this_ref: &Self = self;
+            let adj_ref = &adj;
+            let cf_ref = &conftests;
+            let digests_ref = &node_digests;
+            let base_ref = &base_hasher;
+            type TestEdgeOutcome = (String, Vec<String>, Vec<u32>, String);
+            let chunk_outcomes: Vec<Vec<TestEdgeOutcome>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = test_files
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            let mut visited_stamp = vec![0u32; num_files];
+                            let mut epoch = 0u32;
+                            let mut queue = VecDeque::new();
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for test_path in chunk {
+                                epoch = epoch.wrapping_add(1);
+                                if epoch == 0 {
+                                    visited_stamp.fill(0);
+                                    epoch = 1;
+                                }
+                                let ancestor_conftests = ancestor_conftests_for(test_path, cf_ref);
+                                let mut reachable_ids = Vec::new();
+                                queue.clear();
+                                if let Some(&test_id) = this_ref.path_to_id.get(test_path) {
+                                    visited_stamp[test_id as usize] = epoch;
+                                    reachable_ids.push(test_id);
+                                    queue.push_back(test_id);
+                                }
+                                for cf in &ancestor_conftests {
+                                    if let Some(&cf_id) = this_ref.path_to_id.get(cf)
+                                        && visited_stamp[cf_id as usize] != epoch
+                                        && this_ref.is_conftest_used_by_test(cf, test_path)
+                                    {
+                                        visited_stamp[cf_id as usize] = epoch;
+                                        reachable_ids.push(cf_id);
+                                        queue.push_back(cf_id);
+                                    }
+                                }
+                                while let Some(curr_id) = queue.pop_front() {
+                                    for &next_id in &adj_ref[curr_id as usize] {
+                                        if visited_stamp[next_id as usize] != epoch {
+                                            visited_stamp[next_id as usize] = epoch;
+                                            reachable_ids.push(next_id);
+                                            queue.push_back(next_id);
+                                        }
+                                    }
+                                }
+                                reachable_ids.sort_unstable();
+                                let mut hasher = base_ref.clone();
+                                for &dep_id in &reachable_ids {
+                                    if let Some(bytes) = digests_ref.get(dep_id as usize) {
+                                        hasher.update(bytes);
+                                    }
+                                }
+                                let dep_hash = hex_encode(&hasher.finalize());
+                                out.push((
+                                    test_path.clone(),
+                                    ancestor_conftests,
+                                    reachable_ids,
+                                    dep_hash,
+                                ));
+                            }
+                            out
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok())
+                    .collect()
+            });
+            for chunk in chunk_outcomes {
+                for (test_path, ancestor_conftests, reachable_ids, dep_hash) in chunk {
+                    self.conftest_for_test
+                        .insert(test_path.clone(), ancestor_conftests);
+                    self.transitive_dep_ids_for_test
+                        .insert(test_path.clone(), reachable_ids);
+                    self.dep_hash_for_test.insert(test_path, dep_hash);
                 }
             }
+        } else {
+            let mut visited_stamp = vec![0u32; num_files];
+            let mut epoch = 0u32;
+            let mut queue = VecDeque::new();
 
-            while let Some(curr_id) = queue.pop_front() {
-                for &next_id in &adj[curr_id as usize] {
-                    if visited_stamp[next_id as usize] != epoch {
-                        visited_stamp[next_id as usize] = epoch;
-                        reachable_ids.push(next_id);
-                        queue.push_back(next_id);
+            for test_path in test_files {
+                epoch = epoch.wrapping_add(1);
+                if epoch == 0 {
+                    visited_stamp.fill(0);
+                    epoch = 1;
+                }
+                let ancestor_conftests = ancestor_conftests_for(&test_path, &conftests);
+                let mut reachable_ids = Vec::new();
+                queue.clear();
+
+                if let Some(&test_id) = self.path_to_id.get(&test_path) {
+                    visited_stamp[test_id as usize] = epoch;
+                    reachable_ids.push(test_id);
+                    queue.push_back(test_id);
+                }
+                for cf in &ancestor_conftests {
+                    if let Some(&cf_id) = self.path_to_id.get(cf)
+                        && visited_stamp[cf_id as usize] != epoch
+                        && self.is_conftest_used_by_test(cf, &test_path)
+                    {
+                        visited_stamp[cf_id as usize] = epoch;
+                        reachable_ids.push(cf_id);
+                        queue.push_back(cf_id);
                     }
                 }
-            }
 
-            reachable_ids.sort_unstable();
-
-            let mut hasher = base_hasher.clone();
-            for &dep_id in &reachable_ids {
-                let dep_path = &self.file_index_to_path[dep_id as usize];
-                if let Some(dep_node) = self.files.get(dep_path) {
-                    hash_dep_node(&mut hasher, dep_path, dep_node);
+                while let Some(curr_id) = queue.pop_front() {
+                    for &next_id in &adj[curr_id as usize] {
+                        if visited_stamp[next_id as usize] != epoch {
+                            visited_stamp[next_id as usize] = epoch;
+                            reachable_ids.push(next_id);
+                            queue.push_back(next_id);
+                        }
+                    }
                 }
+
+                reachable_ids.sort_unstable();
+
+                let mut hasher = base_hasher.clone();
+                for &dep_id in &reachable_ids {
+                    if let Some(bytes) = node_digests.get(dep_id as usize) {
+                        hasher.update(bytes);
+                    }
+                }
+                let dep_hash = hex_encode(&hasher.finalize());
+                self.conftest_for_test
+                    .insert(test_path.clone(), ancestor_conftests);
+                self.transitive_dep_ids_for_test
+                    .insert(test_path.clone(), reachable_ids);
+                self.dep_hash_for_test.insert(test_path, dep_hash);
             }
-            let dep_hash = hex_encode(&hasher.finalize());
-            self.conftest_for_test
-                .insert(test_path.clone(), ancestor_conftests);
-            self.transitive_dep_ids_for_test
-                .insert(test_path.clone(), reachable_ids);
-            self.dep_hash_for_test.insert(test_path, dep_hash);
         }
     }
 
@@ -816,18 +868,19 @@ impl DependencyGraph {
         if tests.is_empty() {
             return;
         }
-        let path_to_id: BTreeMap<String, u32> = self
-            .file_index_to_path
-            .iter()
-            .enumerate()
-            .map(|(idx, path)| (path.clone(), u32::try_from(idx).unwrap_or(u32::MAX)))
-            .collect();
+        if self.path_to_id.len() != self.file_index_to_path.len() {
+            self.path_to_id.clear();
+            for (idx, path) in self.file_index_to_path.iter().enumerate() {
+                self.path_to_id
+                    .insert(path.clone(), u32::try_from(idx).unwrap_or(u32::MAX));
+            }
+        }
         let mut adj: Vec<Vec<u32>> = vec![Vec::new(); self.file_index_to_path.len()];
         for (source, deps) in &self.direct_imports {
-            if let Some(&source_id) = path_to_id.get(source) {
+            if let Some(&source_id) = self.path_to_id.get(source) {
                 adj[source_id as usize] = deps
                     .iter()
-                    .filter_map(|dep| path_to_id.get(dep).copied())
+                    .filter_map(|dep| self.path_to_id.get(dep).copied())
                     .collect();
             }
         }
@@ -842,7 +895,7 @@ impl DependencyGraph {
         let mut epoch = 0u32;
         let mut queue = VecDeque::new();
         for test_path in tests {
-            let Some(&test_id) = path_to_id.get(test_path) else {
+            let Some(&test_id) = self.path_to_id.get(test_path) else {
                 continue;
             };
             epoch = epoch.wrapping_add(1);
@@ -856,7 +909,7 @@ impl DependencyGraph {
             queue.push_back(test_id);
             visited_stamp[test_id as usize] = epoch;
             for conftest in &conftest_chain {
-                if let Some(&id) = path_to_id.get(conftest)
+                if let Some(&id) = self.path_to_id.get(conftest)
                     && visited_stamp[id as usize] != epoch
                     && self.is_conftest_used_by_test(conftest, test_path)
                 {
@@ -1988,25 +2041,194 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&hasher.finalize())
 }
 
-fn hash_dep_node(hasher: &mut Sha256, dep_path: &str, dep_node: &FileNode) {
-    hasher.update(b"py:");
-    hasher.update(dep_path.as_bytes());
-    hasher.update(b":");
+fn build_node_hash_bytes(dep_path: &str, dep_node: &FileNode) -> Vec<u8> {
     let effective_sha = if dep_node.semantic_sha256.is_empty() {
         &dep_node.sha256
     } else {
         &dep_node.semantic_sha256
     };
-    hasher.update(effective_sha.as_bytes());
-    hasher.update(b"\n");
+    let mut out = Vec::with_capacity(
+        5 + dep_path.len()
+            + effective_sha.len()
+            + dep_node.parsed.env_vars_referenced.len() * 80,
+    );
+    out.extend_from_slice(b"py:");
+    out.extend_from_slice(dep_path.as_bytes());
+    out.push(b':');
+    out.extend_from_slice(effective_sha.as_bytes());
+    out.push(b'\n');
     for env_key in &dep_node.parsed.env_vars_referenced {
-        hasher.update(b"env_ref:");
-        hasher.update(env_key.as_bytes());
-        hasher.update(b"=");
+        out.extend_from_slice(b"env_ref:");
+        out.extend_from_slice(env_key.as_bytes());
+        out.push(b'=');
         if let Some(val) = std::env::var_os(env_key) {
-            hasher.update(sha256_hex(val.to_string_lossy().as_bytes()).as_bytes());
+            out.extend_from_slice(sha256_hex(val.to_string_lossy().as_bytes()).as_bytes());
         }
-        hasher.update(b"\n");
+        out.push(b'\n');
+    }
+    out
+}
+
+fn hash_dep_node(hasher: &mut Sha256, dep_path: &str, dep_node: &FileNode) {
+    hasher.update(build_node_hash_bytes(dep_path, dep_node));
+}
+
+fn build_file_node_from_bytes(
+    rel_str: &str,
+    bytes: &[u8],
+    stamp: Option<FileStamp>,
+    test_file_patterns: &[String],
+    testpaths: &[String],
+) -> FileNode {
+    let sha = sha256_hex(bytes);
+    let semantic_sha = semantic_sha256_for_source(rel_str, bytes);
+    let file_name = Path::new(rel_str)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if PYTEST_CONFIG_FILES.contains(&file_name)
+        || RUST_CONFIG_FILES.contains(&file_name)
+        || FRONTEND_CONFIG_FILES.contains(&file_name)
+        || POLYGLOT_CONFIG_FILES.contains(&file_name)
+        || file_name.ends_with(".csproj")
+    {
+        let parsed = if matches!(
+            file_name,
+            "Cargo.toml"
+                | "pyproject.toml"
+                | "package.json"
+                | "tsconfig.json"
+                | "tsconfig.app.json"
+                | "tsconfig.node.json"
+                | "jsconfig.json"
+                | "go.mod"
+        ) || file_name.starts_with("vite.config.")
+            || file_name.starts_with("vitest.config.")
+            || file_name.starts_with("vitest.workspace.")
+        {
+            parse_manifest_metadata(&String::from_utf8_lossy(bytes), file_name)
+        } else {
+            ParsedPythonFile::default()
+        };
+        return FileNode {
+            path: rel_str.to_string(),
+            sha256: sha.clone(),
+            semantic_sha256: sha,
+            stamp,
+            is_test: false,
+            is_conftest: false,
+            is_config: true,
+            parsed,
+        };
+    }
+    if file_name.ends_with(".rs") {
+        let source = String::from_utf8_lossy(bytes);
+        let parsed = parse_rust_source(&source);
+        let is_conftest = is_rust_common_test_helper(rel_str);
+        let is_test = !is_conftest
+            && (!parsed.test_symbols.is_empty() || is_rust_integration_test_path(rel_str));
+        return FileNode {
+            path: rel_str.to_string(),
+            sha256: sha,
+            semantic_sha256: semantic_sha,
+            stamp,
+            is_test,
+            is_conftest,
+            is_config: false,
+            parsed,
+        };
+    }
+    if is_frontend_source_path(rel_str) {
+        let source = String::from_utf8_lossy(bytes);
+        let mut parsed = parse_frontend_source(&source);
+        if is_playwright_e2e_path(rel_str) {
+            if !parsed.markers.iter().any(|m| m == "playwright") {
+                parsed.markers.push("playwright".to_string());
+            }
+            if !parsed.module_markers.iter().any(|m| m == "e2e") {
+                parsed.module_markers.push("e2e".to_string());
+            }
+        } else if is_cypress_test_path(rel_str) {
+            if !parsed.markers.iter().any(|m| m == "cypress") {
+                parsed.markers.push("cypress".to_string());
+            }
+            if !parsed.module_markers.iter().any(|m| m == "e2e") {
+                parsed.module_markers.push("e2e".to_string());
+            }
+        }
+        let is_conftest = is_frontend_setup_file(rel_str);
+        let is_test = !is_conftest
+            && (is_frontend_test_path(rel_str)
+                || parsed.markers.iter().any(|m| m == "in_source_vitest")
+                || (is_storybook_story_path(rel_str)
+                    && parsed.markers.iter().any(|m| m == "storybook_play")));
+        return FileNode {
+            path: rel_str.to_string(),
+            sha256: sha,
+            semantic_sha256: semantic_sha,
+            stamp,
+            is_test,
+            is_conftest,
+            is_config: false,
+            parsed,
+        };
+    }
+    if is_stylesheet_path(rel_str) {
+        let source = String::from_utf8_lossy(bytes);
+        let parsed = parse_css_source(&source);
+        return FileNode {
+            path: rel_str.to_string(),
+            sha256: sha,
+            semantic_sha256: semantic_sha,
+            stamp,
+            is_test: false,
+            is_conftest: false,
+            is_config: false,
+            parsed,
+        };
+    }
+    if is_polyglot_source_path(rel_str) {
+        let source = String::from_utf8_lossy(bytes);
+        let parsed = parse_polyglot_source(rel_str, &source);
+        let is_test = is_polyglot_test_path(rel_str, &parsed);
+        return FileNode {
+            path: rel_str.to_string(),
+            sha256: sha,
+            semantic_sha256: semantic_sha,
+            stamp,
+            is_test,
+            is_conftest: false,
+            is_config: false,
+            parsed,
+        };
+    }
+    if !file_name.ends_with(".py") {
+        return FileNode {
+            path: rel_str.to_string(),
+            sha256: sha.clone(),
+            semantic_sha256: sha,
+            stamp,
+            is_test: false,
+            is_conftest: false,
+            is_config: false,
+            parsed: ParsedPythonFile::default(),
+        };
+    }
+    let source = String::from_utf8_lossy(bytes);
+    let parsed = parse_python_source(&source);
+    let is_conftest = file_name == "conftest.py";
+    let is_test = !is_conftest
+        && matches_test_filename(file_name, test_file_patterns)
+        && matches_test_path(rel_str, testpaths);
+    FileNode {
+        path: rel_str.to_string(),
+        sha256: sha,
+        semantic_sha256: semantic_sha,
+        stamp,
+        is_test,
+        is_conftest,
+        is_config: false,
+        parsed,
     }
 }
 
@@ -2065,6 +2287,14 @@ fn normalize_python_semantic(source: &str) -> String {
         let mut in_single: Option<u8> = None;
         while i < bytes.len() {
             if let Some(delim) = in_triple {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    line_out.push('\\');
+                    if let Some(esc_ch) = raw_line[i + 1..].chars().next() {
+                        line_out.push(esc_ch);
+                        i += 1 + esc_ch.len_utf8();
+                        continue;
+                    }
+                }
                 if raw_line[i..].starts_with(delim) {
                     line_out.push_str(delim);
                     i += 3;
@@ -2078,10 +2308,12 @@ fn normalize_python_semantic(source: &str) -> String {
             }
             if let Some(q) = in_single {
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    line_out.push(bytes[i] as char);
-                    line_out.push(bytes[i + 1] as char);
-                    i += 2;
-                    continue;
+                    line_out.push('\\');
+                    if let Some(esc_ch) = raw_line[i + 1..].chars().next() {
+                        line_out.push(esc_ch);
+                        i += 1 + esc_ch.len_utf8();
+                        continue;
+                    }
                 }
                 if bytes[i] == q {
                     in_single = None;
@@ -2146,16 +2378,19 @@ fn normalize_c_style_semantic(source: &str) -> String {
                 if bytes[i] == b'\n' {
                     stripped.push('\n');
                 }
-                i += 1;
+                let ch = source[i..].chars().next().unwrap_or(' ');
+                i += ch.len_utf8();
             }
             continue;
         }
         if let Some(q) = in_quote {
             if bytes[i] == b'\\' && i + 1 < len {
-                stripped.push(bytes[i] as char);
-                stripped.push(bytes[i + 1] as char);
-                i += 2;
-                continue;
+                stripped.push('\\');
+                if let Some(esc_ch) = source[i + 1..].chars().next() {
+                    stripped.push(esc_ch);
+                    i += 1 + esc_ch.len_utf8();
+                    continue;
+                }
             }
             if bytes[i] == q {
                 in_quote = None;
@@ -2203,12 +2438,12 @@ fn normalize_c_style_semantic(source: &str) -> String {
 
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
+    let mut out = vec![0u8; bytes.len() * 2];
+    for (idx, &b) in bytes.iter().enumerate() {
+        out[idx * 2] = HEX[(b >> 4) as usize];
+        out[idx * 2 + 1] = HEX[(b & 0x0f) as usize];
     }
-    out
+    String::from_utf8(out).unwrap_or_default()
 }
 
 fn ancestor_conftests_for(test_path: &str, conftests: &BTreeSet<String>) -> Vec<String> {
@@ -2806,14 +3041,24 @@ impl RustModuleIndex {
             deps.insert(build_rs);
         }
 
-        // 1. Resolve `mod <name>;` declarations (for barrel `mod.rs`/`lib.rs` with `pub use` reexports, avoid coupling all siblings)
-        let is_barrel_with_reexports = (path.ends_with("/mod.rs") || path == "mod.rs")
-            && node
-                .parsed
-                .defined_symbols
-                .iter()
-                .any(|s| s.starts_with("rs_reexport:"));
-        if !is_barrel_with_reexports {
+        // 1. Resolve `mod <name>;` declarations.
+        // For crate/module roots (`lib.rs`, `mod.rs`) outside `tests/` that are not PyO3 entrypoints
+        // and do not contain their own inline tests, `pub mod <child>;` declarations mount child modules
+        // into the module tree rather than making symbols defined directly in `lib.rs`/`mod.rs`
+        // (such as shared `Result`/`Error` types) depend on every sibling module.
+        let is_test_tree_mod = path.starts_with("tests/") || path.contains("/tests/");
+        let is_crate_or_mod_root = !is_test_tree_mod
+            && (path.ends_with("/lib.rs")
+                || path == "lib.rs"
+                || path.ends_with("/mod.rs")
+                || path == "mod.rs");
+        let is_pymodule_root = node
+            .parsed
+            .defined_symbols
+            .iter()
+            .any(|s| s.starts_with("pyo3:"));
+        let skip_root_mod_fanout = is_crate_or_mod_root && !is_pymodule_root && !node.is_test;
+        if !skip_root_mod_fanout {
             for decl in &node.parsed.rust_mods {
                 if decl.is_inline {
                     continue;
@@ -2836,13 +3081,22 @@ impl RustModuleIndex {
         }
 
         // 3. If an integration test (`tests/*.rs`) did not resolve any specific file under `src/`,
-        // fall back to linking it to the crate's `src/lib.rs` if present.
+        // fall back to linking it to the crate's `src/lib.rs` and its mounted modules if present.
         if is_rust_integration_test_path(path) {
             let src_prefix = format!("{src_dir}/");
             let has_src_dep = deps.iter().any(|d| d.starts_with(&src_prefix));
             let lib_rs = format!("{src_dir}/lib.rs");
-            if !has_src_dep && files.contains_key(&lib_rs) {
-                deps.insert(lib_rs);
+            if !has_src_dep
+                && let Some(lib_node) = files.get(&lib_rs)
+            {
+                deps.insert(lib_rs.clone());
+                for decl in &lib_node.parsed.rust_mods {
+                    if !decl.is_inline {
+                        for child in resolve_rust_mod_decl(&lib_rs, decl, files) {
+                            deps.insert(child);
+                        }
+                    }
+                }
             }
         }
 
@@ -4237,7 +4491,10 @@ fn scan_string_literal(source: &str, start_quote_idx: usize, is_fstring: bool) -
     let mut brace_depth = 0usize;
     while i < len {
         if bytes[i] == b'\\' {
-            i = (i + 2).min(len);
+            i += 1;
+            if i < len {
+                i += source[i..].chars().next().map_or(1, char::len_utf8);
+            }
             continue;
         }
         if is_fstring {
@@ -4786,7 +5043,7 @@ fn tokenize_rust(source: &str) -> Vec<RsToken> {
                 i = next_i;
             }
             b'\'' => {
-                // Distinguish character literals ('a', '\n') from lifetimes ('a, 'static)
+                // Distinguish character literals ('a', '\n', '¥') from lifetimes ('a, 'static)
                 if i + 1 < len && bytes[i + 1] == b'\\' {
                     i += 2;
                     while i < len && bytes[i] != b'\'' && bytes[i] != b'\n' {
@@ -4796,8 +5053,12 @@ fn tokenize_rust(source: &str) -> Vec<RsToken> {
                         i += 1;
                     }
                     push_rs_other(&mut tokens);
-                } else if i + 2 < len && bytes[i + 2] == b'\'' {
-                    i += 3;
+                } else if i + 1 < len
+                    && let Some(ch) = source[i + 1..].chars().next()
+                    && i + 1 + ch.len_utf8() < len
+                    && bytes[i + 1 + ch.len_utf8()] == b'\''
+                {
+                    i += 1 + ch.len_utf8() + 1;
                     push_rs_other(&mut tokens);
                 } else {
                     i += 1;
@@ -4841,7 +5102,10 @@ fn scan_rust_string(source: &str, quote_idx: usize) -> (String, usize) {
         };
         i += off;
         if bytes[i] == b'\\' {
-            i = (i + 2).min(len);
+            i += 1;
+            if i < len {
+                i += source[i..].chars().next().map_or(1, char::len_utf8);
+            }
             continue;
         }
         return (source[start..i].to_string(), i + 1);
@@ -5431,7 +5695,7 @@ fn tokenize_frontend(source: &str) -> Vec<JsToken> {
             }
             b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
                 i += 2;
-                while i + 1 < len {
+                loop {
                     if let Some(off) = memchr::memchr(b'*', &bytes[i..]) {
                         i += off;
                         if i + 1 < len && bytes[i + 1] == b'/' {
@@ -5525,7 +5789,10 @@ fn scan_js_string(source: &str, quote_idx: usize, quote: u8) -> (String, usize) 
         };
         i += off;
         if bytes[i] == b'\\' {
-            i = (i + 2).min(len);
+            i += 1;
+            if i < len {
+                i += source[i..].chars().next().map_or(1, char::len_utf8);
+            }
             continue;
         }
         return (source[start..i].to_string(), (i + 1).min(len));
@@ -5545,7 +5812,10 @@ fn scan_js_template_string(source: &str, quote_idx: usize) -> (String, usize) {
         };
         i += off;
         if bytes[i] == b'\\' {
-            i = (i + 2).min(len);
+            i += 1;
+            if i < len {
+                i += source[i..].chars().next().map_or(1, char::len_utf8);
+            }
             continue;
         }
         if bytes[i] == b'$' && i + 1 < len && bytes[i + 1] == b'{' {
@@ -7759,5 +8029,93 @@ mod tests {
             "pkg/calc/math.go".to_string(),
         ]);
         assert_eq!(untested, vec!["src/backend/untested_orphan.py".to_string()]);
+    }
+
+    #[test]
+    fn normalizes_and_parses_escaped_multibyte_utf8_without_panicking() {
+        let py_src = concat!(
+            "import re\n",
+            "CURRENCY_RE = re.compile(r\"[\\$€£\\¥\\₩\\🦀]+\")\n",
+            "TRIPLE = \"\"\"prefix \\¥ \\가 \\🦀 suffix\"\"\"\n",
+            "def test_currency():\n",
+            "    assert CURRENCY_RE.match(\"¥100\")\n",
+        );
+        let py_hash_a = semantic_sha256_for_source("tests/test_currency.py", py_src.as_bytes());
+        let py_hash_b = semantic_sha256_for_source(
+            "tests/test_currency.py",
+            format!("{py_src}# trailing comment with ¥ and 한글\n").as_bytes(),
+        );
+        assert_eq!(py_hash_a, py_hash_b);
+        let parsed_py = parse_python_source(py_src);
+        assert!(parsed_py.test_symbols.contains(&"test_currency".to_string()));
+
+        let ts_src = concat!(
+            "import { parsePrice } from './price';\n",
+            "/* multi-byte block comment ¥ 가 🦀 */\n",
+            "const pat = \"\\¥\\₩\\🦀\";\n",
+            "const tpl = `\\¥\\₩\\🦀`;\n",
+            "test('parses yen', () => { expect(parsePrice(pat, tpl)).toBe(100); });\n",
+        );
+        let ts_hash_a = semantic_sha256_for_source("src/price.test.ts", ts_src.as_bytes());
+        let ts_hash_b = semantic_sha256_for_source(
+            "src/price.test.ts",
+            format!("{ts_src}// comment ¥\n").as_bytes(),
+        );
+        assert_eq!(ts_hash_a, ts_hash_b);
+        let parsed_ts = parse_frontend_source(ts_src);
+        assert!(parsed_ts.test_symbols.contains(&"parses yen".to_string()));
+
+        let rs_src = concat!(
+            "use crate::currency::parse_symbol;\n",
+            "#[test]\n",
+            "fn parses_yen_char() {\n",
+            "    let ch = '¥';\n",
+            "    let escaped = \"\\¥\";\n",
+            "    assert_eq!(parse_symbol(ch, escaped), 1);\n",
+            "}\n",
+        );
+        let rs_hash = semantic_sha256_for_source("src/lib.rs", rs_src.as_bytes());
+        assert!(!rs_hash.is_empty());
+        let parsed_rs = parse_rust_source(rs_src);
+        assert!(parsed_rs.test_symbols.contains(&"parses_yen_char".to_string()));
+    }
+
+    #[test]
+    fn rust_lib_root_shared_types_do_not_couple_unrelated_sibling_modules() {
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "Cargo.toml",
+            b"[package]\nname = \"sample\"\nversion = \"0.1.0\"\n",
+        );
+        graph.insert_file_bytes(
+            "src/lib.rs",
+            b"pub mod alpha;\npub mod beta;\npub type Result<T> = std::result::Result<T, String>;\n",
+        );
+        graph.insert_file_bytes(
+            "src/alpha.rs",
+            b"use crate::Result;\npub fn run_a() -> Result<i32> { Ok(1) }\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn test_a() { assert_eq!(run_a().unwrap(), 1); }\n}\n",
+        );
+        graph.insert_file_bytes(
+            "src/beta.rs",
+            b"use crate::Result;\npub fn run_b() -> Result<i32> { Ok(2) }\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn test_b() { assert_eq!(run_b().unwrap(), 2); }\n}\n",
+        );
+        graph.recompute_edges();
+
+        let affected_alpha: Vec<String> = graph
+            .affected_tests(&["src/alpha.rs".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(affected_alpha, vec!["src/alpha.rs".to_string()]);
+
+        let affected_lib: Vec<String> = graph
+            .affected_tests(&["src/lib.rs".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            affected_lib,
+            vec!["src/alpha.rs".to_string(), "src/beta.rs".to_string()]
+        );
     }
 }

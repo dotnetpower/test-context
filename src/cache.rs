@@ -111,6 +111,10 @@ pub struct RootCache {
     wal_needs_repair: bool,
     #[serde(skip)]
     last_snapshot_stamp: Option<(u64, i64, i64)>,
+    #[serde(skip)]
+    cached_memory_bytes: Option<usize>,
+    #[serde(skip)]
+    last_saved_metrics: (u64, u64, u64, u64),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -167,6 +171,8 @@ impl RootCache {
             wal_valid_bytes: 0,
             wal_needs_repair: false,
             last_snapshot_stamp: None,
+            cached_memory_bytes: Some(0),
+            last_saved_metrics: (0, 0, 0, 0),
         }
     }
 
@@ -269,21 +275,32 @@ impl RootCache {
         for node in record.node_results.values_mut() {
             truncate_utf8(&mut node.output_snippet, 2 * 1024);
         }
+        let mut current_bytes = self.estimated_bytes();
+        let rec_bytes = record_estimated_bytes(&record);
         let key = Self::key(&record.test_file, &record.dep_hash);
         if let Some(existing) = self.history_by_key.get(&key)
             && existing.outcome != record.outcome
         {
-            self.quarantined_keys.insert(key.clone());
+            if self.quarantined_keys.insert(key.clone()) {
+                current_bytes = current_bytes.saturating_add(key.len());
+            }
             self.pending_events
                 .push(CacheWalEvent::Quarantine { key: key.clone() });
         }
-        self.latest_by_file
-            .insert(record.test_file.clone(), record.clone());
-        self.history_by_key.insert(key, record.clone());
+        if let Some(old_latest) = self
+            .latest_by_file
+            .insert(record.test_file.clone(), record.clone())
+        {
+            current_bytes = current_bytes.saturating_sub(record_estimated_bytes(&old_latest));
+        }
+        current_bytes = current_bytes.saturating_add(rec_bytes);
+        if let Some(old_hist) = self.history_by_key.insert(key, record.clone()) {
+            current_bytes = current_bytes.saturating_sub(record_estimated_bytes(&old_hist));
+        }
+        current_bytes = current_bytes.saturating_add(rec_bytes);
         self.pending_events.push(CacheWalEvent::Upsert {
             record: Box::new(record),
         });
-        let mut current_bytes = self.estimated_bytes();
         while self.history_by_key.len() > policy.max_cached_results
             || current_bytes > policy.max_cache_bytes
         {
@@ -316,9 +333,11 @@ impl RootCache {
                 break;
             }
         }
+        self.cached_memory_bytes = Some(current_bytes);
     }
 
     pub fn invalidate_file(&mut self, test_file: &str) -> usize {
+        self.cached_memory_bytes = None;
         let mut removed = usize::from(self.latest_by_file.remove(test_file).is_some());
         let prefix = format!("{test_file}@");
         let keys: Vec<String> = self
@@ -345,6 +364,7 @@ impl RootCache {
         self.latest_by_file.clear();
         self.history_by_key.clear();
         self.quarantined_keys.clear();
+        self.cached_memory_bytes = None;
         self.pending_events.push(CacheWalEvent::Reset);
         count
     }
@@ -353,6 +373,7 @@ impl RootCache {
         if test_files.is_empty() || test_files.len() > 256 {
             return;
         }
+        self.cached_memory_bytes = None;
         let mut files = test_files.to_vec();
         files.sort();
         files.dedup();
@@ -534,6 +555,7 @@ impl RootCache {
         }
         cache.pending_events.clear();
         cache.trim_invocation_patterns();
+        cache.cached_memory_bytes = None;
         let default_policy = MemoryPolicy::default();
         let mut current_bytes = cache.estimated_bytes();
         while cache.history_by_key.len() > default_policy.max_cached_results
@@ -565,10 +587,35 @@ impl RootCache {
                     current_bytes.saturating_sub(record_estimated_bytes(&removed_latest));
             }
         }
+        cache.cached_memory_bytes = Some(current_bytes);
+        cache.last_saved_metrics = (
+            cache.total_saved_ms,
+            cache.total_cache_hits,
+            cache.total_delta_runs,
+            cache.total_background_runs,
+        );
         cache
     }
 
     pub fn save(&mut self) -> Result<()> {
+        let current_metrics = (
+            self.total_saved_ms,
+            self.total_cache_hits,
+            self.total_delta_runs,
+            self.total_background_runs,
+        );
+        if current_metrics != self.last_saved_metrics {
+            self.pending_events.push(CacheWalEvent::Metrics {
+                total_saved_ms: self.total_saved_ms,
+                total_cache_hits: self.total_cache_hits,
+                total_delta_runs: self.total_delta_runs,
+                total_background_runs: self.total_background_runs,
+            });
+        }
+        let wal_path = Self::wal_path(&self.root)?;
+        if self.pending_events.is_empty() && !self.wal_needs_repair && wal_path.exists() {
+            return Ok(());
+        }
         let lock_path = Self::lock_path(&self.root)?;
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
@@ -578,13 +625,6 @@ impl RootCache {
             .mode(0o600)
             .open(&lock_path)?;
         lock_file.lock_exclusive()?;
-        self.pending_events.push(CacheWalEvent::Metrics {
-            total_saved_ms: self.total_saved_ms,
-            total_cache_hits: self.total_cache_hits,
-            total_delta_runs: self.total_delta_runs,
-            total_background_runs: self.total_background_runs,
-        });
-        let wal_path = Self::wal_path(&self.root)?;
         let disk_wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
         let disk_snap_stamp = Self::snapshot_stamp(&self.root);
 
@@ -636,14 +676,21 @@ impl RootCache {
             pos
         };
         self.pending_events.clear();
+        self.last_saved_metrics = (
+            self.total_saved_ms,
+            self.total_cache_hits,
+            self.total_delta_runs,
+            self.total_background_runs,
+        );
 
-        if wal_bytes > 16 * 1024 * 1024 {
+        if wal_bytes > 4 * 1024 * 1024 {
             self.compact_snapshot(&wal_path)?;
         }
         Ok(())
     }
 
     fn apply_wal_event(&mut self, event: CacheWalEvent) {
+        self.cached_memory_bytes = None;
         match event {
             CacheWalEvent::Upsert { record } => {
                 let record = *record;
@@ -748,6 +795,9 @@ impl RootCache {
     }
 
     pub fn estimated_bytes(&self) -> usize {
+        if let Some(cached) = self.cached_memory_bytes {
+            return cached;
+        }
         self.latest_by_file
             .values()
             .map(record_estimated_bytes)
@@ -772,6 +822,12 @@ impl RootCache {
 
     pub fn has_pending_events(&self) -> bool {
         !self.pending_events.is_empty()
+            || (
+                self.total_saved_ms,
+                self.total_cache_hits,
+                self.total_delta_runs,
+                self.total_background_runs,
+            ) != self.last_saved_metrics
     }
 }
 

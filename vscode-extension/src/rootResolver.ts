@@ -9,20 +9,58 @@ export class RootResolutionError extends Error {
   }
 }
 
+export function toPosixPathIfPossible(rawPath: string): string | undefined {
+  const trimmed = rawPath.trim().split('::')[0]?.trim() ?? '';
+  if (!trimmed || /[\0\r\n]/u.test(trimmed)) {
+    return undefined;
+  }
+  const uncMatch = /^\\\\(?:wsl\.localhost|wsl\$)\\[^\\]+(\\.+)$/iu.exec(trimmed);
+  if (uncMatch?.[1]) {
+    return posix.normalize(uncMatch[1].replace(/\\/gu, '/'));
+  }
+  if (posix.isAbsolute(trimmed) && !trimmed.includes('\\')) {
+    return posix.normalize(trimmed);
+  }
+  return undefined;
+}
+
 export function resolveWslRoot(
   workspaces: readonly WorkspaceSpec[],
   explicitPath: string | undefined,
+  candidates: readonly string[] = [],
 ): string {
-  const target = explicitPath ?? (workspaces.length === 1 ? workspaces[0]?.root : undefined);
-  if (!target) {
-    throw new RootResolutionError(
-      'Windows Agent Sessions require an explicit absolute Linux root when multiple roots are registered.',
-    );
+  const posixRoots = workspaces
+    .map((w) => w.root)
+    .filter((r) => posix.isAbsolute(r))
+    .map((r) => posix.normalize(r));
+
+  if (explicitPath !== undefined && explicitPath.trim().length > 0) {
+    const uncConverted = toPosixPathIfPossible(explicitPath);
+    const rawTarget = uncConverted ?? explicitPath;
+    if (!posix.isAbsolute(rawTarget) || /[\\\0\r\n]/u.test(rawTarget)) {
+      throw new RootResolutionError('WSL Test Context root must be an absolute Linux path.');
+    }
+    const normalized = posix.normalize(rawTarget);
+    return bestContainingPosixRoot(posixRoots, normalized) ?? normalized;
   }
-  if (!posix.isAbsolute(target) || /[\\\0\r\n]/u.test(target)) {
-    throw new RootResolutionError('WSL Test Context root must be an absolute Linux path.');
+
+  for (const candidate of candidates) {
+    const posixCand = toPosixPathIfPossible(candidate);
+    if (posixCand) {
+      const match = bestContainingPosixRoot(posixRoots, posixCand);
+      if (match) {
+        return match;
+      }
+    }
   }
-  return posix.normalize(target);
+
+  if (workspaces.length === 1 && workspaces[0]?.root) {
+    return posix.normalize(workspaces[0].root);
+  }
+
+  throw new RootResolutionError(
+    'Windows Agent Sessions require an explicit absolute Linux root when multiple roots are registered.',
+  );
 }
 
 export function resolveRegisteredRoot(
@@ -96,6 +134,17 @@ function bestContainingRoot(roots: readonly string[], candidate: string): string
   return roots
     .filter((root) => contains(root, candidate))
     .sort((left, right) => right.length - left.length)[0];
+}
+
+function bestContainingPosixRoot(roots: readonly string[], candidate: string): string | undefined {
+  return roots
+    .filter((root) => containsPosix(root, candidate))
+    .sort((left, right) => right.length - left.length)[0];
+}
+
+function containsPosix(root: string, candidate: string): boolean {
+  const child = posix.relative(root, candidate);
+  return child === '' || (!child.startsWith('../') && child !== '..' && !posix.isAbsolute(child));
 }
 
 function contains(root: string, candidate: string): boolean {

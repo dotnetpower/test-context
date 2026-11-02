@@ -182,9 +182,19 @@ pub struct Request {
     pub compact: bool,
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unexpected panic".to_string()
+    }
+}
+
 struct DaemonHub {
     roots: Mutex<BTreeMap<PathBuf, Arc<ManagedRoot>>>,
-    load_gate: Mutex<()>,
+    load_gate: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>,
     traces: Mutex<VecDeque<Value>>,
     started_at: Instant,
     local_oneshot: bool,
@@ -199,7 +209,7 @@ impl DaemonHub {
     fn with_mode(local_oneshot: bool) -> Self {
         Self {
             roots: Mutex::new(BTreeMap::new()),
-            load_gate: Mutex::new(()),
+            load_gate: Mutex::new(BTreeMap::new()),
             traces: Mutex::new(VecDeque::new()),
             started_at: Instant::now(),
             local_oneshot,
@@ -207,28 +217,45 @@ impl DaemonHub {
         }
     }
 
+    fn lock_roots(&self) -> std::sync::MutexGuard<'_, BTreeMap<PathBuf, Arc<ManagedRoot>>> {
+        self.roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn root_load_gate(&self, root: &Path) -> Arc<Mutex<()>> {
+        let mut gates = self
+            .load_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            gates
+                .entry(root.to_path_buf())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    fn lock_traces(&self) -> std::sync::MutexGuard<'_, VecDeque<Value>> {
+        self.traces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
-        let roots = self
-            .roots
-            .lock()
-            .map(|guard| guard.values().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let roots = self.lock_roots().values().cloned().collect::<Vec<_>>();
         for root in roots {
             root.cancel_active();
         }
     }
 
     fn shutdown_all(&self) {
-        let roots = self
-            .roots
-            .lock()
-            .map(|mut guard| {
-                std::mem::take(&mut *guard)
-                    .into_values()
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let roots = {
+            let mut guard = self.lock_roots();
+            std::mem::take(&mut *guard)
+                .into_values()
+                .collect::<Vec<_>>()
+        };
         for root in roots {
             root.shutdown();
         }
@@ -236,16 +263,13 @@ impl DaemonHub {
 
     fn evict_idle_or_excess_roots(&self) {
         let mut evicted = Vec::new();
-        let roots = self
-            .roots
-            .lock()
-            .map(|guard| guard.values().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let roots = self.lock_roots().values().cloned().collect::<Vec<_>>();
         for root in roots {
             root.reclaim_idle_zygote();
             root.flush_pending_cache();
         }
-        if let Ok(mut guard) = self.roots.lock() {
+        {
+            let mut guard = self.lock_roots();
             let idle_keys: Vec<PathBuf> = guard
                 .iter()
                 .filter(|(_, root)| {
@@ -298,24 +322,19 @@ impl DaemonHub {
             spec.policy.background_enabled = false;
         }
         {
-            let guard = self
-                .roots
-                .lock()
-                .map_err(|_| invalid("hub mutex poisoned"))?;
+            let guard = self.lock_roots();
             if let Some(existing) = guard.get(&spec.root) {
                 return Ok(Arc::clone(existing));
             }
         }
-        // Serialize cold loads so concurrent callers do not duplicate work or leak background worker threads
-        let _load_guard = self
-            .load_gate
+        // Serialize cold loads per root so concurrent callers for the same root do not duplicate work,
+        // while allowing independent workspaces to load concurrently without head-of-line blocking.
+        let root_gate = self.root_load_gate(&spec.root);
+        let _load_guard = root_gate
             .lock()
-            .map_err(|_| invalid("load gate poisoned"))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
-            let guard = self
-                .roots
-                .lock()
-                .map_err(|_| invalid("hub mutex poisoned"))?;
+            let guard = self.lock_roots();
             if let Some(existing) = guard.get(&spec.root) {
                 return Ok(Arc::clone(existing));
             }
@@ -323,11 +342,21 @@ impl DaemonHub {
         if !self.local_oneshot {
             self.evict_idle_or_excess_roots();
         }
-        let loaded = ManagedRoot::load(spec.clone())?;
-        let mut guard = self
-            .roots
-            .lock()
-            .map_err(|_| invalid("hub mutex poisoned"))?;
+        let spec_for_load = spec.clone();
+        let loaded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            ManagedRoot::load(spec_for_load)
+        })) {
+            Ok(res) => res?,
+            Err(payload) => {
+                return Err(invalid(format!(
+                    "failed to load workspace root {} (internal panic: {})",
+                    spec.root.display(),
+                    panic_payload_message(payload.as_ref())
+                ))
+                .into());
+            }
+        };
+        let mut guard = self.lock_roots();
         if let Some(old) = guard.insert(spec.root, Arc::clone(&loaded)) {
             old.shutdown();
         }
@@ -336,10 +365,7 @@ impl DaemonHub {
 
     fn loaded_root(&self, requested_root: &Path) -> Result<Option<Arc<ManagedRoot>>> {
         let requested = requested_root.canonicalize()?;
-        let guard = self
-            .roots
-            .lock()
-            .map_err(|_| invalid("hub mutex poisoned"))?;
+        let guard = self.lock_roots();
         Ok(guard
             .iter()
             .filter(|(root, _)| requested.starts_with(root))
@@ -348,12 +374,11 @@ impl DaemonHub {
     }
 
     fn record_trace(&self, trace: Value) {
-        if let Ok(mut guard) = self.traces.lock() {
-            if guard.len() >= 64 {
-                guard.pop_front();
-            }
-            guard.push_back(trace);
+        let mut guard = self.lock_traces();
+        if guard.len() >= 64 {
+            guard.pop_front();
         }
+        guard.push_back(trace);
     }
 
     fn capabilities() -> Value {
@@ -383,7 +408,16 @@ impl DaemonHub {
         }
         let started = Instant::now();
         let trace_id = extract_trace_id(&mut req.arguments);
-        let outcome = self.execute_inner(&req);
+        let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.execute_inner(&req)
+        })) {
+            Ok(res) => res,
+            Err(payload) => Err(invalid(format!(
+                "internal daemon panic: {}",
+                panic_payload_message(payload.as_ref())
+            ))
+            .into()),
+        };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         match outcome {
@@ -424,11 +458,7 @@ impl DaemonHub {
             }
             "test_status" => {
                 let registered = catalog::load()?;
-                let loaded_roots: Vec<PathBuf> = self
-                    .roots
-                    .lock()
-                    .map(|g| g.keys().cloned().collect())
-                    .unwrap_or_default();
+                let loaded_roots: Vec<PathBuf> = self.lock_roots().keys().cloned().collect();
                 let root_status = if let Some(root_path) = &req.root {
                     if let Some(managed) = self.loaded_root(root_path)? {
                         Some(managed.status())
@@ -697,15 +727,17 @@ pub fn serve() -> Result<()> {
                 .spawn(move || {
                     loop {
                         let work = {
-                            let Ok(receiver) = rx_worker.lock() else {
-                                return;
-                            };
+                            let receiver = rx_worker
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
                             receiver.recv()
                         };
                         let Ok(work) = work else {
                             return;
                         };
-                        let _ = handle_connection(work.stream, &hub_worker);
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _ = handle_connection(work.stream, &hub_worker);
+                        }));
                     }
                 })?,
         );
@@ -731,7 +763,9 @@ pub fn serve() -> Result<()> {
                             STOP_REQUESTED.store(true, Ordering::Release);
                             break;
                         }
-                        hub_maint.evict_idle_or_excess_roots();
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            hub_maint.evict_idle_or_excess_roots();
+                        }));
                         last_identity_check = Instant::now();
                     }
                 })?,
@@ -862,9 +896,7 @@ fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
                 },
             };
             let encoded = bincode::serialize(&reply)?;
-            stream.write_all(&u32::try_from(encoded.len())?.to_be_bytes())?;
-            stream.write_all(&encoded)?;
-            stream.flush()?;
+            write_framed(&mut stream, &encoded)?;
             last_activity = Instant::now();
         }
     } else if peek.starts_with(FRAMED_JSON_MAGIC) {
@@ -908,9 +940,7 @@ fn handle_connection(mut stream: UnixStream, hub: &DaemonHub) -> Result<()> {
                 Err(err) => json!({ "error": err }),
             };
             let bytes = serde_json::to_vec(&response_json)?;
-            stream.write_all(&u32::try_from(bytes.len())?.to_be_bytes())?;
-            stream.write_all(&bytes)?;
-            stream.flush()?;
+            write_framed(&mut stream, &bytes)?;
             last_activity = Instant::now();
         }
     } else {
@@ -966,10 +996,7 @@ impl Client {
         if bytes.len() > MAX_WIRE {
             return Err(invalid("request too large").into());
         }
-        self.stream
-            .write_all(&u32::try_from(bytes.len())?.to_be_bytes())?;
-        self.stream.write_all(&bytes)?;
-        self.stream.flush()?;
+        write_framed(&mut self.stream, &bytes)?;
 
         let mut length = [0u8; 4];
         self.reader.read_exact(&mut length)?;
@@ -1036,16 +1063,36 @@ pub fn native_bridge(mut input: impl Read, mut output: impl Write) -> Result<()>
         let mut payload = vec![0u8; len];
         input.read_exact(&mut payload)?;
         let req: Request = serde_json::from_slice(&payload)?;
-        let response_json = match client.call(&req) {
+        let call_outcome = match client.call(&req) {
+            Ok(val) => Ok(val),
+            Err(err) if is_transport_disconnect(err.as_ref()) => match Client::connect() {
+                Ok(mut reconnected) => {
+                    let retry = reconnected.call(&req);
+                    client = reconnected;
+                    retry
+                }
+                Err(_) => return Err(err),
+            },
+            Err(err) => Err(err),
+        };
+        let response_json = match call_outcome {
             Ok(val) => json!({ "result": val }),
             Err(err) if is_transport_disconnect(err.as_ref()) => return Err(err),
             Err(err) => json!({ "error": err.to_string() }),
         };
         let bytes = serde_json::to_vec(&response_json)?;
-        output.write_all(&u32::try_from(bytes.len())?.to_be_bytes())?;
-        output.write_all(&bytes)?;
-        output.flush()?;
+        write_framed(&mut output, &bytes)?;
     }
+}
+
+fn write_framed(stream: &mut impl Write, payload: &[u8]) -> Result<()> {
+    let len_bytes = u32::try_from(payload.len())?.to_be_bytes();
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&len_bytes);
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    Ok(())
 }
 
 fn is_transport_disconnect(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -1155,6 +1202,41 @@ mod tests {
                 .get("load")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
+        );
+    }
+
+    #[test]
+    fn daemon_hub_recovers_from_poisoned_load_gate_and_roots_mutex() {
+        let hub = Arc::new(DaemonHub::new());
+        let hub_for_panic = Arc::clone(&hub);
+        let _ = std::thread::spawn(move || {
+            let _gate = hub_for_panic.load_gate.lock().unwrap();
+            let _roots = hub_for_panic.roots.lock().unwrap();
+            panic!("simulated panic while holding load_gate and roots");
+        })
+        .join();
+
+        assert!(hub.load_gate.is_poisoned());
+        assert!(hub.roots.is_poisoned());
+
+        let pong = hub
+            .execute(Request {
+                root: None,
+                name: "ping".to_string(),
+                arguments: json!({}),
+                compact: false,
+            })
+            .expect("ping succeeds after poison");
+        assert_eq!(pong["ok"], json!(true));
+
+        let temp = tempfile::tempdir().unwrap();
+        let err = hub
+            .get_or_load_root(&temp.path().join("nonexistent-subdir"))
+            .err()
+            .expect("missing directory returns error, not load gate poisoned");
+        assert!(
+            !err.to_string().contains("poisoned"),
+            "unexpected poisoned error: {err}"
         );
     }
 }

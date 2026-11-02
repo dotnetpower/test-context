@@ -53,7 +53,8 @@ export function formatToolResult(operation: string, value: JsonValue): string {
       const total = integerValue(result.total_affected_test_files, 'total_affected_test_files');
       const items = arrayValue(result.affected_tests, 'affected_tests');
       const lines = [`affected_test_files=${total}`];
-      for (const [idx, raw] of items.entries()) {
+      const maxInlineAffected = 50;
+      for (const [idx, raw] of items.slice(0, maxInlineAffected).entries()) {
         const item = recordValue(raw, `affected test ${idx}`);
         const file = stringValue(item.test_file, 'test_file');
         const state = stringValue(item.cache_state, 'cache_state');
@@ -61,6 +62,9 @@ export function formatToolResult(operation: string, value: JsonValue): string {
           .map((c) => stringValue(c, 'chain step'))
           .join(' -> ');
         lines.push(`${file} state=${state} chain=[${chain}]`);
+      }
+      if (items.length > maxInlineAffected) {
+        lines.push(`... and ${items.length - maxInlineAffected} more affected test files`);
       }
       if (Array.isArray(result.untested_modified_files) && result.untested_modified_files.length > 0) {
         const untested = result.untested_modified_files.map((u) => stringValue(u, 'untested file'));
@@ -249,14 +253,18 @@ function readableLines(value: JsonValue, depth: number, label?: string): string[
     if (value.length === 0) {
       return [`${indent}${prefix}(none)`];
     }
+    const maxArrayItems = 40;
     const lines = label ? [`${indent}${label}:`] : [];
-    for (const item of value) {
+    for (const item of value.slice(0, maxArrayItems)) {
       if (item !== null && typeof item === 'object') {
         lines.push(`${indent}-`);
         lines.push(...readableLines(item, depth + 1));
       } else {
         lines.push(`${indent}- ${String(item)}`);
       }
+    }
+    if (value.length > maxArrayItems) {
+      lines.push(`${indent}- ... (${value.length - maxArrayItems} more)`);
     }
     return lines;
   }

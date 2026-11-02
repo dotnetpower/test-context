@@ -262,6 +262,20 @@ pub fn detect_cargo_cmd(_root: &Path) -> Vec<String> {
             return vec![p.to_string_lossy().into_owned()];
         }
     }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let cand = dir.join("cargo");
+            if cand.is_file() {
+                return vec![cand.to_string_lossy().into_owned()];
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let cand = PathBuf::from(home).join(".cargo/bin/cargo");
+        if cand.is_file() {
+            return vec![cand.to_string_lossy().into_owned()];
+        }
+    }
     vec!["cargo".to_string()]
 }
 
@@ -421,7 +435,24 @@ pub fn socket_path() -> Result<PathBuf> {
 }
 
 pub fn load() -> Result<Vec<Spec>> {
+    type RegistryCacheEntry = (PathBuf, (u64, i64, i64), Vec<Spec>);
+    static REGISTRY_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<RegistryCacheEntry>>> =
+        std::sync::OnceLock::new();
     let path = state_dir()?.join("workspaces.json");
+    let stamp = std::fs::metadata(&path)
+        .ok()
+        .map(|m| (m.len(), m.mtime(), m.mtime_nsec()));
+    let cache_mutex = REGISTRY_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Some(current_stamp) = stamp
+        && let Some((cached_path, cached_stamp, cached_specs)) = cache_mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        && cached_path == &path
+        && *cached_stamp == current_stamp
+    {
+        return Ok(cached_specs.clone());
+    }
     match std::fs::File::open(&path) {
         Ok(file) => {
             let mut bytes = Vec::new();
@@ -435,6 +466,12 @@ pub fn load() -> Result<Vec<Spec>> {
                     "at most {MAX_REGISTERED_ROOTS} roots can be registered"
                 ))
                 .into());
+            }
+            if let Some(current_stamp) = stamp {
+                *cache_mutex
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                    Some((path, current_stamp, specs.clone()));
             }
             Ok(specs)
         }

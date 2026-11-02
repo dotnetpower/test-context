@@ -21,7 +21,12 @@ bincode = "1.3"
 name = "tctx"
 path = "src/main.rs"
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
-lto = "thin"
-codegen-units = 1
+incremental = true
 strip = "symbols"

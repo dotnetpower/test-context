@@ -128,6 +128,15 @@ void test('Windows Agent roots preserve absolute Linux paths', () => {
     { root: '/home/test/other', scopes: ['.'], globs: ['*.py'] },
   ];
   assert.equal(resolveWslRoot(roots, '/home/test/repo/src/..'), '/home/test/repo');
+  assert.equal(resolveWslRoot(roots, '/home/test/repo/src/sub'), '/home/test/repo');
+  assert.equal(
+    resolveWslRoot(roots, undefined, ['/home/test/other/src/main.rs']),
+    '/home/test/other',
+  );
+  assert.equal(
+    resolveWslRoot(roots, undefined, ['\\\\wsl.localhost\\Ubuntu-22.04\\home\\test\\repo\\src']),
+    '/home/test/repo',
+  );
   assert.throws(() => resolveWslRoot(roots, undefined), /explicit absolute Linux root/u);
   assert.throws(() => resolveWslRoot(roots, 'C:\\Users\\test'), /absolute Linux path/u);
 });
