@@ -3,7 +3,7 @@
   "repository": "https://github.com/dotnetpower/aks-store-demo.git",
   "target_commit": "61b033448904a930f01d497ce7139aca87a1b12d",
   "tctx_source_commit": "f96e780ffb03704f826ef97f839d712f05642ccd",
-  "tctx_source_tree_sha256": "3a166e07c1572e2856eb2139fd72b60765c90c54f3f7a7ce052bd7e1d780775e",
+  "tctx_source_tree_sha256": "324f24a0bd812ce1e2ed727710ac7824b6c5142c1bbe7f18c71fac22409e0f08",
   "tctx_binary_sha256": "8ee063a3dce5b2704454e973f07e9c060e32cf6bd18aa48671d50d96d1ae29f1",
   "python_version": "3.12.13",
   "sessions": 8,

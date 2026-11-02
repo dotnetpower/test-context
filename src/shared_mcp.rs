@@ -3,11 +3,12 @@ use crate::mcp::MAX_MESSAGE;
 use crate::{Result, invalid};
 use serde_json::{Value, json};
 use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const INSTRUCTIONS: &str = "TCTX (test-context) is a local Rust AST dependency graph, speculative background pytest/cargo-test runner, and content-addressed Ruff pre-flight checker. Use test_run (#tctxNativeRun) FIRST instead of running shell pytest/ruff directly: unchanged tests that already passed in the background return in < 5ms from cache, only uncached/modified tests run, and pre-flight Ruff diagnostics (with optional ruff_fix=true auto-remediation) are surfaced automatically. Use test_affected (#tctxNativeAffected) to see which tests are affected by edited source files, whether the background runner has already verified them, and any pre-checked Ruff errors.";
 
-pub fn serve(mut input: impl BufRead, mut output: impl Write) -> Result<()> {
+pub fn serve(mut input: impl BufRead, output: impl Write) -> Result<()> {
+    let mut output = std::io::BufWriter::with_capacity(64 * 1024, output);
     let default_root = std::env::current_dir().ok();
     let mut line = Vec::new();
     loop {
@@ -154,8 +155,39 @@ fn resolve_tool_root(
     {
         return Ok(Some(PathBuf::from(root_str).canonicalize()?));
     }
-    if let Some(def) = default_root {
-        return Ok(Some(def.canonicalize()?));
+    if let Some(obj) = arguments.as_object() {
+        let mut hints: Vec<&str> = Vec::new();
+        if let Some(f) = obj.get("file").and_then(Value::as_str) {
+            hints.push(f.split("::").next().unwrap_or(f));
+        }
+        for key in ["targets", "files"] {
+            if let Some(arr) = obj.get(key).and_then(Value::as_array) {
+                for item in arr.iter().filter_map(Value::as_str) {
+                    hints.push(item.split("::").next().unwrap_or(item));
+                }
+            }
+        }
+        for hint in hints {
+            let p = Path::new(hint);
+            if p.is_absolute()
+                && let Ok(spec) = crate::catalog::resolve_spec(p)
+            {
+                return Ok(Some(spec.root));
+            }
+        }
+    }
+    if let Some(def) = default_root
+        && let Ok(canon) = def.canonicalize()
+    {
+        if let Ok(spec) = crate::catalog::resolve_spec(&canon) {
+            return Ok(Some(spec.root));
+        }
+        return Ok(Some(canon));
+    }
+    if let Ok(specs) = crate::catalog::load()
+        && specs.len() == 1
+    {
+        return Ok(Some(specs[0].root.clone()));
     }
     if name == "test_status" {
         return Ok(None);

@@ -53,7 +53,7 @@ export function formatToolResult(operation: string, value: JsonValue): string {
       const total = integerValue(result.total_affected_test_files, 'total_affected_test_files');
       const items = arrayValue(result.affected_tests, 'affected_tests');
       const lines = [`affected_test_files=${total}`];
-      const maxInlineAffected = 50;
+      const maxInlineAffected = 30;
       for (const [idx, raw] of items.slice(0, maxInlineAffected).entries()) {
         const item = recordValue(raw, `affected test ${idx}`);
         const file = stringValue(item.test_file, 'test_file');

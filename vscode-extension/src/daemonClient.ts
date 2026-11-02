@@ -19,6 +19,7 @@ import type {
 
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
 const FRAMED_JSON_MAGIC = Buffer.from('TCTXJ1\n', 'ascii');
+const EMPTY_BUFFER = Buffer.alloc(0);
 
 interface PendingResponse {
   resolve(value: JsonValue): void;
@@ -170,7 +171,10 @@ export class DaemonClient {
       throw new RequestCancelledError();
     }
     let firstError: Error | undefined;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    const hadConnectedSocket = Boolean(this.socket && !this.socket.destroyed);
+    const maxAttempts = hadConnectedSocket ? 3 : 2;
+    let serviceStarted = false;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
       try {
         const preparing = performance.now();
         await this.ensureConnected(cancellation);
@@ -222,7 +226,12 @@ export class DaemonClient {
         }
         firstError ??= failure;
         this.disconnect(failure);
-        if (attempt === 0 && this.settings().autoStartService) {
+        const shouldStartService =
+          !serviceStarted &&
+          this.settings().autoStartService &&
+          (!hadConnectedSocket || attempt >= 1);
+        if (shouldStartService && attempt + 1 < maxAttempts) {
+          serviceStarted = true;
           await this.serviceStarter(this.settings());
           await delay(100, cancellation);
         }
@@ -369,7 +378,9 @@ export class DaemonClient {
       return;
     }
     const frame = this.receiveBuffer.subarray(4, length + 4);
-    this.receiveBuffer = this.receiveBuffer.subarray(length + 4);
+    const remaining = this.receiveBuffer.byteLength - (length + 4);
+    this.receiveBuffer =
+      remaining === 0 ? EMPTY_BUFFER : Buffer.from(this.receiveBuffer.subarray(length + 4));
     const pending = this.takePending();
     if (!pending) {
       this.disconnect(new Error('Test Context daemon sent an unsolicited response.'));

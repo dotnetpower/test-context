@@ -121,6 +121,10 @@ pub struct DependencyGraph {
     pub conftest_for_test: BTreeMap<String, Vec<String>>,
     pub file_index_to_path: Vec<String>,
     pub path_to_id: BTreeMap<String, u32>,
+    pub forward_adj: Vec<Vec<u32>>,
+    pub reverse_adj: Vec<Vec<u32>>,
+    pub conftest_paths: BTreeSet<String>,
+    pub symbol_to_test_files: BTreeMap<String, Vec<String>>,
     pub transitive_dep_ids_for_test: BTreeMap<String, Vec<u32>>,
     pub dep_hash_for_test: BTreeMap<String, String>,
     pub config_hashes: BTreeMap<String, String>,
@@ -129,6 +133,8 @@ pub struct DependencyGraph {
     pub environment_hash: String,
     pub runtime_deps_for_test: BTreeMap<String, BTreeSet<String>>,
     pub last_env_ref_digest: String,
+    pub local_python_roots: BTreeSet<String>,
+    pub cached_conventions: Option<serde_json::Value>,
 }
 
 impl Default for DependencyGraph {
@@ -146,6 +152,10 @@ impl DependencyGraph {
             conftest_for_test: BTreeMap::new(),
             file_index_to_path: Vec::new(),
             path_to_id: BTreeMap::new(),
+            forward_adj: Vec::new(),
+            reverse_adj: Vec::new(),
+            conftest_paths: BTreeSet::new(),
+            symbol_to_test_files: BTreeMap::new(),
             transitive_dep_ids_for_test: BTreeMap::new(),
             dep_hash_for_test: BTreeMap::new(),
             config_hashes: BTreeMap::new(),
@@ -154,6 +164,8 @@ impl DependencyGraph {
             environment_hash: String::new(),
             runtime_deps_for_test: BTreeMap::new(),
             last_env_ref_digest: String::new(),
+            local_python_roots: BTreeSet::new(),
+            cached_conventions: None,
         }
     }
 
@@ -468,17 +480,24 @@ impl DependencyGraph {
             .map(|a| a.test_file)
             .collect();
 
+        let mut digest_cache: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         for test_path in affected {
             let Some(reachable_ids) = self.transitive_dep_ids_for_test.get(&test_path) else {
                 continue;
             };
             let mut hasher = base_hasher.clone();
             for &dep_id in reachable_ids {
-                if let Some(dep_path) = self.file_index_to_path.get(dep_id as usize)
-                    && let Some(dep_node) = self.files.get(dep_path)
-                {
-                    hash_dep_node(&mut hasher, dep_path, dep_node);
-                }
+                let bytes = digest_cache.entry(dep_id).or_insert_with(|| {
+                    self.file_index_to_path
+                        .get(dep_id as usize)
+                        .and_then(|dep_path| {
+                            self.files
+                                .get(dep_path)
+                                .map(|dep_node| build_node_hash_bytes(dep_path, dep_node))
+                        })
+                        .unwrap_or_default()
+                });
+                hasher.update(bytes);
             }
             let dep_hash = hex_encode(&hasher.finalize());
             self.dep_hash_for_test.insert(test_path, dep_hash);
@@ -524,19 +543,62 @@ impl DependencyGraph {
         self.conftest_for_test.clear();
         self.file_index_to_path.clear();
         self.path_to_id.clear();
+        self.forward_adj.clear();
+        self.reverse_adj.clear();
+        self.conftest_paths.clear();
+        self.symbol_to_test_files.clear();
         self.transitive_dep_ids_for_test.clear();
         self.dep_hash_for_test.clear();
 
-        for (idx, path) in self.files.keys().enumerate() {
+        let mut has_py_or_proto = false;
+        let mut has_rs = false;
+        let mut has_fe = false;
+        for (idx, (path, node)) in self.files.iter().enumerate() {
             let id = u32::try_from(idx).unwrap_or(u32::MAX);
             self.file_index_to_path.push(path.clone());
             self.path_to_id.insert(path.clone(), id);
+            if node.is_conftest {
+                self.conftest_paths.insert(path.clone());
+            }
+            if node.is_test {
+                for sym in &node.parsed.test_symbols {
+                    self.symbol_to_test_files
+                        .entry(sym.clone())
+                        .or_default()
+                        .push(path.clone());
+                }
+            }
+            if path.ends_with(".py") || path.ends_with(".proto") {
+                has_py_or_proto = true;
+            } else if path.ends_with(".rs") {
+                has_rs = true;
+            } else if is_frontend_source_path(path) || is_stylesheet_path(path) {
+                has_fe = true;
+            }
         }
+        self.file_index_to_path.shrink_to_fit();
 
-        let module_index = ModuleIndex::build(&self.files);
-        let fixture_providers = build_fixture_provider_index(&self.files);
-        let rust_index = RustModuleIndex::build(&self.files);
-        let frontend_index = FrontendModuleIndex::build(&self.files);
+        let module_index = if has_py_or_proto {
+            ModuleIndex::build(&self.files)
+        } else {
+            ModuleIndex::default()
+        };
+        let fixture_providers = if has_py_or_proto {
+            build_fixture_provider_index(&self.files)
+        } else {
+            BTreeMap::new()
+        };
+        let rust_index = if has_rs {
+            RustModuleIndex::build(&self.files)
+        } else {
+            RustModuleIndex::default()
+        };
+        let frontend_index = if has_fe {
+            FrontendModuleIndex::build(&self.files)
+        } else {
+            FrontendModuleIndex::default()
+        };
+        let bridge_index = BridgeProviderIndex::build(&self.files);
 
         if self.files.len() >= 128 {
             let entries: Vec<(&String, &FileNode)> = self
@@ -554,6 +616,7 @@ impl DependencyGraph {
             let rs_ref = &rust_index;
             let fe_ref = &frontend_index;
             let fix_ref = &fixture_providers;
+            let br_ref = &bridge_index;
             let rt_ref = &self.runtime_deps_for_test;
             let chunk_deps: Vec<Vec<(String, BTreeSet<String>)>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = entries
@@ -565,7 +628,7 @@ impl DependencyGraph {
                                 .map(|&(path, node)| {
                                     let deps = compute_direct_dependencies(
                                         path, node, files_ref, mod_ref, rs_ref, fe_ref, fix_ref,
-                                        rt_ref,
+                                        br_ref, rt_ref,
                                     );
                                     (path.clone(), deps)
                                 })
@@ -602,6 +665,7 @@ impl DependencyGraph {
                     &rust_index,
                     &frontend_index,
                     &fixture_providers,
+                    &bridge_index,
                     &self.runtime_deps_for_test,
                 );
                 for dep in &deps {
@@ -614,24 +678,26 @@ impl DependencyGraph {
             }
         }
 
-        // Build compact adjacency list in terms of u32 file IDs
+        // Build compact forward and reverse adjacency lists in terms of u32 file IDs
         let num_files = self.file_index_to_path.len();
         let mut adj: Vec<Vec<u32>> = vec![Vec::new(); num_files];
+        let mut rev_adj: Vec<Vec<u32>> = vec![Vec::new(); num_files];
         for (src, targets) in &self.direct_imports {
             if let Some(&src_id) = self.path_to_id.get(src) {
-                adj[src_id as usize] = targets
-                    .iter()
-                    .filter_map(|t| self.path_to_id.get(t).copied())
-                    .collect();
+                let mut row = Vec::with_capacity(targets.len());
+                for t in targets {
+                    if let Some(&dst_id) = self.path_to_id.get(t) {
+                        row.push(dst_id);
+                        rev_adj[dst_id as usize].push(src_id);
+                    }
+                }
+                adj[src_id as usize] = row;
             }
         }
-
-        let conftests: BTreeSet<String> = self
-            .files
-            .values()
-            .filter(|n| n.is_conftest)
-            .map(|n| n.path.clone())
-            .collect();
+        for r in &mut rev_adj {
+            r.shrink_to_fit();
+        }
+        let conftests = self.conftest_paths.clone();
 
         let test_files: Vec<String> = self
             .files
@@ -788,6 +854,10 @@ impl DependencyGraph {
                 self.dep_hash_for_test.insert(test_path, dep_hash);
             }
         }
+        self.forward_adj = adj;
+        self.reverse_adj = rev_adj;
+        self.local_python_roots = self.compute_local_python_roots();
+        self.cached_conventions = Some(self.compute_test_conventions_summary());
     }
 
     pub fn recompute_structure_incremental(&mut self, changed_files: &[String]) {
@@ -815,10 +885,40 @@ impl DependencyGraph {
             .into_iter()
             .map(|item| item.test_file)
             .collect();
-        let module_index = ModuleIndex::build(&self.files);
-        let rust_index = RustModuleIndex::build(&self.files);
-        let frontend_index = FrontendModuleIndex::build(&self.files);
-        let fixture_providers = build_fixture_provider_index(&self.files);
+        let need_py = changed_files
+            .iter()
+            .any(|p| p.ends_with(".py") || p.ends_with(".proto"));
+        let need_rs = changed_files
+            .iter()
+            .any(|p| p.ends_with(".rs") || p.ends_with(".py"));
+        let need_fe = changed_files
+            .iter()
+            .any(|p| is_frontend_source_path(p) || is_stylesheet_path(p));
+        let module_index = if need_py {
+            ModuleIndex::build(&self.files)
+        } else {
+            ModuleIndex::default()
+        };
+        let rust_index = if need_rs {
+            RustModuleIndex::build(&self.files)
+        } else {
+            RustModuleIndex::default()
+        };
+        let frontend_index = if need_fe {
+            FrontendModuleIndex::build(&self.files)
+        } else {
+            FrontendModuleIndex::default()
+        };
+        let fixture_providers = if need_py {
+            build_fixture_provider_index(&self.files)
+        } else {
+            BTreeMap::new()
+        };
+        let bridge_index = BridgeProviderIndex::build(&self.files);
+        self.cached_conventions = None;
+        if need_py {
+            self.local_python_roots = self.compute_local_python_roots();
+        }
         let mut replacements = BTreeMap::new();
         for path in changed_files {
             let Some(node) = self.files.get(path) else {
@@ -835,15 +935,37 @@ impl DependencyGraph {
                     &rust_index,
                     &frontend_index,
                     &fixture_providers,
+                    &bridge_index,
                     &self.runtime_deps_for_test,
                 ),
             );
         }
         for (path, new_deps) in replacements {
+            let src_id = self.path_to_id.get(&path).copied();
             if let Some(old_deps) = self.direct_imports.insert(path.clone(), new_deps.clone()) {
                 for dep in old_deps {
                     if let Some(importers) = self.reverse_imports.get_mut(&dep) {
                         importers.remove(&path);
+                    }
+                    if let (Some(s_id), Some(&d_id)) = (src_id, self.path_to_id.get(&dep))
+                        && let Some(rev_row) = self.reverse_adj.get_mut(d_id as usize)
+                    {
+                        rev_row.retain(|&x| x != s_id);
+                    }
+                }
+            }
+            if let Some(s_id) = src_id
+                && let Some(fwd_row) = self.forward_adj.get_mut(s_id as usize)
+            {
+                fwd_row.clear();
+                for dep in &new_deps {
+                    if let Some(&d_id) = self.path_to_id.get(dep) {
+                        fwd_row.push(d_id);
+                        if let Some(rev_row) = self.reverse_adj.get_mut(d_id as usize)
+                            && !rev_row.contains(&s_id)
+                        {
+                            rev_row.push(s_id);
+                        }
                     }
                 }
             }
@@ -868,29 +990,15 @@ impl DependencyGraph {
         if tests.is_empty() {
             return;
         }
-        if self.path_to_id.len() != self.file_index_to_path.len() {
-            self.path_to_id.clear();
-            for (idx, path) in self.file_index_to_path.iter().enumerate() {
-                self.path_to_id
-                    .insert(path.clone(), u32::try_from(idx).unwrap_or(u32::MAX));
-            }
+        if self.path_to_id.len() != self.file_index_to_path.len()
+            || self.forward_adj.len() != self.file_index_to_path.len()
+        {
+            self.recompute_edges();
+            return;
         }
-        let mut adj: Vec<Vec<u32>> = vec![Vec::new(); self.file_index_to_path.len()];
-        for (source, deps) in &self.direct_imports {
-            if let Some(&source_id) = self.path_to_id.get(source) {
-                adj[source_id as usize] = deps
-                    .iter()
-                    .filter_map(|dep| self.path_to_id.get(dep).copied())
-                    .collect();
-            }
-        }
-        let conftests: BTreeSet<String> = self
-            .files
-            .values()
-            .filter(|node| node.is_conftest)
-            .map(|node| node.path.clone())
-            .collect();
+        let conftests = self.conftest_paths.clone();
         let base_hasher = self.build_base_hasher();
+        let mut digest_cache: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
         let mut visited_stamp = vec![0u32; self.file_index_to_path.len()];
         let mut epoch = 0u32;
         let mut queue = VecDeque::new();
@@ -919,7 +1027,7 @@ impl DependencyGraph {
                 }
             }
             while let Some(id) = queue.pop_front() {
-                for &next in &adj[id as usize] {
+                for &next in &self.forward_adj[id as usize] {
                     if visited_stamp[next as usize] != epoch {
                         visited_stamp[next as usize] = epoch;
                         reachable.push(next);
@@ -930,10 +1038,14 @@ impl DependencyGraph {
             reachable.sort_unstable();
             let mut hasher = base_hasher.clone();
             for &id in &reachable {
-                let path = &self.file_index_to_path[id as usize];
-                if let Some(node) = self.files.get(path) {
-                    hash_dep_node(&mut hasher, path, node);
-                }
+                let bytes = digest_cache.entry(id).or_insert_with(|| {
+                    let path = &self.file_index_to_path[id as usize];
+                    self.files
+                        .get(path)
+                        .map(|node| build_node_hash_bytes(path, node))
+                        .unwrap_or_default()
+                });
+                hasher.update(bytes);
             }
             self.conftest_for_test
                 .insert(test_path.clone(), conftest_chain);
@@ -954,10 +1066,7 @@ impl DependencyGraph {
         self.external_preload_modules_for_tests(&self.test_files())
     }
 
-    pub fn external_preload_modules_for_tests(&self, test_files: &[String]) -> Vec<String> {
-        if !test_files.iter().any(|tf| tf.ends_with(".py")) {
-            return Vec::new();
-        }
+    fn compute_local_python_roots(&self) -> BTreeSet<String> {
         let mut local_roots = BTreeSet::new();
         for path in self.files.keys() {
             if !path.ends_with(".py") {
@@ -972,6 +1081,20 @@ impl DependencyGraph {
                 local_roots.insert(stem.to_string());
             }
         }
+        local_roots
+    }
+
+    pub fn external_preload_modules_for_tests(&self, test_files: &[String]) -> Vec<String> {
+        if !test_files.iter().any(|tf| tf.ends_with(".py")) {
+            return Vec::new();
+        }
+        let computed_roots;
+        let local_roots = if !self.local_python_roots.is_empty() {
+            &self.local_python_roots
+        } else {
+            computed_roots = self.compute_local_python_roots();
+            &computed_roots
+        };
         let excluded = [
             "pytest",
             "_pytest",
@@ -1035,6 +1158,40 @@ impl DependencyGraph {
 
     /// Computes all transitively affected Python files (both application modules and test files) for a list of modified paths.
     pub fn affected_modules(&self, changed_files: &[String]) -> Vec<String> {
+        let num_files = self.file_index_to_path.len();
+        if num_files > 0 && self.reverse_adj.len() == num_files {
+            let mut visited = vec![false; num_files];
+            let mut queue: VecDeque<u32> = VecDeque::new();
+            let mut extra: BTreeSet<String> = BTreeSet::new();
+            for raw in changed_files {
+                let norm = raw.trim().trim_start_matches("./").replace('\\', "/");
+                if norm.is_empty() {
+                    continue;
+                }
+                if let Some(&id) = self.path_to_id.get(&norm) {
+                    if !visited[id as usize] {
+                        visited[id as usize] = true;
+                        queue.push_back(id);
+                    }
+                } else {
+                    extra.insert(norm);
+                }
+            }
+            while let Some(curr_id) = queue.pop_front() {
+                for &imp_id in &self.reverse_adj[curr_id as usize] {
+                    if !visited[imp_id as usize] {
+                        visited[imp_id as usize] = true;
+                        queue.push_back(imp_id);
+                    }
+                }
+            }
+            for (idx, &flag) in visited.iter().enumerate() {
+                if flag {
+                    extra.insert(self.file_index_to_path[idx].clone());
+                }
+            }
+            return extra.into_iter().collect();
+        }
         let mut queue: VecDeque<String> = VecDeque::new();
         let mut visited: BTreeSet<String> = BTreeSet::new();
         for raw in changed_files {
@@ -1055,9 +1212,33 @@ impl DependencyGraph {
         visited.into_iter().collect()
     }
 
+    fn reconstruct_chain(&self, parent_id: &[u32], leaf_id: u32) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut curr = leaf_id;
+        while curr != u32::MAX {
+            ids.push(curr);
+            let next = parent_id[curr as usize];
+            if next == curr {
+                break;
+            }
+            curr = next;
+        }
+        ids.reverse();
+        ids.into_iter()
+            .filter_map(|id| self.file_index_to_path.get(id as usize).cloned())
+            .collect()
+    }
+
     /// Computes affected test files and shortest dependency chains for a list of modified relative file paths.
     pub fn affected_tests(&self, changed_files: &[String]) -> Vec<AffectedTest> {
         let mut reasons: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let num_files = self.file_index_to_path.len();
+        let use_fast_adj = num_files > 0
+            && self.reverse_adj.len() == num_files
+            && self.path_to_id.len() == num_files;
+        let mut visited_ids = vec![false; if use_fast_adj { num_files } else { 0 }];
+        let mut parent_id = vec![u32::MAX; if use_fast_adj { num_files } else { 0 }];
+        let mut id_queue: VecDeque<u32> = VecDeque::new();
         let mut queue: VecDeque<(String, Vec<String>)> = VecDeque::new();
         let mut visited: BTreeSet<String> = BTreeSet::new();
 
@@ -1091,7 +1272,6 @@ impl DependencyGraph {
                         continue;
                     }
                     if is_rust_only_cfg && !is_rs_test {
-                        // Also check if Python test transitively depends on any .rs file (PyO3 hybrid)
                         let depends_on_rs = self
                             .transitive_deps_for(test_path)
                             .iter()
@@ -1115,58 +1295,162 @@ impl DependencyGraph {
             {
                 let scope_dir = conftest_scope_dir(&norm);
                 let helper_lang = file_language_family(&norm);
-                for test_path in self.dep_hash_for_test.keys() {
-                    if file_language_family(test_path) != helper_lang {
-                        continue;
+                if scope_dir.is_empty() {
+                    for test_path in self.dep_hash_for_test.keys() {
+                        if file_language_family(test_path) == helper_lang
+                            && self.is_conftest_used_by_test(&norm, test_path)
+                        {
+                            reasons
+                                .entry(test_path.clone())
+                                .or_insert_with(|| vec![norm.clone(), test_path.clone()]);
+                        }
                     }
-                    if (scope_dir.is_empty() || test_path.starts_with(&format!("{scope_dir}/")))
-                        && self.is_conftest_used_by_test(&norm, test_path)
+                } else {
+                    let prefix = format!("{scope_dir}/");
+                    for (test_path, _) in self
+                        .dep_hash_for_test
+                        .range(prefix.clone()..)
+                        .take_while(|(p, _)| p.starts_with(&prefix))
                     {
-                        reasons
-                            .entry(test_path.clone())
-                            .or_insert_with(|| vec![norm.clone(), test_path.clone()]);
+                        if file_language_family(test_path) == helper_lang
+                            && self.is_conftest_used_by_test(&norm, test_path)
+                        {
+                            reasons
+                                .entry(test_path.clone())
+                                .or_insert_with(|| vec![norm.clone(), test_path.clone()]);
+                        }
                     }
                 }
             }
 
             // 3. Reverse import graph traversal
-            if visited.insert(norm.clone()) {
+            if use_fast_adj {
+                if let Some(&id) = self.path_to_id.get(&norm)
+                    && !visited_ids[id as usize]
+                {
+                    visited_ids[id as usize] = true;
+                    parent_id[id as usize] = u32::MAX;
+                    id_queue.push_back(id);
+                }
+            } else if visited.insert(norm.clone()) {
                 queue.push_back((norm.clone(), vec![norm]));
             }
         }
 
-        while let Some((curr, chain)) = queue.pop_front() {
-            if let Some(node) = self.files.get(&curr) {
-                if node.is_test {
-                    reasons.entry(curr.clone()).or_insert_with(|| chain.clone());
-                }
-                if node.is_conftest {
-                    let scope_dir = conftest_scope_dir(&curr);
-                    let helper_lang = file_language_family(&curr);
-                    for test_path in self.dep_hash_for_test.keys() {
-                        if file_language_family(test_path) != helper_lang {
-                            continue;
-                        }
-                        if (scope_dir.is_empty() || test_path.starts_with(&format!("{scope_dir}/")))
-                            && self.is_conftest_used_by_test(&curr, test_path)
-                        {
-                            reasons.entry(test_path.clone()).or_insert_with(|| {
-                                let mut c = chain.clone();
-                                if c.last() != Some(test_path) {
-                                    c.push(test_path.clone());
+        if use_fast_adj {
+            while let Some(curr_id) = id_queue.pop_front() {
+                let curr_path = &self.file_index_to_path[curr_id as usize];
+                if let Some(node) = self.files.get(curr_path) {
+                    if node.is_test && !reasons.contains_key(curr_path) {
+                        reasons.insert(
+                            curr_path.clone(),
+                            self.reconstruct_chain(&parent_id, curr_id),
+                        );
+                    }
+                    if node.is_conftest {
+                        let scope_dir = conftest_scope_dir(curr_path);
+                        let helper_lang = file_language_family(curr_path);
+                        let mut cf_chain: Option<Vec<String>> = None;
+                        if scope_dir.is_empty() {
+                            for test_path in self.dep_hash_for_test.keys() {
+                                if !reasons.contains_key(test_path)
+                                    && file_language_family(test_path) == helper_lang
+                                    && self.is_conftest_used_by_test(curr_path, test_path)
+                                {
+                                    let base = cf_chain.get_or_insert_with(|| {
+                                        self.reconstruct_chain(&parent_id, curr_id)
+                                    });
+                                    let mut c = base.clone();
+                                    if c.last() != Some(test_path) {
+                                        c.push(test_path.clone());
+                                    }
+                                    reasons.insert(test_path.clone(), c);
                                 }
-                                c
-                            });
+                            }
+                        } else {
+                            let prefix = format!("{scope_dir}/");
+                            for (test_path, _) in self
+                                .dep_hash_for_test
+                                .range(prefix.clone()..)
+                                .take_while(|(p, _)| p.starts_with(&prefix))
+                            {
+                                if !reasons.contains_key(test_path)
+                                    && file_language_family(test_path) == helper_lang
+                                    && self.is_conftest_used_by_test(curr_path, test_path)
+                                {
+                                    let base = cf_chain.get_or_insert_with(|| {
+                                        self.reconstruct_chain(&parent_id, curr_id)
+                                    });
+                                    let mut c = base.clone();
+                                    if c.last() != Some(test_path) {
+                                        c.push(test_path.clone());
+                                    }
+                                    reasons.insert(test_path.clone(), c);
+                                }
+                            }
                         }
                     }
                 }
+                for &imp_id in &self.reverse_adj[curr_id as usize] {
+                    if !visited_ids[imp_id as usize] {
+                        visited_ids[imp_id as usize] = true;
+                        parent_id[imp_id as usize] = curr_id;
+                        id_queue.push_back(imp_id);
+                    }
+                }
             }
-            if let Some(importers) = self.reverse_imports.get(&curr) {
-                for importer in importers {
-                    if visited.insert(importer.clone()) {
-                        let mut next_chain = chain.clone();
-                        next_chain.push(importer.clone());
-                        queue.push_back((importer.clone(), next_chain));
+        } else {
+            while let Some((curr, chain)) = queue.pop_front() {
+                if let Some(node) = self.files.get(&curr) {
+                    if node.is_test {
+                        reasons.entry(curr.clone()).or_insert_with(|| chain.clone());
+                    }
+                    if node.is_conftest {
+                        let scope_dir = conftest_scope_dir(&curr);
+                        let helper_lang = file_language_family(&curr);
+                        if scope_dir.is_empty() {
+                            for test_path in self.dep_hash_for_test.keys() {
+                                if file_language_family(test_path) == helper_lang
+                                    && self.is_conftest_used_by_test(&curr, test_path)
+                                {
+                                    reasons.entry(test_path.clone()).or_insert_with(|| {
+                                        let mut c = chain.clone();
+                                        if c.last() != Some(test_path) {
+                                            c.push(test_path.clone());
+                                        }
+                                        c
+                                    });
+                                }
+                            }
+                        } else {
+                            let prefix = format!("{scope_dir}/");
+                            for (test_path, _) in self
+                                .dep_hash_for_test
+                                .range(prefix.clone()..)
+                                .take_while(|(p, _)| p.starts_with(&prefix))
+                            {
+                                if file_language_family(test_path) == helper_lang
+                                    && self.is_conftest_used_by_test(&curr, test_path)
+                                {
+                                    reasons.entry(test_path.clone()).or_insert_with(|| {
+                                        let mut c = chain.clone();
+                                        if c.last() != Some(test_path) {
+                                            c.push(test_path.clone());
+                                        }
+                                        c
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(importers) = self.reverse_imports.get(&curr) {
+                    for importer in importers {
+                        if visited.insert(importer.clone()) {
+                            let mut next_chain = chain.clone();
+                            next_chain.push(importer.clone());
+                            queue.push_back((importer.clone(), next_chain));
+                        }
                     }
                 }
             }
@@ -1199,22 +1483,30 @@ impl DependencyGraph {
             .get(&norm)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
-        let direct_imported_by = self
+        let mut direct_imported_by: Vec<String> = self
             .reverse_imports
             .get(&norm)
             .map(|s| s.iter().cloned().collect())
             .unwrap_or_default();
-        let transitive_dependencies = self.transitive_deps_for(&norm);
+        direct_imported_by.truncate(50);
+        let mut transitive_dependencies = self.transitive_deps_for(&norm);
+        transitive_dependencies.truncate(50);
         let conftest_chain = self
             .conftest_for_test
             .get(&norm)
             .cloned()
             .unwrap_or_default();
-        let affected_tests = self
-            .affected_tests(std::slice::from_ref(&norm))
-            .into_iter()
-            .map(|a| a.test_file)
-            .collect();
+        let mut affected_raw = self.affected_tests(std::slice::from_ref(&norm));
+        if affected_raw.len() > 50 {
+            affected_raw.sort_by(|a, b| {
+                a.reason_chain
+                    .len()
+                    .cmp(&b.reason_chain.len())
+                    .then_with(|| a.test_file.cmp(&b.test_file))
+            });
+            affected_raw.truncate(50);
+        }
+        let affected_tests = affected_raw.into_iter().map(|a| a.test_file).collect();
         let language = if norm.ends_with(".rs") {
             "rust"
         } else if norm.ends_with(".py") {
@@ -1307,7 +1599,7 @@ impl DependencyGraph {
                 .parsed
                 .fixtures_used
                 .iter()
-                .any(|fx| cf_node.parsed.fixtures_defined.contains(fx))
+                .any(|fx| cf_node.parsed.fixtures_defined.binary_search(fx).is_ok())
         {
             return true;
         }
@@ -1315,6 +1607,103 @@ impl DependencyGraph {
             && direct.contains(conftest_path)
         {
             return true;
+        }
+        false
+    }
+
+    fn has_any_affected_test(&self, norm: &str) -> bool {
+        let num_files = self.file_index_to_path.len();
+        if num_files > 0
+            && self.reverse_adj.len() == num_files
+            && let Some(&start_id) = self.path_to_id.get(norm)
+        {
+            let mut visited = vec![false; num_files];
+            let mut queue: VecDeque<u32> = VecDeque::new();
+            visited[start_id as usize] = true;
+            queue.push_back(start_id);
+            while let Some(curr_id) = queue.pop_front() {
+                let curr = &self.file_index_to_path[curr_id as usize];
+                if let Some(node) = self.files.get(curr) {
+                    if node.is_test && self.dep_hash_for_test.contains_key(curr) {
+                        return true;
+                    }
+                    if node.is_conftest {
+                        let scope_dir = conftest_scope_dir(curr);
+                        let helper_lang = file_language_family(curr);
+                        if scope_dir.is_empty() {
+                            if self.dep_hash_for_test.keys().any(|tp| {
+                                file_language_family(tp) == helper_lang
+                                    && self.is_conftest_used_by_test(curr, tp)
+                            }) {
+                                return true;
+                            }
+                        } else {
+                            let prefix = format!("{scope_dir}/");
+                            if self
+                                .dep_hash_for_test
+                                .range(prefix.clone()..)
+                                .take_while(|(p, _)| p.starts_with(&prefix))
+                                .any(|(tp, _)| {
+                                    file_language_family(tp) == helper_lang
+                                        && self.is_conftest_used_by_test(curr, tp)
+                                })
+                            {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                for &imp_id in &self.reverse_adj[curr_id as usize] {
+                    if !visited[imp_id as usize] {
+                        visited[imp_id as usize] = true;
+                        queue.push_back(imp_id);
+                    }
+                }
+            }
+            return false;
+        }
+        let mut queue: VecDeque<&str> = VecDeque::new();
+        let mut visited: BTreeSet<&str> = BTreeSet::new();
+        visited.insert(norm);
+        queue.push_back(norm);
+        while let Some(curr) = queue.pop_front() {
+            if let Some(node) = self.files.get(curr) {
+                if node.is_test && self.dep_hash_for_test.contains_key(curr) {
+                    return true;
+                }
+                if node.is_conftest {
+                    let scope_dir = conftest_scope_dir(curr);
+                    let helper_lang = file_language_family(curr);
+                    if scope_dir.is_empty() {
+                        if self.dep_hash_for_test.keys().any(|tp| {
+                            file_language_family(tp) == helper_lang
+                                && self.is_conftest_used_by_test(curr, tp)
+                        }) {
+                            return true;
+                        }
+                    } else {
+                        let prefix = format!("{scope_dir}/");
+                        if self
+                            .dep_hash_for_test
+                            .range(prefix.clone()..)
+                            .take_while(|(p, _)| p.starts_with(&prefix))
+                            .any(|(tp, _)| {
+                                file_language_family(tp) == helper_lang
+                                    && self.is_conftest_used_by_test(curr, tp)
+                            })
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            if let Some(importers) = self.reverse_imports.get(curr) {
+                for importer in importers {
+                    if visited.insert(importer.as_str()) {
+                        queue.push_back(importer.as_str());
+                    }
+                }
+            }
         }
         false
     }
@@ -1330,7 +1719,7 @@ impl DependencyGraph {
             if node.is_test || node.is_conftest || node.is_config {
                 continue;
             }
-            if self.affected_tests(std::slice::from_ref(&norm)).is_empty() {
+            if !self.has_any_affected_test(&norm) {
                 untested.push(norm);
             }
         }
@@ -1339,6 +1728,9 @@ impl DependencyGraph {
 
     /// Suggests candidate test files by symbol/stem similarity when static imports are absent (e.g., dynamic dispatch).
     pub fn suggest_tests_for_untested(&self, source_files: &[String]) -> Vec<String> {
+        if source_files.is_empty() {
+            return Vec::new();
+        }
         let mut suggestions = BTreeSet::new();
         for src in source_files {
             let stem = Path::new(src)
@@ -1353,21 +1745,24 @@ impl DependencyGraph {
                     n.parsed
                         .defined_symbols
                         .iter()
-                        .filter(|s| !s.contains(':'))
+                        .filter(|s| !s.contains(':') && s.len() >= 4)
                         .map(|s| s.to_ascii_lowercase())
                         .collect()
                 })
                 .unwrap_or_default();
             for test_path in self.dep_hash_for_test.keys() {
-                let test_lower = test_path.to_ascii_lowercase();
-                if !stem.is_empty() && stem.len() >= 3 && test_lower.contains(&stem) {
+                if stem.len() >= 3 && contains_ascii_case_insensitive(test_path, stem.as_bytes()) {
                     suggestions.insert(test_path.clone());
                     continue;
                 }
-                if let Some(t_node) = self.files.get(test_path) {
+                if !defined.is_empty()
+                    && let Some(t_node) = self.files.get(test_path)
+                {
                     for t_sym in &t_node.parsed.test_symbols {
-                        let t_sym_low = t_sym.to_ascii_lowercase();
-                        if defined.iter().any(|d| d.len() >= 4 && t_sym_low.contains(d)) {
+                        if defined
+                            .iter()
+                            .any(|d| contains_ascii_case_insensitive(t_sym, d.as_bytes()))
+                        {
                             suggestions.insert(test_path.clone());
                             break;
                         }
@@ -1380,6 +1775,13 @@ impl DependencyGraph {
 
     /// Summarizes repository test conventions (frameworks, fixtures, markers) for AI coding agents.
     pub fn test_conventions_summary(&self) -> serde_json::Value {
+        if let Some(ref cached) = self.cached_conventions {
+            return cached.clone();
+        }
+        self.compute_test_conventions_summary()
+    }
+
+    fn compute_test_conventions_summary(&self) -> serde_json::Value {
         let mut frameworks = BTreeSet::new();
         let mut fixtures = BTreeSet::new();
         let mut markers = BTreeSet::new();
@@ -1443,11 +1845,13 @@ impl DependencyGraph {
             // Directory prefix match for tests under `norm/`
             let dir_prefix = format!("{norm}/");
             let mut matched_dir = false;
-            for test_path in self.dep_hash_for_test.keys() {
-                if test_path.starts_with(&dir_prefix) {
-                    selected.insert(test_path.clone());
-                    matched_dir = true;
-                }
+            for (test_path, _) in self
+                .dep_hash_for_test
+                .range(dir_prefix.clone()..)
+                .take_while(|(p, _)| p.starts_with(&dir_prefix))
+            {
+                selected.insert(test_path.clone());
+                matched_dir = true;
             }
             // Also check if `norm` is a source file (or source directory) and expand affected tests via AST graph
             if self.files.contains_key(&norm) {
@@ -1458,9 +1862,9 @@ impl DependencyGraph {
                 // Source directory prefix
                 let source_files: Vec<String> = self
                     .files
-                    .keys()
-                    .filter(|p| p.starts_with(&dir_prefix))
-                    .cloned()
+                    .range(dir_prefix.clone()..)
+                    .take_while(|(p, _)| p.starts_with(&dir_prefix))
+                    .map(|(p, _)| p.clone())
                     .collect();
                 if !source_files.is_empty() {
                     for affected in self.affected_tests(&source_files) {
@@ -1472,13 +1876,19 @@ impl DependencyGraph {
                     && !is_frontend_source_path(&norm)
                 {
                     // Exact test symbol match (e.g. `test_add_unit` or `test_create_user`)
-                    for test_path in self.dep_hash_for_test.keys() {
-                        if self
-                            .files
-                            .get(test_path)
-                            .is_some_and(|n| n.parsed.test_symbols.contains(&norm))
-                        {
-                            selected.insert(test_path.clone());
+                    if let Some(matched_files) = self.symbol_to_test_files.get(&norm) {
+                        for tf in matched_files {
+                            selected.insert(tf.clone());
+                        }
+                    } else {
+                        for test_path in self.dep_hash_for_test.keys() {
+                            if self
+                                .files
+                                .get(test_path)
+                                .is_some_and(|n| n.parsed.test_symbols.binary_search(&norm).is_ok())
+                            {
+                                selected.insert(test_path.clone());
+                            }
                         }
                     }
                 }
@@ -1488,10 +1898,15 @@ impl DependencyGraph {
     }
 
     pub fn suggest_closest_targets(&self, raw_targets: &[String]) -> Vec<String> {
+        let include_symbols = raw_targets
+            .iter()
+            .any(|r| r.contains("::") || !r.trim_start_matches("./").contains('/'));
         let mut candidates = BTreeSet::new();
         for test_path in self.dep_hash_for_test.keys() {
             candidates.insert(test_path.clone());
-            if let Some(node) = self.files.get(test_path) {
+            if include_symbols
+                && let Some(node) = self.files.get(test_path)
+            {
                 for sym in &node.parsed.test_symbols {
                     candidates.insert(format!("{test_path}::{sym}"));
                 }
@@ -1534,6 +1949,21 @@ impl DependencyGraph {
     }
 }
 
+fn contains_ascii_case_insensitive(haystack: &str, needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let hay = haystack.as_bytes();
+    if hay.len() < needle_lower.len() {
+        return false;
+    }
+    hay.windows(needle_lower.len()).any(|win| {
+        win.iter()
+            .zip(needle_lower.iter())
+            .all(|(&a, &b)| a.to_ascii_lowercase() == b)
+    })
+}
+
 fn edit_distance(a: &str, b: &str) -> usize {
     const MAX_LEN: usize = 128;
     const CUTOFF: usize = 8;
@@ -1570,6 +2000,32 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[m]
 }
 
+#[derive(Default)]
+struct BridgeProviderIndex {
+    providers_by_tag: BTreeMap<String, Vec<String>>,
+}
+
+impl BridgeProviderIndex {
+    fn build(files: &BTreeMap<String, FileNode>) -> Self {
+        let mut providers_by_tag: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (path, node) in files {
+            for sym in &node.parsed.defined_symbols {
+                if sym.starts_with("api_route:")
+                    || sym.starts_with("ctx_def:")
+                    || sym.starts_with("wasm:")
+                    || sym.starts_with("proto:")
+                {
+                    providers_by_tag
+                        .entry(sym.clone())
+                        .or_default()
+                        .push(path.clone());
+                }
+            }
+        }
+        Self { providers_by_tag }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_direct_dependencies(
     path: &str,
@@ -1579,6 +2035,7 @@ fn compute_direct_dependencies(
     rust_index: &RustModuleIndex,
     frontend_index: &FrontendModuleIndex,
     fixture_providers: &BTreeMap<String, Vec<String>>,
+    bridge_index: &BridgeProviderIndex,
     runtime_deps_for_test: &BTreeMap<String, BTreeSet<String>>,
 ) -> BTreeSet<String> {
     let mut deps = BTreeSet::new();
@@ -1611,37 +2068,27 @@ fn compute_direct_dependencies(
             }
         }
     }
-    // Cross-language & symbol-level bridges:
+    // Cross-language & symbol-level bridges via O(1) BridgeProviderIndex lookup:
     // 1) WebAssembly (`#[wasm_bindgen]` Rust -> Frontend TS/JS)
     // 2) Full-Stack API routes (`api_route:/api/...` -> `api_call:/api/...`)
     // 3) React Context (`ctx_def:<Name>` -> `ctx_use:<Name>`)
     // 4) Protobuf (`.proto` -> generated `_pb2.py`, `.pb.go`, `_pb.ts`, Rust prost modules)
     for sym in &node.parsed.defined_symbols {
-        if let Some(api_path) = sym.strip_prefix("api_call:") {
-            let target_tag = format!("api_route:{api_path}");
-            for (other_path, other_node) in files {
-                if other_path != path && other_node.parsed.defined_symbols.contains(&target_tag) {
-                    deps.insert(other_path.clone());
-                }
-            }
+        let target_tag = if let Some(api_path) = sym.strip_prefix("api_call:") {
+            Some(format!("api_route:{api_path}"))
         } else if let Some(ctx_name) = sym.strip_prefix("ctx_use:") {
-            let target_tag = format!("ctx_def:{ctx_name}");
-            for (other_path, other_node) in files {
-                if other_path != path && other_node.parsed.defined_symbols.contains(&target_tag) {
-                    deps.insert(other_path.clone());
-                }
-            }
+            Some(format!("ctx_def:{ctx_name}"))
         } else if let Some(wasm_sym) = sym.strip_prefix("wasm_use:") {
-            let target_tag = format!("wasm:{wasm_sym}");
-            for (other_path, other_node) in files {
-                if other_path != path && other_node.parsed.defined_symbols.contains(&target_tag) {
-                    deps.insert(other_path.clone());
-                }
-            }
-        } else if let Some(proto_stem) = sym.strip_prefix("proto_use:") {
-            let target_tag = format!("proto:{proto_stem}");
-            for (other_path, other_node) in files {
-                if other_path != path && other_node.parsed.defined_symbols.contains(&target_tag) {
+            Some(format!("wasm:{wasm_sym}"))
+        } else {
+            sym.strip_prefix("proto_use:")
+                .map(|proto_stem| format!("proto:{proto_stem}"))
+        };
+        if let Some(tag) = target_tag
+            && let Some(providers) = bridge_index.providers_by_tag.get(&tag)
+        {
+            for other_path in providers {
+                if other_path != path {
                     deps.insert(other_path.clone());
                 }
             }
@@ -1675,6 +2122,16 @@ fn compute_direct_dependencies(
 }
 
 pub fn normalize_lexical_rel(path: &Path) -> Option<String> {
+    if let Some(s) = path.to_str()
+        && !s.is_empty()
+        && !s.starts_with('/')
+        && !s.contains('\\')
+        && !s.contains("//")
+        && !s.starts_with('.')
+        && !s.contains("/.")
+    {
+        return Some(s.to_string());
+    }
     let mut parts: Vec<&str> = Vec::new();
     for comp in path.components() {
         match comp {
@@ -2069,10 +2526,6 @@ fn build_node_hash_bytes(dep_path: &str, dep_node: &FileNode) -> Vec<u8> {
     out
 }
 
-fn hash_dep_node(hasher: &mut Sha256, dep_path: &str, dep_node: &FileNode) {
-    hasher.update(build_node_hash_bytes(dep_path, dep_node));
-}
-
 fn build_file_node_from_bytes(
     rel_str: &str,
     bytes: &[u8],
@@ -2281,8 +2734,18 @@ fn normalize_python_semantic(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut in_triple: Option<&str> = None;
     for raw_line in source.lines() {
-        let mut line_out = String::new();
         let bytes = raw_line.as_bytes();
+        if in_triple.is_none()
+            && memchr::memchr3(b'#', b'"', b'\'', bytes).is_none()
+        {
+            let trimmed_end = raw_line.trim_end();
+            if !trimmed_end.trim().is_empty() {
+                out.push_str(trimmed_end);
+                out.push('\n');
+            }
+            continue;
+        }
+        let mut line_out = String::with_capacity(raw_line.len());
         let mut i = 0usize;
         let mut in_single: Option<u8> = None;
         while i < bytes.len() {
@@ -2420,9 +2883,19 @@ fn normalize_c_style_semantic(source: &str) -> String {
             i += 1;
             continue;
         }
-        let ch = source[i..].chars().next().unwrap_or(' ');
-        stripped.push(ch);
-        i += ch.len_utf8();
+        let next_special = bytes[i..]
+            .iter()
+            .position(|&b| matches!(b, b'/' | b'"' | b'\'' | b'`'))
+            .map(|off| i + off)
+            .unwrap_or(len);
+        if next_special > i {
+            stripped.push_str(&source[i..next_special]);
+            i = next_special;
+        } else {
+            let ch = source[i..].chars().next().unwrap_or(' ');
+            stripped.push(ch);
+            i += ch.len_utf8();
+        }
     }
 
     let mut out = String::with_capacity(stripped.len());
@@ -2796,6 +3269,7 @@ pub fn rust_crate_dir(rel_path: &str) -> String {
     String::new()
 }
 
+#[derive(Default)]
 struct RustModuleIndex {
     crate_to_src_dirs: BTreeMap<String, BTreeSet<String>>,
     pyo3_module_to_lib_rs: BTreeMap<String, BTreeSet<String>>,
@@ -2934,16 +3408,18 @@ impl RustModuleIndex {
         };
 
         // Resolve `pub use` re-exports in Rust barrel modules (`lib.rs`, `mod.rs`)
+        let barrel_files: Vec<(&String, &FileNode)> = files
+            .iter()
+            .filter(|(path, _)| {
+                path.ends_with("/mod.rs")
+                    || *path == "mod.rs"
+                    || path.ends_with("/lib.rs")
+                    || *path == "src/lib.rs"
+            })
+            .collect();
         for _ in 0..2 {
             let mut next_reexports = index.reexports.clone();
-            for (path, node) in files {
-                if !(path.ends_with("/mod.rs")
-                    || path == "mod.rs"
-                    || path.ends_with("/lib.rs")
-                    || path == "src/lib.rs")
-                {
-                    continue;
-                }
+            for &(path, node) in &barrel_files {
                 let cdir = rust_crate_dir(path);
                 let src_dir = if cdir.is_empty() {
                     "src".to_string()
@@ -3272,6 +3748,7 @@ const FRONTEND_INDEX_FILES: &[&str] = &[
     "index.mts",
 ];
 
+#[derive(Default)]
 struct FrontendModuleIndex {
     pkg_to_dir: BTreeMap<String, String>,
     aliases_by_dir: BTreeMap<String, Vec<(String, String)>>,
@@ -3357,13 +3834,14 @@ impl FrontendModuleIndex {
         };
 
         // Two passes to resolve nested barrel (`index.ts` / `index.tsx`) re-exports
+        let barrel_files: Vec<(&String, &FileNode)> = files
+            .iter()
+            .filter(|(path, _)| is_frontend_barrel_file(path))
+            .collect();
         for _ in 0..2 {
             let mut next_reexports = index.reexports.clone();
             let mut next_wildcards = index.wildcard_reexports.clone();
-            for (path, node) in files {
-                if !is_frontend_barrel_file(path) {
-                    continue;
-                }
+            for &(path, node) in &barrel_files {
                 for sym_def in &node.parsed.defined_symbols {
                     if let Some(rest) = sym_def.strip_prefix("reexport:")
                         && let Some((exported_sym, target_part)) = rest.split_once("->")
@@ -3506,7 +3984,7 @@ impl FrontendModuleIndex {
                         resolved.extend(reexported.iter().cloned());
                     } else if files
                         .get(target)
-                        .is_some_and(|n| n.parsed.defined_symbols.contains(sym))
+                        .is_some_and(|n| n.parsed.defined_symbols.binary_search(sym).is_ok())
                     {
                         resolved.insert(target.clone());
                     } else {
@@ -3965,6 +4443,7 @@ fn add_rust_module_candidates(
     }
 }
 
+#[derive(Default)]
 struct ModuleIndex {
     module_to_files: BTreeMap<String, BTreeSet<String>>,
     reexports: BTreeMap<(String, String), BTreeSet<String>>,
@@ -3989,12 +4468,13 @@ impl ModuleIndex {
             reexports: BTreeMap::new(),
         };
         // Two passes to resolve nested package `__init__.py` re-exports
+        let init_files: Vec<(&String, &FileNode)> = files
+            .iter()
+            .filter(|(path, _)| *path == "__init__.py" || path.ends_with("/__init__.py"))
+            .collect();
         for _ in 0..2 {
             let mut next_reexports = index.reexports.clone();
-            for (path, node) in files {
-                if !(path == "__init__.py" || path.ends_with("/__init__.py")) {
-                    continue;
-                }
+            for &(path, node) in &init_files {
                 for spec in &node.parsed.imports {
                     if spec.symbols.is_empty() {
                         continue;
@@ -4051,7 +4531,7 @@ impl ModuleIndex {
                         resolved.extend(reexported_files.iter().cloned());
                     } else if files
                         .get(target)
-                        .is_some_and(|n| n.parsed.defined_symbols.contains(sym))
+                        .is_some_and(|n| n.parsed.defined_symbols.binary_search(sym).is_ok())
                     {
                         resolved.insert(target.clone());
                     } else {

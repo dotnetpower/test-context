@@ -188,7 +188,13 @@ export class NativeToolBridge implements vscode.Disposable {
       result.trace.started_unix_ms = startedUnixMs;
       result.trace.completed_unix_ms = Date.now();
       result.trace.outcome = 'success';
-      this.onUsage?.({ operation: definition.operation, root });
+      const valRec =
+        typeof result.value === 'object' && result.value !== null && !Array.isArray(result.value)
+          ? (result.value as Record<string, JsonValue>)
+          : undefined;
+      const savedMs = typeof valRec?.saved_ms === 'number' ? valRec.saved_ms : 0;
+      const cachedFiles = typeof valRec?.cached_files_count === 'number' ? valRec.cached_files_count : 0;
+      this.onUsage?.({ operation: definition.operation, root, savedMs, cachedFiles });
       this.output.appendLine(
         `[success] operation=${definition.operation} root=${root ?? '-'} duration=${result.trace.total_ms.toFixed(3)}ms trace=${traceId}`,
       );
@@ -220,6 +226,9 @@ export class NativeToolBridge implements vscode.Disposable {
   public recordTrace(trace: ClientTrace, token: vscode.CancellationToken): void {
     this.output.appendLine(formatTraceLog(trace));
     if (!shouldReportTrace(trace)) {
+      return;
+    }
+    if (trace.success && trace.daemon !== null && trace.daemon !== undefined) {
       return;
     }
     void this.client.request(request(null, 'test_trace', trace), token).catch((error: unknown) => {

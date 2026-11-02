@@ -310,10 +310,20 @@ impl DaemonHub {
                 evicted.push(old);
             }
         }
+        let had_evictions = !evicted.is_empty();
         for root in evicted {
             root.shutdown();
         }
-        trim_allocator();
+        let high_rss = daemon_rss_bytes().is_some_and(|rss| rss > 64 * 1024 * 1024);
+        if high_rss {
+            let roots = self.lock_roots().values().cloned().collect::<Vec<_>>();
+            for root in roots {
+                root.reclaim_idle_zygote();
+            }
+        }
+        if had_evictions || high_rss {
+            trim_allocator();
+        }
     }
 
     fn get_or_load_root(&self, requested_root: &Path) -> Result<Arc<ManagedRoot>> {
@@ -373,7 +383,11 @@ impl DaemonHub {
             .map(|(_, managed)| Arc::clone(managed)))
     }
 
-    fn record_trace(&self, trace: Value) {
+    fn record_trace(&self, mut trace: Value) {
+        if let Some(obj) = trace.as_object_mut() {
+            obj.remove("arguments");
+            obj.remove("value");
+        }
         let mut guard = self.lock_traces();
         if guard.len() >= 64 {
             guard.pop_front();
@@ -423,11 +437,20 @@ impl DaemonHub {
         match outcome {
             Ok(value) => {
                 if let Some(tid) = trace_id {
+                    let now_ms = crate::cache::now_unix_ms();
+                    self.record_trace(json!({
+                        "trace_id": tid,
+                        "operation": req.name,
+                        "root": req.root,
+                        "execute_ms": elapsed_ms,
+                        "daemon_unix_ms": now_ms,
+                        "outcome": "success",
+                    }));
                     Ok(json!({
                         "_tctx_trace": {
                             "trace_id": tid,
                             "execute_ms": elapsed_ms,
-                            "daemon_unix_ms": crate::cache::now_unix_ms(),
+                            "daemon_unix_ms": now_ms,
                         },
                         "value": value,
                     }))
@@ -702,6 +725,15 @@ pub fn serve() -> Result<()> {
     }
     let tmp_sock = dir.join("sock.tmp");
     let _ = std::fs::remove_file(&tmp_sock);
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str()
+                && name.starts_with("workspaces.json.tmp.")
+            {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
     let listener = UnixListener::bind(&tmp_sock)?;
     listener.set_nonblocking(true)?;
     std::fs::set_permissions(&tmp_sock, std::fs::Permissions::from_mode(0o600))?;

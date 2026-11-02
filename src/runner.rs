@@ -570,13 +570,18 @@ impl ManagedRoot {
 
     pub fn cancel_active(&self) -> bool {
         let mut cancelled = cancel_process_group(&self.active_pgid);
-        if let Ok(pgids) = self.active_pgids.lock() {
+        {
+            let pgids = self
+                .active_pgids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             for &pgid in pgids.iter() {
                 cancelled |= unsafe { libc::kill(-pgid, libc::SIGKILL) == 0 };
             }
         }
         if cancelled {
             self.cancel_requested.store(true, Ordering::Release);
+            self.condvar.notify_all();
         }
         cancelled
     }
@@ -885,6 +890,7 @@ impl ManagedRoot {
             }
         }
         if overflowed {
+            invalidate_git_dirty_cache(&guard.workspace.root);
             Self::reconcile_live_files_locked(guard, None);
             guard.last_safety_scan = Instant::now();
             return;
@@ -982,6 +988,7 @@ impl ManagedRoot {
         }
 
         if !changed_rels.is_empty() {
+            invalidate_git_dirty_cache(&guard.workspace.root);
             guard.generation = guard.generation.saturating_add(1);
             for rel_str in &changed_rels {
                 if matches!(
@@ -1115,22 +1122,68 @@ impl ManagedRoot {
             guard.graph.files.keys().cloned().collect()
         };
 
-        let mut changed = Vec::new();
+        let mut changed: Vec<String> = Vec::new();
         let mut structure_changed = false;
-        for rel_str in files_to_check {
+        let candidates_with_stamps: Vec<(String, Option<crate::ast_graph::FileStamp>)> =
+            if files_to_check.len() >= 256 {
+            let root_ref = &guard.workspace.root;
+            let indexed_ref = &guard.graph.files;
+            let workers = std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(4)
+                .clamp(2, 8);
+            let chunk_size = files_to_check.len().div_ceil(workers).max(1);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = files_to_check
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            let mut diff = Vec::new();
+                            for rel_str in chunk {
+                                let full = root_ref.join(Path::new(rel_str));
+                                let live_stamp = file_stamp(&full);
+                                let unchanged = live_stamp.is_some()
+                                    && indexed_ref
+                                        .get(rel_str)
+                                        .and_then(|n| n.stamp)
+                                        .is_some_and(|s| Some(s) == live_stamp);
+                                if !unchanged {
+                                    diff.push((rel_str.clone(), live_stamp));
+                                }
+                            }
+                            diff
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok())
+                    .flatten()
+                    .collect()
+            })
+        } else {
+            let mut diff = Vec::new();
+            for rel_str in files_to_check {
+                let full = guard.workspace.root.join(Path::new(&rel_str));
+                let live_stamp = file_stamp(&full);
+                let unchanged = live_stamp.is_some()
+                    && guard
+                        .graph
+                        .files
+                        .get(&rel_str)
+                        .and_then(|n| n.stamp)
+                        .is_some_and(|s| Some(s) == live_stamp);
+                if !unchanged {
+                    diff.push((rel_str, live_stamp));
+                }
+            }
+            diff
+        };
+
+        for (rel_str, live_stamp_opt) in candidates_with_stamps {
             let rel_path = Path::new(&rel_str);
             let full = guard.workspace.root.join(rel_path);
-            if let Some(live_stamp) = file_stamp(&full) {
-                // Fast metadata stamp check avoids reading file bytes when mtime/size/inode are unchanged
-                if guard
-                    .graph
-                    .files
-                    .get(&rel_str)
-                    .and_then(|n| n.stamp)
-                    .is_some_and(|s| s == live_stamp)
-                {
-                    continue;
-                }
+            if let Some(live_stamp) = live_stamp_opt {
                 if let Ok(bytes) = guard
                     .workspace
                     .read_known_with_limit(rel_path, guard.spec.policy.max_file_bytes)
@@ -1453,14 +1506,15 @@ impl ManagedRoot {
         let guard = self.lock_state();
         let ruff_diagnostics = Self::collect_ruff_diagnostics_locked(&guard, &lint_changed);
 
-        let affected_modules = guard.graph.affected_modules(&changed_files);
-        let untested_modified_files = guard.graph.untested_modified_files(&changed_files);
+        let mut affected_modules = guard.graph.affected_modules(&changed_files);
+        let mut untested_modified_files = guard.graph.untested_modified_files(&changed_files);
         let suggested_tests = guard
             .graph
             .suggest_tests_for_untested(&untested_modified_files);
         let test_conventions = guard.graph.test_conventions_summary();
         let affected_raw: Vec<AffectedTest> = guard.graph.affected_tests(&changed_files);
-        let mut items = Vec::with_capacity(affected_raw.len());
+        let total_affected = affected_raw.len();
+        let mut items = Vec::with_capacity(total_affected);
         for a in affected_raw {
             let f_key = flight_key(&a.test_file, &a.dep_hash);
             let (cache_state, last_duration_ms) = if guard.in_flight.contains(&f_key) {
@@ -1484,12 +1538,23 @@ impl ManagedRoot {
                 reason_chain: a.reason_chain,
             });
         }
+        if items.len() > 30 {
+            items.sort_by(|a, b| {
+                a.reason_chain
+                    .len()
+                    .cmp(&b.reason_chain.len())
+                    .then_with(|| a.test_file.cmp(&b.test_file))
+            });
+            items.truncate(30);
+        }
+        affected_modules.truncate(30);
+        untested_modified_files.truncate(30);
 
         Ok(serde_json::json!({
             "root": guard.workspace.root,
             "changed_files": changed_files,
             "affected_modules": affected_modules,
-            "total_affected_test_files": items.len(),
+            "total_affected_test_files": total_affected,
             "affected_tests": items,
             "untested_modified_files": untested_modified_files,
             "suggested_tests": suggested_tests,
@@ -1670,14 +1735,16 @@ impl ManagedRoot {
         let by_file = execute_ruff_check(&spec, &uncached, false);
         let mut guard = self.lock_state();
         for (file, sha) in expected_shas {
-            let diags = by_file.get(&file).cloned().unwrap_or_default();
+            let mut diags = by_file.get(&file).cloned().unwrap_or_default();
+            diags.truncate(100);
             guard.ruff_cache.insert(flight_key(&file, &sha), diags);
         }
-        while guard.ruff_cache.len() > 4096 {
-            if let Some(first_key) = guard.ruff_cache.keys().next().cloned() {
-                guard.ruff_cache.remove(&first_key);
-            } else {
-                break;
+        if guard.ruff_cache.len() > 4096 {
+            let excess = guard.ruff_cache.len().saturating_sub(3584);
+            let keys_to_remove: Vec<String> =
+                guard.ruff_cache.keys().take(excess).cloned().collect();
+            for k in keys_to_remove {
+                guard.ruff_cache.remove(&k);
             }
         }
     }
@@ -2517,6 +2584,7 @@ fn execute_clippy_check(
     command.args(base_args);
     command.arg("clippy");
     command.arg("--no-deps");
+    command.arg("--quiet");
     if fix {
         command.arg("--fix");
         command.arg("--allow-dirty");
@@ -3095,7 +3163,28 @@ print(json.dumps({'identity':[sys.version,sys.executable,platform.platform(),pyt
     (identity, plugins)
 }
 
+type GitDirtyCacheMap = BTreeMap<PathBuf, (Instant, Vec<String>)>;
+static GIT_DIRTY_CACHE: OnceLock<Mutex<GitDirtyCacheMap>> = OnceLock::new();
+
+fn invalidate_git_dirty_cache(root: &Path) {
+    if let Some(cache) = GIT_DIRTY_CACHE.get() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(root);
+    }
+}
+
 fn git_dirty_files(root: &Path) -> Result<Vec<String>> {
+    let cache = GIT_DIRTY_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some((captured_at, cached_files)) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(root)
+        && captured_at.elapsed() < Duration::from_millis(1_500)
+    {
+        return Ok(cached_files.clone());
+    }
     let mut cmd = Command::new("git");
     cmd.args(["--no-optional-locks", "-c", "core.quotePath=false", "-C"])
         .arg(root)
@@ -3114,39 +3203,61 @@ fn git_dirty_files(root: &Path) -> Result<Vec<String>> {
             files.push(actual.to_string());
         }
     }
+    cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(root.to_path_buf(), (Instant::now(), files.clone()));
     Ok(files)
 }
 
 fn build_pythonpath(root: &Path, existing: Option<std::ffi::OsString>) -> std::ffi::OsString {
-    let mut paths = vec![root.to_path_buf()];
-    let src = root.join("src");
-    if src.is_dir() {
-        paths.push(src);
-    }
-    for container in ["src", "services", "packages", "apps", "extensions"] {
-        let dir = root.join(container);
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let sub = entry.path();
-                if !sub.is_dir() {
-                    continue;
-                }
-                let sub_src = sub.join("src");
-                if sub_src.is_dir() && !paths.contains(&sub_src) {
-                    paths.push(sub_src);
-                }
-                if (sub.join("requirements.txt").is_file()
-                    || sub.join("pyproject.toml").is_file()
-                    || sub.join("pytest.ini").is_file()
-                    || sub.join("main.py").is_file()
-                    || sub.join("conftest.py").is_file())
-                    && !paths.contains(&sub)
-                {
-                    paths.push(sub);
+    type PythonPathCacheMap = BTreeMap<PathBuf, (Instant, Vec<PathBuf>)>;
+    static PYTHONPATH_CACHE: OnceLock<Mutex<PythonPathCacheMap>> = OnceLock::new();
+    let cache = PYTHONPATH_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let base_paths = if let Some((captured_at, cached)) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(root)
+        && captured_at.elapsed() < Duration::from_secs(60)
+    {
+        cached.clone()
+    } else {
+        let mut paths = vec![root.to_path_buf()];
+        let src = root.join("src");
+        if src.is_dir() {
+            paths.push(src);
+        }
+        for container in ["src", "services", "packages", "apps", "extensions"] {
+            let dir = root.join(container);
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let sub = entry.path();
+                    if !sub.is_dir() {
+                        continue;
+                    }
+                    let sub_src = sub.join("src");
+                    if sub_src.is_dir() && !paths.contains(&sub_src) {
+                        paths.push(sub_src);
+                    }
+                    if (sub.join("requirements.txt").is_file()
+                        || sub.join("pyproject.toml").is_file()
+                        || sub.join("pytest.ini").is_file()
+                        || sub.join("main.py").is_file()
+                        || sub.join("conftest.py").is_file())
+                        && !paths.contains(&sub)
+                    {
+                        paths.push(sub);
+                    }
                 }
             }
         }
-    }
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(root.to_path_buf(), (Instant::now(), paths.clone()));
+        paths
+    };
+    let mut paths = base_paths;
     if let Some(old) = existing {
         for p in std::env::split_paths(&old) {
             if !paths.contains(&p) {
@@ -5252,8 +5363,14 @@ fn execute_go_test_batch(
                 node_results: stats.node_results.clone(),
             });
         } else {
+            let is_build_err = !overall_success
+                && (combined_out.contains("[build failed]")
+                    || combined_out.contains("[setup failed]")
+                    || combined_out.contains("cannot find package"));
             let outcome = if overall_success {
                 TestOutcome::Passed
+            } else if is_build_err {
+                TestOutcome::Error
             } else {
                 TestOutcome::Failed
             };
@@ -5262,9 +5379,9 @@ fn execute_go_test_batch(
                 dep_hash: dep_hash.clone(),
                 outcome,
                 passed: usize::from(overall_success),
-                failed: usize::from(!overall_success),
+                failed: usize::from(!overall_success && !is_build_err),
                 skipped: 0,
-                errors: 0,
+                errors: usize::from(is_build_err),
                 duration_ms: fallback_dur,
                 failed_nodeids: if overall_success {
                     Vec::new()
@@ -5910,6 +6027,17 @@ fn parse_junit_xml_per_file(
     stats
 }
 
+fn unescape_xml_entities(raw: &str) -> String {
+    if !raw.contains('&') {
+        return raw.to_string();
+    }
+    raw.replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 fn extract_xml_attr(tag: &str, attr_name: &str) -> Option<String> {
     let pattern = format!("{attr_name}=\"");
     let mut search_from = 0usize;
@@ -5918,7 +6046,8 @@ fn extract_xml_attr(tag: &str, attr_name: &str) -> Option<String> {
         if idx == 0 || tag.as_bytes()[idx - 1].is_ascii_whitespace() {
             let val_start = idx + pattern.len();
             let val_end = tag[val_start..].find('"')? + val_start;
-            return Some(tag[val_start..val_end].replace('\\', "/"));
+            let raw_val = &tag[val_start..val_end];
+            return Some(unescape_xml_entities(raw_val).replace('\\', "/"));
         }
         search_from = idx + pattern.len();
     }

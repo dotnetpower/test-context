@@ -501,7 +501,7 @@ where
         return Err(invalid("registry exceeds 1 MiB").into());
     }
     let tmp_path = dir.join(format!("workspaces.json.tmp.{}", std::process::id()));
-    {
+    let write_res: Result<()> = (|| {
         let mut tmp = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -510,8 +510,13 @@ where
             .open(&tmp_path)?;
         tmp.write_all(&bytes)?;
         tmp.sync_all()?;
+        std::fs::rename(&tmp_path, dir.join("workspaces.json"))?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
     }
-    std::fs::rename(&tmp_path, dir.join("workspaces.json"))?;
     Ok(())
 }
 

@@ -218,7 +218,10 @@ impl RootCache {
 
     pub fn is_flaky_test_file(&self, test_file: &str) -> bool {
         let prefix = format!("{test_file}@");
-        self.quarantined_keys.iter().any(|k| k.starts_with(&prefix))
+        self.quarantined_keys
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|k| k.starts_with(&prefix))
     }
 
     /// Exports portable cache records for CI/CD cache sharing (`tctx cache-export`).
@@ -273,7 +276,12 @@ impl RootCache {
                 .collect();
         }
         for node in record.node_results.values_mut() {
-            truncate_utf8(&mut node.output_snippet, 2 * 1024);
+            if node.outcome.is_green() {
+                node.output_snippet.clear();
+                node.output_snippet.shrink_to_fit();
+            } else {
+                truncate_utf8(&mut node.output_snippet, 2 * 1024);
+            }
         }
         let mut current_bytes = self.estimated_bytes();
         let rec_bytes = record_estimated_bytes(&record);
@@ -301,39 +309,60 @@ impl RootCache {
         self.pending_events.push(CacheWalEvent::Upsert {
             record: Box::new(record),
         });
-        while self.history_by_key.len() > policy.max_cached_results
+        if self.history_by_key.len() > policy.max_cached_results
             || current_bytes > policy.max_cache_bytes
         {
-            if let Some(oldest_key) = self
-                .history_by_key
-                .iter()
-                .min_by_key(|(_, r)| r.updated_unix_ms)
-                .map(|(k, _)| k.clone())
-            {
-                if let Some(removed_hist) = self.history_by_key.remove(&oldest_key) {
-                    current_bytes =
-                        current_bytes.saturating_sub(record_estimated_bytes(&removed_hist));
-                }
-                if let Some((test_file, dep_hash)) = oldest_key.rsplit_once('@')
-                    && self
-                        .latest_by_file
-                        .get(test_file)
-                        .is_some_and(|record| record.dep_hash == dep_hash)
-                    && let Some(removed_latest) = self.latest_by_file.remove(test_file)
-                {
-                    current_bytes =
-                        current_bytes.saturating_sub(record_estimated_bytes(&removed_latest));
-                }
-                if self.quarantined_keys.remove(&oldest_key) {
-                    current_bytes = current_bytes.saturating_sub(oldest_key.len());
-                }
-                self.pending_events
-                    .push(CacheWalEvent::RemoveKey { key: oldest_key });
-            } else {
-                break;
-            }
+            current_bytes = self.evict_to_bounds(current_bytes, policy, true);
         }
         self.cached_memory_bytes = Some(current_bytes);
+    }
+
+    fn evict_to_bounds(
+        &mut self,
+        mut current_bytes: usize,
+        policy: &MemoryPolicy,
+        record_wal: bool,
+    ) -> usize {
+        if self.history_by_key.len() <= policy.max_cached_results
+            && current_bytes <= policy.max_cache_bytes
+        {
+            return current_bytes;
+        }
+        let mut by_age: Vec<(u64, String)> = self
+            .history_by_key
+            .iter()
+            .map(|(k, r)| (r.updated_unix_ms, k.clone()))
+            .collect();
+        by_age.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, oldest_key) in by_age {
+            if self.history_by_key.len() <= policy.max_cached_results
+                && current_bytes <= policy.max_cache_bytes
+            {
+                break;
+            }
+            if let Some(removed_hist) = self.history_by_key.remove(&oldest_key) {
+                current_bytes =
+                    current_bytes.saturating_sub(record_estimated_bytes(&removed_hist));
+            }
+            if let Some((test_file, dep_hash)) = oldest_key.rsplit_once('@')
+                && self
+                    .latest_by_file
+                    .get(test_file)
+                    .is_some_and(|record| record.dep_hash == dep_hash)
+                && let Some(removed_latest) = self.latest_by_file.remove(test_file)
+            {
+                current_bytes =
+                    current_bytes.saturating_sub(record_estimated_bytes(&removed_latest));
+            }
+            if self.quarantined_keys.remove(&oldest_key) {
+                current_bytes = current_bytes.saturating_sub(oldest_key.len());
+            }
+            if record_wal {
+                self.pending_events
+                    .push(CacheWalEvent::RemoveKey { key: oldest_key });
+            }
+        }
+        current_bytes
     }
 
     pub fn invalidate_file(&mut self, test_file: &str) -> usize {
@@ -342,17 +371,24 @@ impl RootCache {
         let prefix = format!("{test_file}@");
         let keys: Vec<String> = self
             .history_by_key
-            .keys()
-            .filter(|k| k.starts_with(&prefix))
-            .cloned()
+            .range(prefix.clone()..)
+            .take_while(|(k, _)| k.starts_with(&prefix))
+            .map(|(k, _)| k.clone())
             .collect();
         for k in keys {
             if self.history_by_key.remove(&k).is_some() {
                 removed += 1;
             }
         }
-        self.quarantined_keys
-            .retain(|key| !key.starts_with(&prefix));
+        let q_keys: Vec<String> = self
+            .quarantined_keys
+            .range(prefix.clone()..)
+            .take_while(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for qk in q_keys {
+            self.quarantined_keys.remove(&qk);
+        }
         self.pending_events.push(CacheWalEvent::InvalidateFile {
             test_file: test_file.to_string(),
         });
@@ -431,6 +467,9 @@ impl RootCache {
     }
 
     pub fn predicted_affected_tests(&self, affected: &[String]) -> Vec<String> {
+        if affected.is_empty() || self.invocation_patterns.is_empty() {
+            return Vec::new();
+        }
         let affected: BTreeSet<&str> = affected.iter().map(String::as_str).collect();
         let mut scores: BTreeMap<String, (u64, u64)> = BTreeMap::new();
         for pattern in self.invocation_patterns.values() {
@@ -493,11 +532,14 @@ impl RootCache {
 
     fn load_unlocked(root: &Path) -> Self {
         let snap_stamp = Self::snapshot_stamp(root);
+        let approx_cap = snap_stamp
+            .map_or(0, |(len, _, _)| usize::try_from(len).unwrap_or(0))
+            .min(16 * 1024 * 1024);
         let mut cache = Self::storage_path(root)
             .ok()
             .and_then(|path| std::fs::File::open(path).ok())
             .and_then(|file| {
-                let mut bytes = Vec::new();
+                let mut bytes = Vec::with_capacity(approx_cap);
                 file.take(16 * 1024 * 1024)
                     .read_to_end(&mut bytes)
                     .ok()
@@ -511,7 +553,7 @@ impl RootCache {
         if let Ok(wal_path) = Self::wal_path(root)
             && let Ok(file) = std::fs::File::open(wal_path)
         {
-            let mut reader = BufReader::new(file);
+            let mut reader = BufReader::with_capacity(64 * 1024, file);
             let mut line = String::new();
             let mut total = 0usize;
             let mut expected_sequence = cache.wal_sequence.saturating_add(1);
@@ -558,34 +600,10 @@ impl RootCache {
         cache.cached_memory_bytes = None;
         let default_policy = MemoryPolicy::default();
         let mut current_bytes = cache.estimated_bytes();
-        while cache.history_by_key.len() > default_policy.max_cached_results
+        if cache.history_by_key.len() > default_policy.max_cached_results
             || current_bytes > default_policy.max_cache_bytes
         {
-            let Some(oldest) = cache
-                .history_by_key
-                .iter()
-                .min_by_key(|(_, record)| record.updated_unix_ms)
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            if let Some(removed_hist) = cache.history_by_key.remove(&oldest) {
-                current_bytes =
-                    current_bytes.saturating_sub(record_estimated_bytes(&removed_hist));
-            }
-            if cache.quarantined_keys.remove(&oldest) {
-                current_bytes = current_bytes.saturating_sub(oldest.len());
-            }
-            if let Some((test_file, dep_hash)) = oldest.rsplit_once('@')
-                && cache
-                    .latest_by_file
-                    .get(test_file)
-                    .is_some_and(|record| record.dep_hash == dep_hash)
-                && let Some(removed_latest) = cache.latest_by_file.remove(test_file)
-            {
-                current_bytes =
-                    current_bytes.saturating_sub(record_estimated_bytes(&removed_latest));
-            }
+            current_bytes = cache.evict_to_bounds(current_bytes, &default_policy, false);
         }
         cache.cached_memory_bytes = Some(current_bytes);
         cache.last_saved_metrics = (
@@ -702,10 +720,24 @@ impl RootCache {
             CacheWalEvent::InvalidateFile { test_file } => {
                 self.latest_by_file.remove(&test_file);
                 let prefix = format!("{test_file}@");
-                self.history_by_key
-                    .retain(|key, _| !key.starts_with(&prefix));
-                self.quarantined_keys
-                    .retain(|key| !key.starts_with(&prefix));
+                let h_keys: Vec<String> = self
+                    .history_by_key
+                    .range(prefix.clone()..)
+                    .take_while(|(k, _)| k.starts_with(&prefix))
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for hk in h_keys {
+                    self.history_by_key.remove(&hk);
+                }
+                let q_keys: Vec<String> = self
+                    .quarantined_keys
+                    .range(prefix.clone()..)
+                    .take_while(|k| k.starts_with(&prefix))
+                    .cloned()
+                    .collect();
+                for qk in q_keys {
+                    self.quarantined_keys.remove(&qk);
+                }
             }
             CacheWalEvent::Reset => {
                 self.latest_by_file.clear();
@@ -747,8 +779,9 @@ impl RootCache {
     fn compact_snapshot(&mut self, wal_path: &Path) -> Result<()> {
         let path = Self::storage_path(&self.root)?;
         let tmp_path = path.with_extension(format!("json.tmp.{}", std::process::id()));
-        let bytes = serde_json::to_vec(self)?;
-        {
+        let mut bytes = Vec::with_capacity(self.estimated_bytes().saturating_add(4096));
+        serde_json::to_writer(&mut bytes, self)?;
+        let write_res: Result<()> = (|| {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -757,8 +790,13 @@ impl RootCache {
                 .open(&tmp_path)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
+            std::fs::rename(&tmp_path, &path)?;
+            Ok(())
+        })();
+        if let Err(err) = write_res {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err);
         }
-        std::fs::rename(&tmp_path, &path)?;
         std::fs::File::open(catalog::cache_dir()?)?.sync_all()?;
         let wal = std::fs::OpenOptions::new()
             .write(true)

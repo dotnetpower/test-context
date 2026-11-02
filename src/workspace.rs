@@ -532,8 +532,8 @@ fn drain_bounded(mut reader: impl Read, max_output_bytes: usize) -> Vec<u8> {
         if read == 0 {
             break;
         }
-        let remaining = max_output_bytes.saturating_sub(kept.len());
-        if remaining > 0 {
+        if kept.len() < max_output_bytes {
+            let remaining = max_output_bytes - kept.len();
             kept.extend_from_slice(&chunk[..read.min(remaining)]);
         }
     }
@@ -560,6 +560,13 @@ pub fn run_command_with_timeout_tracked(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.process_group(0);
+    #[cfg(target_os = "linux")]
+    unsafe {
+        command.pre_exec(|| {
+            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            Ok(())
+        });
+    }
     let mut child = command.spawn()?;
     let pid = child.id();
     if let Some(active) = active_pgid

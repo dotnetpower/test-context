@@ -2,7 +2,7 @@
   "name": "test-context-native",
   "displayName": "Test Context by dotnetpower",
   "description": "Fast Python, Rust & React/Vite AST graph, background pytest/cargo/vitest runner, Ruff/ESLint pre-check, and instant test cache.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "dotnetpower",
   "license": "MIT",
   "icon": "resources/icon.png",

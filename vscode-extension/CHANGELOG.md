@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+- Resolved multi-byte UTF-8 escape char-boundary panics across Python, Rust, and Frontend semantic normalizers and tokenizers.
+- Added poison auto-recovery and `catch_unwind` isolation across `DaemonHub`, `ManagedRoot`, and background workers, plus per-root load gates and lock-free linter/git execution.
+- Accelerated AST graph build and reverse-dependency queries via parallel multi-core indexing, compact `u32` forward/reverse adjacency lists, parent-pointer BFS, and `O(1)` cross-language bridge indexing.
+- Optimized Rust incremental builds and test execution (`--no-run` multi-target precompilation, `--lib` module harness filtering, and non-barrel `lib.rs` decoupling).
+- Enhanced VS Code Copilot compatibility with workspace-root path normalization, WSL/multi-root automatic root inference, singleflight workspace registry caching, and inline response bounding.
+
 ## 0.1.0
 
 - First Marketplace release of **Test Context by dotnetpower** (`dotnetpower.test-context-native`) for VS Code and GitHub Copilot.

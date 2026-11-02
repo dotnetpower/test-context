@@ -58,10 +58,11 @@ struct ParallelPgidGuard<'a> {
 
 impl Drop for ParallelPgidGuard<'_> {
     fn drop(&mut self) {
-        if let Some(registry) = self.registry
-            && let Ok(mut guard) = registry.lock()
-        {
-            guard.remove(&self.pgid);
+        if let Some(registry) = self.registry {
+            registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&self.pgid);
         }
     }
 }
@@ -132,6 +133,8 @@ def resolve_plugin(value):
 safe_preload = {
     "fastapi", "starlette", "pydantic", "httpx", "requests",
     "openai", "azure", "dotenv", "yaml", "PIL",
+    "numpy", "scipy", "pandas", "sqlalchemy", "aiohttp",
+    "attrs", "cryptography", "orjson", "ujson",
 }
 for mod_name in [m.strip() for m in os.environ.get("TCTX_PRELOAD_MODULES", "").split(",") if m.strip()]:
     if mod_name.split(".", 1)[0] not in safe_preload:
@@ -423,9 +426,22 @@ while True:
                 child_result = {"error": f"invalid zygote result: {exc}"}
         if not waited:
             try:
-                _, wait_status = os.waitpid(pid, 0)
+                done_pid, wait_status = os.waitpid(pid, os.WNOHANG)
+                if done_pid == pid:
+                    waited = True
+                else:
+                    time.sleep(0.005)
+                    done_pid, wait_status = os.waitpid(pid, os.WNOHANG)
+                    if done_pid == pid:
+                        waited = True
+                    else:
+                        _, wait_status = os.waitpid(pid, 0)
             except Exception:
                 pass
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except Exception:
+            pass
         # Drain any output written between result delivery and process exit.
         for fd, target in list(open_fds.items()):
             while True:
@@ -636,10 +652,11 @@ impl PytestZygote {
             .ok_or_else(|| invalid("zygote did not return a child pid"))?;
         active_pgid.store(pid, Ordering::Release);
         let _active_guard = ActivePgidGuard(active_pgid);
-        if let Some(registry) = parallel_pgids
-            && let Ok(mut guard) = registry.lock()
-        {
-            guard.insert(pid);
+        if let Some(registry) = parallel_pgids {
+            registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(pid);
         }
         let _parallel_guard = ParallelPgidGuard {
             registry: parallel_pgids,

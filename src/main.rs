@@ -683,10 +683,10 @@ fn run_pytest_dropin(root: PathBuf, raw_args: &[String]) -> Result<i32> {
 }
 
 fn print_json(value: &Value) -> Result<()> {
-    let mut out = io::stdout().lock();
-    let bytes = serde_json::to_vec_pretty(value)?;
-    if let Err(err) = out
-        .write_all(&bytes)
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::with_capacity(64 * 1024, stdout.lock());
+    if let Err(err) = serde_json::to_writer_pretty(&mut out, value)
+        .map_err(io::Error::other)
         .and_then(|()| writeln!(out))
         .and_then(|()| out.flush())
     {
