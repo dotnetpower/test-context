@@ -23,11 +23,17 @@ void test('formatToolResult formats instant_cache_hit test_run output', () => {
     duration_ms: 2,
     saved_ms: 1450,
     failed_nodeids: [],
+    suspected_culprit_files: ['src/pkg/service.py'],
+    untested_modified_files: ['src/pkg/orphan.py'],
+    flaky_tests: ['tests/test_flaky.py'],
     stdout_summary: '=== PASSED (12 passed, 0 failed, 1 skipped) in 0.002s ===',
   });
   assert.match(text, /status=passed mode=instant_cache_hit/);
   assert.match(text, /cached_files=3 executed_files=0/);
   assert.match(text, /saved_ms=1450/);
+  assert.match(text, /suspected_culprit_files=src\/pkg\/service\.py/);
+  assert.match(text, /untested_modified_files=src\/pkg\/orphan\.py/);
+  assert.match(text, /flaky_tests=tests\/test_flaky\.py/);
 });
 
 void test('formatToolResult formats test_affected output', () => {

@@ -367,6 +367,9 @@ impl DaemonHub {
             "test_invalidate": true,
             "test_cancel": true,
             "test_ruff": true,
+            "test_explain": true,
+            "test_cache_export": true,
+            "test_cache_import": true,
             "authorized_worktrees": true,
             "request_tracing": true,
             "trace_clock": "unix_ms",
@@ -582,6 +585,30 @@ impl DaemonHub {
                     .unwrap_or(false);
                 let managed = self.get_or_load_root(root_path)?;
                 managed.check_ruff(&files, fix)
+            }
+            "test_explain" => {
+                let root_path = req
+                    .root
+                    .as_deref()
+                    .ok_or_else(|| invalid("test_explain requires a workspace root"))?;
+                let managed = self.get_or_load_root(root_path)?;
+                managed.explain_failures()
+            }
+            "test_cache_export" => {
+                let root_path = req
+                    .root
+                    .as_deref()
+                    .ok_or_else(|| invalid("test_cache_export requires a workspace root"))?;
+                let managed = self.get_or_load_root(root_path)?;
+                managed.export_cache_bundle()
+            }
+            "test_cache_import" => {
+                let root_path = req
+                    .root
+                    .as_deref()
+                    .ok_or_else(|| invalid("test_cache_import requires a workspace root"))?;
+                let managed = self.get_or_load_root(root_path)?;
+                managed.import_cache_bundle(&req.arguments)
             }
             other => Err(invalid(format!("unknown daemon operation: {other}")).into()),
         }

@@ -640,6 +640,14 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         "src/ui/button.test.mjs"
     );
 
+    // 13. Verify portable CI cache export/import and failure explanation
+    let exported = rust_managed.export_cache_bundle().unwrap();
+    assert!(exported["records_count"].as_u64().unwrap_or(0) >= 4);
+    let imported = rust_managed.import_cache_bundle(&exported).unwrap();
+    assert!(imported["imported_records"].as_u64().unwrap_or(0) >= 4);
+    let explained = rust_managed.explain_failures().unwrap();
+    assert!(explained["failing_test_files"].is_array());
+
     rust_managed.shutdown();
 }
 

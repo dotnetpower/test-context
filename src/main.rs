@@ -93,12 +93,29 @@ enum Action {
         #[arg(long)]
         ruff_fix: bool,
         #[arg(long)]
+        report_format: Option<String>,
+        #[arg(long)]
+        report_out: Option<PathBuf>,
+        #[arg(long)]
         pytest_arg: Vec<String>,
     },
     Ruff {
         files: Vec<String>,
         #[arg(long)]
         fix: bool,
+    },
+    Explain,
+    CacheExport {
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    CacheImport {
+        #[arg(long, value_name = "FILE")]
+        input: PathBuf,
+    },
+    HookInstall {
+        #[arg(long)]
+        pre_push: bool,
     },
     #[command(trailing_var_arg = true)]
     Pytest {
@@ -327,6 +344,8 @@ fn run() -> Result<i32> {
             no_cache,
             no_rerun_failed,
             ruff_fix,
+            report_format,
+            report_out,
             pytest_arg,
         } => {
             let root = args.root.canonicalize()?;
@@ -344,6 +363,25 @@ fn run() -> Result<i32> {
                 }),
                 compact: false,
             })?;
+            if let Some(fmt) = report_format.as_deref()
+                && let Ok(parsed_resp) =
+                    serde_json::from_value::<test_context::runner::TestRunResponse>(res.clone())
+            {
+                let rendered = match fmt {
+                    "junit" => test_context::runner::format_junit_xml_report(&parsed_resp),
+                    "sarif" => serde_json::to_string_pretty(
+                        &test_context::runner::format_sarif_report(&parsed_resp),
+                    )?,
+                    _ => serde_json::to_string_pretty(&res)?,
+                };
+                if let Some(out_path) = report_out {
+                    std::fs::write(out_path, rendered.as_bytes())?;
+                } else {
+                    println!("{rendered}");
+                    let failed = res["status"].as_str() == Some("failed");
+                    return Ok(if failed { 1 } else { 0 });
+                }
+            }
             print_json(&res)?;
             let failed = res["status"].as_str() == Some("failed");
             Ok(if failed { 1 } else { 0 })
@@ -362,6 +400,64 @@ fn run() -> Result<i32> {
             print_json(&res)?;
             let failed = res["status"].as_str() == Some("failed");
             Ok(if failed { 1 } else { 0 })
+        }
+        Action::Explain => {
+            let root = args.root.canonicalize()?;
+            let res = daemon::request_or_local(&daemon::Request {
+                root: Some(root),
+                name: "test_explain".to_string(),
+                arguments: json!({}),
+                compact: false,
+            })?;
+            print_json(&res)?;
+            Ok(0)
+        }
+        Action::CacheExport { out } => {
+            let root = args.root.canonicalize()?;
+            let res = daemon::request_or_local(&daemon::Request {
+                root: Some(root),
+                name: "test_cache_export".to_string(),
+                arguments: json!({}),
+                compact: false,
+            })?;
+            if let Some(out_path) = out {
+                std::fs::write(out_path, serde_json::to_vec_pretty(&res)?)?;
+            } else {
+                print_json(&res)?;
+            }
+            Ok(0)
+        }
+        Action::CacheImport { input } => {
+            let root = args.root.canonicalize()?;
+            let bytes = std::fs::read(input)?;
+            let bundle: Value = serde_json::from_slice(&bytes)?;
+            let res = daemon::request_or_local(&daemon::Request {
+                root: Some(root),
+                name: "test_cache_import".to_string(),
+                arguments: bundle,
+                compact: false,
+            })?;
+            print_json(&res)?;
+            Ok(0)
+        }
+        Action::HookInstall { pre_push } => {
+            use std::os::unix::fs::PermissionsExt;
+            let root = args.root.canonicalize()?;
+            let hooks_dir = root.join(".git/hooks");
+            if !hooks_dir.is_dir() {
+                return Err(invalid("no .git/hooks directory found in workspace root").into());
+            }
+            let hook_name = if *pre_push { "pre-push" } else { "pre-commit" };
+            let hook_path = hooks_dir.join(hook_name);
+            let script = "#!/usr/bin/env bash\nset -euo pipefail\nrepo_root=\"$(git rev-parse --show-toplevel)\"\nexec tctx --root \"$repo_root\" run --ruff-fix\n";
+            std::fs::write(&hook_path, script)?;
+            std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+            print_json(&json!({
+                "installed": true,
+                "hook": hook_name,
+                "path": hook_path,
+            }))?;
+            Ok(0)
         }
         Action::Pytest { args: pytest_args } => run_pytest_dropin(args.root.clone(), pytest_args),
         Action::CargoTest { args: cargo_args } => {

@@ -42,11 +42,35 @@ pub const FRONTEND_CONFIG_FILES: &[&str] = &[
     "vitest.config.ts",
     "vitest.config.js",
     "vitest.config.mjs",
+    "vitest.workspace.ts",
+    "vitest.workspace.js",
     "jest.config.js",
     "jest.config.ts",
     "jest.config.mjs",
     "playwright.config.ts",
     "playwright.config.js",
+    "cypress.config.ts",
+    "cypress.config.js",
+    "tailwind.config.js",
+    "tailwind.config.ts",
+    "biome.json",
+    "biome.jsonc",
+    "pnpm-workspace.yaml",
+    "turbo.json",
+    "nx.json",
+];
+
+pub const POLYGLOT_CONFIG_FILES: &[&str] = &[
+    "go.mod",
+    "go.work",
+    "CMakeLists.txt",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+];
+
+pub const POLYGLOT_SOURCE_EXTENSIONS: &[&str] = &[
+    ".go", ".cs", ".java", ".kt", ".c", ".cpp", ".cc", ".h", ".hpp", ".proto",
 ];
 
 pub const FRONTEND_SOURCE_EXTENSIONS: &[&str] = &[
@@ -55,8 +79,8 @@ pub const FRONTEND_SOURCE_EXTENSIONS: &[&str] = &[
 
 pub const DATA_FILE_EXTENSIONS: &[&str] = &[
     ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".sql", ".rego", ".csv", ".snap",
-    ".golden", ".proto", ".graphql", ".txt", ".css", ".scss", ".sass", ".less", ".svg", ".mdx",
-    ".html",
+    ".golden", ".proto", ".graphql", ".gql", ".txt", ".css", ".scss", ".sass", ".less", ".svg",
+    ".mdx", ".html",
 ];
 
 #[derive(Clone, Debug)]
@@ -136,12 +160,26 @@ impl Workspace {
                 "*.scss".to_string(),
                 "*.sass".to_string(),
                 "*.less".to_string(),
+                "*.go".to_string(),
+                "*.cs".to_string(),
+                "*.java".to_string(),
+                "*.kt".to_string(),
+                "*.c".to_string(),
+                "*.cpp".to_string(),
+                "*.cc".to_string(),
+                "*.h".to_string(),
+                "*.hpp".to_string(),
+                "*.proto".to_string(),
+                "*.graphql".to_string(),
+                "*.gql".to_string(),
+                "*.csproj".to_string(),
                 "pyproject.toml".to_string(),
                 "pytest.ini".to_string(),
                 "setup.cfg".to_string(),
                 "tox.ini".to_string(),
                 "Cargo.toml".to_string(),
                 "rust-toolchain.toml".to_string(),
+                "go.mod".to_string(),
                 "package.json".to_string(),
                 "tsconfig.json".to_string(),
                 "vite.config.ts".to_string(),
@@ -205,6 +243,8 @@ impl Workspace {
             || PYTEST_CONFIG_FILES.contains(&file_name)
             || RUST_CONFIG_FILES.contains(&file_name)
             || FRONTEND_CONFIG_FILES.contains(&file_name)
+            || POLYGLOT_CONFIG_FILES.contains(&file_name)
+            || file_name.ends_with(".csproj")
     }
 
     pub fn is_permitted_data_rel(&self, rel: &Path) -> bool {

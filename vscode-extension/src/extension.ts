@@ -88,6 +88,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('testContextNative.showStatus', async () => {
       await showStatus(bridge, status, output, usage.lastRoot);
     }),
+    vscode.commands.registerCommand('testContextNative.showSessionRoi', () => {
+      output.appendLine(usage.sessionRoiReport());
+      output.show(true);
+    }),
     vscode.commands.registerCommand('testContextNative.selfTest', async (root?: string) => {
       await runSelfTest(bridge, output, root);
     }),

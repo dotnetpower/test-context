@@ -52,4 +52,13 @@ export class UsageSummary {
       .filter((line) => line.length > 0)
       .join('\n');
   }
+
+  public sessionRoiReport(): string {
+    const c = this.counts;
+    const total = c.success + c.invalid_request + c.system_error;
+    return [
+      `session_roi total_calls=${total} success=${c.success} invalid_request=${c.invalid_request} system_error=${c.system_error}`,
+      `active_root=${this.lastRoot ?? '-'}`,
+    ].join('\n');
+  }
 }

@@ -45,6 +45,17 @@ pub struct RuffDiagnostic {
     pub fix_message: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredFailure {
+    pub test_file: String,
+    pub nodeid: String,
+    pub file: String,
+    pub line: usize,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_frames: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileRunSummary {
     pub test_file: String,
@@ -79,6 +90,18 @@ pub struct TestRunResponse {
     pub failed_nodeids: Vec<String>,
     #[serde(default)]
     pub ruff_diagnostics: Vec<RuffDiagnostic>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub structured_failures: Vec<StructuredFailure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suspected_culprit_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untested_modified_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flaky_tests: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_prerequisites: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings_summary: Vec<String>,
     pub stdout_summary: String,
 }
 
@@ -1352,17 +1375,22 @@ impl ManagedRoot {
             Vec::new()
         };
 
-        let py_changed: Vec<String> = changed_files
+        let lint_changed: Vec<String> = changed_files
             .iter()
             .map(|f| f.trim().trim_start_matches("./").replace('\\', "/"))
-            .filter(|f| f.ends_with(".py"))
+            .filter(|f| f.ends_with(".py") || crate::ast_graph::is_frontend_source_path(f))
             .collect();
-        if !py_changed.is_empty() {
-            Self::ensure_ruff_cached_locked(&mut guard, &py_changed);
+        if !lint_changed.is_empty() {
+            Self::ensure_ruff_cached_locked(&mut guard, &lint_changed);
         }
-        let ruff_diagnostics = Self::collect_ruff_diagnostics_locked(&guard, &py_changed);
+        let ruff_diagnostics = Self::collect_ruff_diagnostics_locked(&guard, &lint_changed);
 
         let affected_modules = guard.graph.affected_modules(&changed_files);
+        let untested_modified_files = guard.graph.untested_modified_files(&changed_files);
+        let suggested_tests = guard
+            .graph
+            .suggest_tests_for_untested(&untested_modified_files);
+        let test_conventions = guard.graph.test_conventions_summary();
         let affected_raw: Vec<AffectedTest> = guard.graph.affected_tests(&changed_files);
         let mut items = Vec::with_capacity(affected_raw.len());
         for a in affected_raw {
@@ -1395,6 +1423,9 @@ impl ManagedRoot {
             "affected_modules": affected_modules,
             "total_affected_test_files": items.len(),
             "affected_tests": items,
+            "untested_modified_files": untested_modified_files,
+            "suggested_tests": suggested_tests,
+            "test_conventions": test_conventions,
             "ruff_errors_count": ruff_diagnostics.len(),
             "ruff_diagnostics": ruff_diagnostics,
         }))
@@ -1418,7 +1449,10 @@ impl ManagedRoot {
                     .trim_start_matches("./")
                     .trim_end_matches('/')
                     .replace('\\', "/");
-                if norm.ends_with(".py") || crate::ast_graph::is_frontend_source_path(&norm) {
+                if norm.ends_with(".py")
+                    || norm.ends_with(".rs")
+                    || crate::ast_graph::is_frontend_source_path(&norm)
+                {
                     set.insert(norm);
                 } else {
                     let prefix = if norm.is_empty() || norm == "." {
@@ -1427,7 +1461,9 @@ impl ManagedRoot {
                         format!("{norm}/")
                     };
                     for k in guard.graph.files.keys() {
-                        if (k.ends_with(".py") || crate::ast_graph::is_frontend_source_path(k))
+                        if (k.ends_with(".py")
+                            || k.ends_with(".rs")
+                            || crate::ast_graph::is_frontend_source_path(k))
                             && (prefix.is_empty() || k.starts_with(&prefix))
                         {
                             set.insert(k.clone());
@@ -1441,7 +1477,10 @@ impl ManagedRoot {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|f| f.trim().trim_start_matches("./").replace('\\', "/"))
-                .filter(|f| f.ends_with(".py") && guard.graph.files.contains_key(f))
+                .filter(|f| {
+                    (f.ends_with(".py") || crate::ast_graph::is_frontend_source_path(f))
+                        && guard.graph.files.contains_key(f)
+                })
                 .collect();
             if !dirty.is_empty() {
                 dirty
@@ -1477,11 +1516,64 @@ impl ManagedRoot {
         }))
     }
 
+    pub fn explain_failures(&self) -> Result<serde_json::Value> {
+        let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+        guard.last_activity = Instant::now();
+        self.drain_fs_events_locked(&mut guard);
+        let dirty = git_dirty_files(&guard.workspace.root).unwrap_or_default();
+        let mut failing_files = Vec::new();
+        let mut all_failures = Vec::new();
+        let mut culprits = BTreeSet::new();
+        for (test_file, rec) in &guard.cache.latest_by_file {
+            if !rec.outcome.is_green() {
+                failing_files.push(test_file.clone());
+                all_failures.extend(extract_structured_failures(
+                    test_file,
+                    &rec.failed_nodeids,
+                    &rec.output_snippet,
+                ));
+                let deps = guard.graph.transitive_deps_for(test_file);
+                for d in &dirty {
+                    let norm = d.trim().trim_start_matches("./").replace('\\', "/");
+                    if deps.contains(&norm) || norm == *test_file {
+                        culprits.insert(norm);
+                    }
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "root": guard.workspace.root,
+            "failing_test_files": failing_files,
+            "structured_failures": all_failures,
+            "suspected_culprit_files": culprits.into_iter().collect::<Vec<_>>(),
+            "flaky_tests": guard.cache.flaky_test_files(),
+        }))
+    }
+
+    pub fn export_cache_bundle(&self) -> Result<serde_json::Value> {
+        let guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+        Ok(guard.cache.export_bundle())
+    }
+
+    pub fn import_cache_bundle(&self, bundle: &serde_json::Value) -> Result<serde_json::Value> {
+        let mut guard = self.state.lock().map_err(|_| invalid("mutex poisoned"))?;
+        let policy = guard.spec.policy.clone();
+        let imported = guard.cache.import_bundle(bundle, &policy);
+        let _ = guard.cache.save();
+        Ok(serde_json::json!({
+            "root": guard.workspace.root,
+            "imported_records": imported,
+        }))
+    }
+
     fn ensure_ruff_cached_locked(guard: &mut RootState, py_files: &[String]) {
         let mut uncached = Vec::new();
         let mut expected_shas = BTreeMap::new();
         for f in py_files {
-            if !f.ends_with(".py") && !crate::ast_graph::is_frontend_source_path(f) {
+            if !f.ends_with(".py")
+                && !f.ends_with(".rs")
+                && !crate::ast_graph::is_frontend_source_path(f)
+            {
                 continue;
             }
             let Some(node) = guard.graph.files.get(f) else {
@@ -1668,6 +1760,12 @@ impl ManagedRoot {
                     executed_files: Vec::new(),
                     failed_nodeids: Vec::new(),
                     ruff_diagnostics: Vec::new(),
+                    structured_failures: Vec::new(),
+                    suspected_culprit_files: Vec::new(),
+                    untested_modified_files: Vec::new(),
+                    flaky_tests: Vec::new(),
+                    missing_prerequisites: Vec::new(),
+                    warnings_summary: Vec::new(),
                     stdout_summary: "=== no tests matched in 0.00s ===".to_string(),
                 });
             }
@@ -2137,6 +2235,55 @@ impl ManagedRoot {
         output_parts.push(summary_line);
         let stdout_summary = output_parts.join("\n");
 
+        let mut structured_failures = Vec::new();
+        let mut suspected_culprit_files = BTreeSet::new();
+        let mut untested_modified_files = Vec::new();
+        let mut flaky_tests = Vec::new();
+        let missing_prerequisites = if skipped > 0 {
+            extract_missing_prerequisites(&stdout_summary)
+        } else {
+            Vec::new()
+        };
+        let warnings_summary = extract_warnings_summary(&stdout_summary);
+
+        if let Ok(guard) = self.state.lock() {
+            flaky_tests = guard.cache.flaky_test_files();
+            if status == "failed" {
+                let dirty = git_dirty_files(&guard.workspace.root).unwrap_or_default();
+                for item in cached_summaries.iter().chain(executed_summaries.iter()) {
+                    if !item.outcome.is_green() {
+                        structured_failures.extend(extract_structured_failures(
+                            &item.test_file,
+                            &item.failed_nodeids,
+                            &stdout_summary,
+                        ));
+                        let deps = guard.graph.transitive_deps_for(&item.test_file);
+                        for raw_d in &dirty {
+                            let norm = raw_d.trim().trim_start_matches("./").replace('\\', "/");
+                            if deps.contains(&norm) || norm == item.test_file {
+                                suspected_culprit_files.insert(norm);
+                            }
+                        }
+                        for raw_t in &req.targets {
+                            let norm = raw_t
+                                .split("::")
+                                .next()
+                                .unwrap_or(raw_t)
+                                .trim()
+                                .trim_start_matches("./")
+                                .replace('\\', "/");
+                            if !norm.is_empty() && deps.contains(&norm) && norm != item.test_file {
+                                suspected_culprit_files.insert(norm);
+                            }
+                        }
+                    }
+                }
+            }
+            if !req.targets.is_empty() {
+                untested_modified_files = guard.graph.untested_modified_files(&req.targets);
+            }
+        }
+
         Ok(TestRunResponse {
             root: spec.root,
             status,
@@ -2155,6 +2302,12 @@ impl ManagedRoot {
             executed_files: executed_summaries,
             failed_nodeids,
             ruff_diagnostics,
+            structured_failures,
+            suspected_culprit_files: suspected_culprit_files.into_iter().collect(),
+            untested_modified_files,
+            flaky_tests,
+            missing_prerequisites,
+            warnings_summary,
             stdout_summary,
         })
     }
@@ -2177,6 +2330,11 @@ fn execute_ruff_check(
     let fe_files: Vec<String> = rel_files
         .iter()
         .filter(|f| crate::ast_graph::is_frontend_source_path(f))
+        .cloned()
+        .collect();
+    let rs_files: Vec<String> = rel_files
+        .iter()
+        .filter(|f| f.ends_with(".rs"))
         .cloned()
         .collect();
 
@@ -2208,9 +2366,233 @@ fn execute_ruff_check(
     }
 
     if !fe_files.is_empty() {
-        by_file.extend(execute_eslint_check(spec, &fe_files, fix));
+        let eslint_res = execute_eslint_check(spec, &fe_files, fix);
+        if !eslint_res.is_empty() {
+            by_file.extend(eslint_res);
+        } else {
+            by_file.extend(execute_biome_check(spec, &fe_files, fix));
+        }
     }
 
+    if !rs_files.is_empty() {
+        by_file.extend(execute_clippy_check(spec, &rs_files, fix));
+    }
+
+    by_file
+}
+
+fn execute_clippy_check(
+    spec: &Spec,
+    rs_files: &[String],
+    fix: bool,
+) -> BTreeMap<String, Vec<RuffDiagnostic>> {
+    if std::env::var_os("TCTX_CLIPPY_BIN").is_some_and(|v| v == "none" || v == "0") {
+        return BTreeMap::new();
+    }
+    let cargo_cmd = spec.effective_cargo_cmd();
+    let Some((program, base_args)) = cargo_cmd.split_first() else {
+        return BTreeMap::new();
+    };
+    let mut command = Command::new(program);
+    command.current_dir(&spec.root);
+    command.args(base_args);
+    command.arg("clippy");
+    if fix {
+        command.arg("--fix");
+        command.arg("--allow-dirty");
+        command.arg("--allow-staged");
+    }
+    command.arg("--message-format=json");
+    if let Ok(output) =
+        run_command_with_timeout(&mut command, Duration::from_secs(30), 4 * 1024 * 1024)
+    {
+        return parse_clippy_json_output(&output.stdout, &spec.root, rs_files);
+    }
+    BTreeMap::new()
+}
+
+pub fn parse_clippy_json_output(
+    stdout: &[u8],
+    workspace_root: &Path,
+    known_rel_files: &[String],
+) -> BTreeMap<String, Vec<RuffDiagnostic>> {
+    let mut by_file: BTreeMap<String, Vec<RuffDiagnostic>> = BTreeMap::new();
+    let text = String::from_utf8_lossy(stdout);
+    let root_str = workspace_root.to_string_lossy().replace('\\', "/");
+    let root_prefix = format!("{}/", root_str.trim_end_matches('/'));
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if val.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-message") {
+            continue;
+        }
+        let Some(msg_obj) = val.get("message") else {
+            continue;
+        };
+        let level = msg_obj
+            .get("level")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !matches!(level, "error" | "warning") {
+            continue;
+        }
+        let Some(spans) = msg_obj.get("spans").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let Some(primary_span) = spans
+            .iter()
+            .find(|s| s.get("is_primary").and_then(serde_json::Value::as_bool) == Some(true))
+            .or_else(|| spans.first())
+        else {
+            continue;
+        };
+        let raw_file = primary_span
+            .get("file_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .replace('\\', "/");
+        let rel_file = if let Some(stripped) = raw_file.strip_prefix(&root_prefix) {
+            stripped.to_string()
+        } else {
+            raw_file.trim_start_matches("./").to_string()
+        };
+        if !known_rel_files.is_empty() && !known_rel_files.iter().any(|k| k == &rel_file) {
+            continue;
+        }
+        let row = primary_span
+            .get("line_start")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as usize;
+        let column = primary_span
+            .get("column_start")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1) as usize;
+        let code = msg_obj
+            .get("code")
+            .and_then(|c| c.get("code"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("clippy")
+            .to_string();
+        let message = msg_obj
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let fixable = msg_obj
+            .get("children")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ch| {
+                ch.iter().any(|c| {
+                    c.get("spans")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|sp| {
+                            sp.iter()
+                                .any(|s| s.get("suggested_replacement").is_some_and(|r| !r.is_null()))
+                        })
+                })
+            });
+        by_file.entry(rel_file.clone()).or_default().push(RuffDiagnostic {
+            file: rel_file,
+            row,
+            column,
+            code,
+            message,
+            fixable,
+            fix_message: None,
+        });
+    }
+    by_file
+}
+
+fn execute_biome_check(
+    spec: &Spec,
+    fe_files: &[String],
+    fix: bool,
+) -> BTreeMap<String, Vec<RuffDiagnostic>> {
+    let mut by_file: BTreeMap<String, Vec<RuffDiagnostic>> = BTreeMap::new();
+    let Some((biome_bin, workdir)) = crate::catalog::detect_biome_cmd_for_dir(&spec.root, "") else {
+        return by_file;
+    };
+    let mut command = Command::new(biome_bin);
+    command.current_dir(&workdir);
+    command.arg("check");
+    if fix {
+        command.arg("--write");
+    }
+    command.arg("--reporter=json");
+    for f in fe_files {
+        command.arg(f);
+    }
+    if let Ok(output) =
+        run_command_with_timeout(&mut command, Duration::from_secs(15), 2 * 1024 * 1024)
+    {
+        by_file.extend(parse_biome_json_output(&output.stdout, &spec.root, fe_files));
+    }
+    by_file
+}
+
+pub fn parse_biome_json_output(
+    stdout: &[u8],
+    workspace_root: &Path,
+    known_rel_files: &[String],
+) -> BTreeMap<String, Vec<RuffDiagnostic>> {
+    let mut by_file: BTreeMap<String, Vec<RuffDiagnostic>> = BTreeMap::new();
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(stdout) else {
+        return by_file;
+    };
+    let Some(diags) = val.get("diagnostics").and_then(serde_json::Value::as_array) else {
+        return by_file;
+    };
+    let root_str = workspace_root.to_string_lossy().replace('\\', "/");
+    let root_prefix = format!("{}/", root_str.trim_end_matches('/'));
+    for d in diags {
+        let raw_file = d
+            .get("location")
+            .and_then(|l| l.get("path"))
+            .and_then(|p| p.get("file").or(Some(p)))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .replace('\\', "/");
+        let rel_file = if let Some(stripped) = raw_file.strip_prefix(&root_prefix) {
+            stripped.to_string()
+        } else {
+            let clean = raw_file.trim_start_matches("./");
+            known_rel_files
+                .iter()
+                .find(|k| raw_file.ends_with(k.as_str()) || k.ends_with(clean))
+                .cloned()
+                .unwrap_or_else(|| clean.to_string())
+        };
+        let code = d
+            .get("category")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("biome")
+            .to_string();
+        let message = d
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let fixable = d
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|t| t.as_str() == Some("fixable")));
+        by_file.entry(rel_file.clone()).or_default().push(RuffDiagnostic {
+            file: rel_file,
+            row: 1,
+            column: 1,
+            code,
+            message,
+            fixable,
+            fix_message: None,
+        });
+    }
     by_file
 }
 
@@ -2751,16 +3133,27 @@ fn execute_pytest_batch(
         })
         .cloned()
         .collect();
+    let go_targets: Vec<String> = invocation_targets
+        .iter()
+        .filter(|t| t.split("::").next().unwrap_or(t).ends_with("_test.go"))
+        .cloned()
+        .collect();
     let py_targets: Vec<String> = invocation_targets
         .iter()
         .filter(|t| {
             let f = t.split("::").next().unwrap_or(t);
-            !f.ends_with(".rs") && !crate::ast_graph::is_frontend_source_path(f)
+            !f.ends_with(".rs")
+                && !f.ends_with("_test.go")
+                && !crate::ast_graph::is_frontend_source_path(f)
         })
         .cloned()
         .collect();
 
-    if !rs_targets.is_empty() && fe_targets.is_empty() && py_targets.is_empty() {
+    if !rs_targets.is_empty()
+        && fe_targets.is_empty()
+        && go_targets.is_empty()
+        && py_targets.is_empty()
+    {
         return execute_cargo_test_batch(
             spec,
             &rs_targets,
@@ -2774,7 +3167,11 @@ fn execute_pytest_batch(
             environment_hash,
         );
     }
-    if !fe_targets.is_empty() && rs_targets.is_empty() && py_targets.is_empty() {
+    if !fe_targets.is_empty()
+        && rs_targets.is_empty()
+        && go_targets.is_empty()
+        && py_targets.is_empty()
+    {
         return execute_frontend_test_batch(
             spec,
             &fe_targets,
@@ -2788,79 +3185,133 @@ fn execute_pytest_batch(
             environment_hash,
         );
     }
-    if !rs_targets.is_empty() || !fe_targets.is_empty() {
+    if !go_targets.is_empty()
+        && rs_targets.is_empty()
+        && fe_targets.is_empty()
+        && py_targets.is_empty()
+    {
+        return execute_go_test_batch(
+            spec,
+            &go_targets,
+            dep_hashes,
+            k_expr,
+            extra_args,
+            source_label,
+            active_pgid,
+            active_pgids,
+            environment_hash,
+        );
+    }
+    if !rs_targets.is_empty() || !fe_targets.is_empty() || !go_targets.is_empty() {
         let mut combined_records = Vec::new();
         let mut combined_outputs = Vec::new();
-        if !rs_targets.is_empty() {
-            let rs_hashes: BTreeMap<String, String> = dep_hashes
-                .iter()
-                .filter(|(k, _)| k.ends_with(".rs"))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let (mut recs, out) = execute_cargo_test_batch(
-                spec,
-                &rs_targets,
-                &rs_hashes,
-                k_expr,
-                mark_expr,
-                extra_args,
-                source_label,
-                active_pgid,
-                active_pgids,
-                environment_hash,
-            )?;
-            combined_records.append(&mut recs);
-            if !out.trim().is_empty() {
-                combined_outputs.push(out);
-            }
-        }
-        if !fe_targets.is_empty() {
-            let fe_hashes: BTreeMap<String, String> = dep_hashes
-                .iter()
-                .filter(|(k, _)| crate::ast_graph::is_frontend_source_path(k))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let (mut recs, out) = execute_frontend_test_batch(
-                spec,
-                &fe_targets,
-                &fe_hashes,
-                k_expr,
-                mark_expr,
-                extra_args,
-                source_label,
-                active_pgid,
-                active_pgids,
-                environment_hash,
-            )?;
-            combined_records.append(&mut recs);
-            if !out.trim().is_empty() {
-                combined_outputs.push(out);
-            }
-        }
-        if !py_targets.is_empty() {
-            let py_hashes: BTreeMap<String, String> = dep_hashes
-                .iter()
-                .filter(|(k, _)| {
-                    !k.ends_with(".rs") && !crate::ast_graph::is_frontend_source_path(k)
-                })
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let (mut recs, out) = execute_pytest_batch(
-                spec,
-                &py_targets,
-                &py_hashes,
-                k_expr,
-                mark_expr,
-                extra_args,
-                source_label,
-                zygote_slot,
-                active_pgid,
-                active_pgids,
-                preload_modules,
-                environment_hash,
-                pytest_plugins,
-                capture_dynamic_dependencies,
-            )?;
+        let (rs_res, fe_res, go_res, py_res) = std::thread::scope(|scope| {
+            let rs_handle = if !rs_targets.is_empty() {
+                let rs_hashes: BTreeMap<String, String> = dep_hashes
+                    .iter()
+                    .filter(|(k, _)| k.ends_with(".rs"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                Some(scope.spawn(move || {
+                    execute_cargo_test_batch(
+                        spec,
+                        &rs_targets,
+                        &rs_hashes,
+                        k_expr,
+                        mark_expr,
+                        extra_args,
+                        source_label,
+                        active_pgid,
+                        active_pgids,
+                        environment_hash,
+                    )
+                }))
+            } else {
+                None
+            };
+            let fe_handle = if !fe_targets.is_empty() {
+                let fe_hashes: BTreeMap<String, String> = dep_hashes
+                    .iter()
+                    .filter(|(k, _)| crate::ast_graph::is_frontend_source_path(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                Some(scope.spawn(move || {
+                    execute_frontend_test_batch(
+                        spec,
+                        &fe_targets,
+                        &fe_hashes,
+                        k_expr,
+                        mark_expr,
+                        extra_args,
+                        source_label,
+                        active_pgid,
+                        active_pgids,
+                        environment_hash,
+                    )
+                }))
+            } else {
+                None
+            };
+            let go_handle = if !go_targets.is_empty() {
+                let go_hashes: BTreeMap<String, String> = dep_hashes
+                    .iter()
+                    .filter(|(k, _)| k.ends_with("_test.go"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                Some(scope.spawn(move || {
+                    execute_go_test_batch(
+                        spec,
+                        &go_targets,
+                        &go_hashes,
+                        k_expr,
+                        extra_args,
+                        source_label,
+                        active_pgid,
+                        active_pgids,
+                        environment_hash,
+                    )
+                }))
+            } else {
+                None
+            };
+            let py_res = if !py_targets.is_empty() {
+                let py_hashes: BTreeMap<String, String> = dep_hashes
+                    .iter()
+                    .filter(|(k, _)| {
+                        !k.ends_with(".rs")
+                            && !k.ends_with("_test.go")
+                            && !crate::ast_graph::is_frontend_source_path(k)
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                Some(execute_pytest_batch(
+                    spec,
+                    &py_targets,
+                    &py_hashes,
+                    k_expr,
+                    mark_expr,
+                    extra_args,
+                    source_label,
+                    zygote_slot,
+                    active_pgid,
+                    active_pgids,
+                    preload_modules,
+                    environment_hash,
+                    pytest_plugins,
+                    capture_dynamic_dependencies,
+                ))
+            } else {
+                None
+            };
+            (
+                rs_handle.map(|h| h.join().unwrap_or_else(|_| Err(invalid("rs panic").into()))),
+                fe_handle.map(|h| h.join().unwrap_or_else(|_| Err(invalid("fe panic").into()))),
+                go_handle.map(|h| h.join().unwrap_or_else(|_| Err(invalid("go panic").into()))),
+                py_res,
+            )
+        });
+        for res in [rs_res, fe_res, go_res, py_res].into_iter().flatten() {
+            let (mut recs, out) = res?;
             combined_records.append(&mut recs);
             if !out.trim().is_empty() {
                 combined_outputs.push(out);
@@ -4397,6 +4848,477 @@ fn execute_frontend_test_batch(
     Ok((records, all_outputs.join("\n")))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn execute_go_test_batch(
+    spec: &Spec,
+    invocation_targets: &[String],
+    dep_hashes: &BTreeMap<String, String>,
+    k_expr: Option<&str>,
+    extra_args: &[String],
+    source_label: &str,
+    active_pgid: Option<&AtomicI32>,
+    active_pgids: Option<&Mutex<BTreeSet<i32>>>,
+    environment_hash: &str,
+) -> Result<(Vec<CachedTestRecord>, String)> {
+    let run_started_unix_ms = now_unix_ms();
+    let go_cmd = crate::catalog::detect_go_cmd(&spec.root);
+    let Some((program, base_args)) = go_cmd.split_first() else {
+        return Err(invalid("empty go_cmd").into());
+    };
+    let timeout = Duration::from_secs(spec.policy.pytest_timeout_secs);
+    let explicit_node_filter: Option<String> = invocation_targets.iter().find_map(|t| {
+        let (_, node) = t.split_once("::")?;
+        Some(node.to_string())
+    });
+    let name_filter = explicit_node_filter.or_else(|| k_expr.map(ToOwned::to_owned));
+
+    let mut pkg_dirs = BTreeSet::new();
+    for tf in dep_hashes.keys() {
+        let dir = Path::new(tf)
+            .parent()
+            .map(normalize_rel_str)
+            .unwrap_or_default();
+        if dir.is_empty() {
+            pkg_dirs.insert(".".to_string());
+        } else {
+            pkg_dirs.insert(format!("./{dir}"));
+        }
+    }
+
+    let mut command = Command::new(program);
+    command.current_dir(&spec.root);
+    command.args(base_args);
+    command.arg("test");
+    command.arg("-json");
+    if let Some(ref f) = name_filter
+        && !f.trim().is_empty()
+    {
+        command.arg("-run").arg(f);
+    }
+    for arg in extra_args {
+        command.arg(arg);
+    }
+    for pkg in &pkg_dirs {
+        command.arg(pkg);
+    }
+
+    let output = run_command_with_timeout_tracked(
+        &mut command,
+        timeout,
+        2 * 1024 * 1024,
+        active_pgid,
+        active_pgids,
+    )?;
+    if output.timed_out {
+        return Err(invalid(format!(
+            "go test execution timed out after {}s",
+            spec.policy.pytest_timeout_secs
+        ))
+        .into());
+    }
+    if output.cancelled {
+        return Err(invalid("TEST_CANCELLED: go test child process group was terminated").into());
+    }
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    let combined_out = match (stdout_str.trim().is_empty(), stderr_str.trim().is_empty()) {
+        (true, _) => stderr_str.to_string(),
+        (_, true) => stdout_str.to_string(),
+        (false, false) => format!("{}\n{}", stdout_str.trim(), stderr_str.trim()),
+    };
+    let snippet = truncate_str(&combined_out, 8192);
+    let per_file = parse_go_test_json_output(&stdout_str, dep_hashes);
+    let overall_success = output.status.success();
+    let now = now_unix_ms();
+    let fallback_dur = (output.duration_ms / (dep_hashes.len().max(1) as u64)).max(1);
+    let mut records = Vec::new();
+
+    for (test_file, dep_hash) in dep_hashes {
+        if let Some(stats) = per_file.get(test_file) {
+            let outcome = if stats.failed > 0 {
+                TestOutcome::Failed
+            } else if stats.errors > 0 {
+                TestOutcome::Error
+            } else if stats.passed > 0 && stats.skipped == 0 {
+                TestOutcome::Passed
+            } else if stats.skipped > 0 && overall_success {
+                TestOutcome::Skipped
+            } else if overall_success {
+                TestOutcome::Passed
+            } else {
+                TestOutcome::Failed
+            };
+            records.push(CachedTestRecord {
+                test_file: test_file.clone(),
+                dep_hash: dep_hash.clone(),
+                outcome,
+                passed: stats.passed,
+                failed: stats.failed,
+                skipped: stats.skipped,
+                errors: stats.errors,
+                duration_ms: stats.duration_ms.max(1),
+                failed_nodeids: stats.failed_nodeids.clone(),
+                output_snippet: if outcome.is_green() {
+                    String::new()
+                } else {
+                    snippet.clone()
+                },
+                updated_unix_ms: now,
+                source: source_label.to_string(),
+                environment_hash: environment_hash.to_string(),
+                tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+                runner_mode: "go_test_json".to_string(),
+                started_unix_ms: run_started_unix_ms,
+                completed_unix_ms: now,
+                dynamic_dependencies: Vec::new(),
+                dynamic_dependencies_complete: true,
+                node_results: stats.node_results.clone(),
+            });
+        } else {
+            let outcome = if overall_success {
+                TestOutcome::Passed
+            } else {
+                TestOutcome::Failed
+            };
+            records.push(CachedTestRecord {
+                test_file: test_file.clone(),
+                dep_hash: dep_hash.clone(),
+                outcome,
+                passed: usize::from(overall_success),
+                failed: usize::from(!overall_success),
+                skipped: 0,
+                errors: 0,
+                duration_ms: fallback_dur,
+                failed_nodeids: if overall_success {
+                    Vec::new()
+                } else {
+                    vec![test_file.clone()]
+                },
+                output_snippet: if overall_success {
+                    String::new()
+                } else {
+                    snippet.clone()
+                },
+                updated_unix_ms: now,
+                source: source_label.to_string(),
+                environment_hash: environment_hash.to_string(),
+                tctx_version: env!("CARGO_PKG_VERSION").to_string(),
+                runner_mode: "go_test_json".to_string(),
+                started_unix_ms: run_started_unix_ms,
+                completed_unix_ms: now,
+                dynamic_dependencies: Vec::new(),
+                dynamic_dependencies_complete: true,
+                node_results: BTreeMap::new(),
+            });
+        }
+    }
+    Ok((records, snippet))
+}
+
+fn parse_go_test_json_output(
+    stdout: &str,
+    known_files: &BTreeMap<String, String>,
+) -> BTreeMap<String, FileXmlStats> {
+    let mut stats_by_file: BTreeMap<String, FileXmlStats> = BTreeMap::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let Some(action) = val.get("Action").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if !matches!(action, "pass" | "fail" | "skip") {
+            continue;
+        }
+        let Some(test_name) = val.get("Test").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let pkg = val
+            .get("Package")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let elapsed_ms = val
+            .get("Elapsed")
+            .and_then(serde_json::Value::as_f64)
+            .map(|secs| (secs * 1000.0).max(1.0).round() as u64)
+            .unwrap_or(1);
+
+        let matched_file = known_files
+            .keys()
+            .find(|tf| {
+                let dir = Path::new(tf)
+                    .parent()
+                    .map(normalize_rel_str)
+                    .unwrap_or_default();
+                !dir.is_empty() && pkg.ends_with(&dir)
+            })
+            .cloned()
+            .or_else(|| known_files.keys().next().cloned());
+        let Some(test_file) = matched_file else {
+            continue;
+        };
+        let entry = stats_by_file.entry(test_file.clone()).or_default();
+        entry.duration_ms = entry.duration_ms.saturating_add(elapsed_ms);
+        let outcome = match action {
+            "pass" => {
+                entry.passed += 1;
+                TestOutcome::Passed
+            }
+            "skip" => {
+                entry.skipped += 1;
+                TestOutcome::Skipped
+            }
+            _ => {
+                entry.failed += 1;
+                TestOutcome::Failed
+            }
+        };
+        let nodeid = format!("{test_file}::{test_name}");
+        if outcome == TestOutcome::Failed && !entry.failed_nodeids.contains(&nodeid) {
+            entry.failed_nodeids.push(nodeid.clone());
+        }
+        entry.node_results.insert(
+            nodeid.clone(),
+            CachedNodeResult {
+                nodeid,
+                outcome,
+                duration_ms: elapsed_ms,
+                output_snippet: String::new(),
+            },
+        );
+    }
+    stats_by_file
+}
+
+/// Extracts structured failure locations (`file:line`, `assertion`, and noise-folded stack frames) from test output.
+pub fn extract_structured_failures(
+    test_file: &str,
+    failed_nodeids: &[String],
+    output: &str,
+) -> Vec<StructuredFailure> {
+    let mut failures = Vec::new();
+    let user_frames = fold_stack_trace_noise(output);
+    let mut detected_file = test_file.to_string();
+    let mut detected_line = 1usize;
+    let mut detected_msg = String::new();
+
+    for raw_line in output.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with("E   ") && detected_msg.is_empty() {
+            detected_msg = trimmed.trim_start_matches("E   ").trim().to_string();
+        } else if (trimmed.contains("AssertionError")
+            || trimmed.contains("panicked at")
+            || trimmed.contains("AssertionFailed"))
+            && detected_msg.is_empty()
+        {
+            detected_msg = trimmed.to_string();
+        }
+        if let Some((left, right)) = trimmed.split_once(':')
+            && (left.ends_with(".py")
+                || left.ends_with(".rs")
+                || left.ends_with(".ts")
+                || left.ends_with(".tsx")
+                || left.ends_with(".js")
+                || left.ends_with(".go"))
+            && !left.contains("node_modules")
+            && !left.contains("site-packages")
+        {
+            let line_str = right.split(':').next().unwrap_or("");
+            if let Ok(line_num) = line_str.trim().parse::<usize>() {
+                detected_file = left
+                    .trim_start_matches("-->")
+                    .trim()
+                    .trim_start_matches("./")
+                    .to_string();
+                detected_line = line_num;
+            }
+        }
+    }
+    if detected_msg.is_empty() {
+        detected_msg = "Test assertion failed".to_string();
+    }
+    if failed_nodeids.is_empty() {
+        failures.push(StructuredFailure {
+            test_file: test_file.to_string(),
+            nodeid: test_file.to_string(),
+            file: detected_file,
+            line: detected_line,
+            message: detected_msg,
+            user_frames,
+        });
+    } else {
+        for nid in failed_nodeids {
+            failures.push(StructuredFailure {
+                test_file: test_file.to_string(),
+                nodeid: nid.clone(),
+                file: detected_file.clone(),
+                line: detected_line,
+                message: detected_msg.clone(),
+                user_frames: user_frames.clone(),
+            });
+        }
+    }
+    failures
+}
+
+/// Folds external library / runtime stack frames (`node_modules`, `site-packages`, `tokio::runtime`, `std::panicking`)
+/// and keeps only workspace-local user frames.
+pub fn fold_stack_trace_noise(output: &str) -> Vec<String> {
+    let mut frames = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.contains("node_modules/")
+            || trimmed.contains("site-packages/")
+            || trimmed.contains("_pytest/")
+            || trimmed.contains("tokio::runtime")
+            || trimmed.contains("std::panicking")
+            || trimmed.contains("node:internal/")
+        {
+            continue;
+        }
+        if (trimmed.contains(".py:")
+            || trimmed.contains(".rs:")
+            || trimmed.contains(".ts:")
+            || trimmed.contains(".tsx:")
+            || trimmed.contains(".go:"))
+            && frames.len() < 8
+        {
+            frames.push(trimmed.to_string());
+        }
+    }
+    frames
+}
+
+pub fn extract_missing_prerequisites(output: &str) -> Vec<String> {
+    let mut prereqs = BTreeSet::new();
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("skip")
+            && (lower.contains("env")
+                || lower.contains("url")
+                || lower.contains("database")
+                || lower.contains("redis")
+                || lower.contains("docker")
+                || lower.contains("token")
+                || lower.contains("key")
+                || lower.contains("requires"))
+        {
+            prereqs.insert(line.trim().to_string());
+        }
+    }
+    prereqs.into_iter().take(8).collect()
+}
+
+pub fn extract_warnings_summary(output: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if (trimmed.contains("DeprecationWarning:")
+            || trimmed.contains("UserWarning:")
+            || trimmed.contains("RuntimeWarning:")
+            || trimmed.contains("Warning: An update to ")
+            || trimmed.starts_with("warning:"))
+            && warnings.len() < 10
+            && !warnings.contains(&trimmed.to_string())
+        {
+            warnings.push(trimmed.to_string());
+        }
+    }
+    warnings
+}
+
+/// Formats a `TestRunResponse` as a standard JUnit XML report (`--report-format=junit`).
+pub fn format_junit_xml_report(resp: &TestRunResponse) -> String {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+    xml.push_str(&format!(
+        "<testsuites tests=\"{}\" failures=\"{}\" skipped=\"{}\" errors=\"{}\" time=\"{:.3}\">\n",
+        resp.passed + resp.failed + resp.skipped,
+        resp.failed,
+        resp.skipped,
+        resp.errors,
+        resp.duration_ms as f64 / 1000.0
+    ));
+    for f in resp.cached_files.iter().chain(resp.executed_files.iter()) {
+        xml.push_str(&format!(
+            "  <testsuite name=\"{}\" tests=\"{}\" failures=\"{}\" skipped=\"{}\" time=\"{:.3}\">\n",
+            f.test_file,
+            f.passed + f.failed + f.skipped,
+            f.failed,
+            f.skipped,
+            f.duration_ms as f64 / 1000.0
+        ));
+        if f.failed_nodeids.is_empty() {
+            xml.push_str(&format!(
+                "    <testcase classname=\"{}\" name=\"{}\" time=\"{:.3}\" />\n",
+                f.test_file,
+                f.test_file,
+                f.duration_ms as f64 / 1000.0
+            ));
+        } else {
+            for nid in &f.failed_nodeids {
+                xml.push_str(&format!(
+                    "    <testcase classname=\"{}\" name=\"{}\" time=\"{:.3}\">\n      <failure message=\"test failed\" />\n    </testcase>\n",
+                    f.test_file,
+                    nid,
+                    f.duration_ms as f64 / 1000.0
+                ));
+            }
+        }
+        xml.push_str("  </testsuite>\n");
+    }
+    xml.push_str("</testsuites>\n");
+    xml
+}
+
+/// Formats a `TestRunResponse` (including Ruff/ESLint/Clippy diagnostics and structured test failures) as SARIF v2.1.0 JSON (`--report-format=sarif`).
+pub fn format_sarif_report(resp: &TestRunResponse) -> serde_json::Value {
+    let mut results = Vec::new();
+    for diag in &resp.ruff_diagnostics {
+        results.push(serde_json::json!({
+            "ruleId": diag.code,
+            "level": "warning",
+            "message": { "text": diag.message },
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": { "uri": diag.file },
+                    "region": { "startLine": diag.row.max(1), "startColumn": diag.column.max(1) }
+                }
+            }]
+        }));
+    }
+    for fail in &resp.structured_failures {
+        results.push(serde_json::json!({
+            "ruleId": "tctx/test-failure",
+            "level": "error",
+            "message": { "text": format!("{}: {}", fail.nodeid, fail.message) },
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": { "uri": fail.file },
+                    "region": { "startLine": fail.line.max(1), "startColumn": 1 }
+                }
+            }]
+        }));
+    }
+    serde_json::json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "test-context",
+                    "version": env!("CARGO_PKG_VERSION"),
+                }
+            },
+            "results": results,
+        }]
+    })
+}
+
 fn truncate_str(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
@@ -5139,5 +6061,91 @@ ok 3 - skipped browser check # SKIP no display
             batch_stats["vscode-extension/test/nativeTools.test.ts"].failed_nodeids,
             vec!["vscode-extension/test/nativeTools.test.ts::formats status".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_clippy_go_test_structured_failures_and_junit_sarif_reports() {
+        let clippy_ndjson = br#"{"reason":"compiler-message","message":{"code":{"code":"clippy::needless_return"},"level":"warning","message":"unneeded `return` statement","spans":[{"file_name":"src/lib.rs","is_primary":true,"line_start":12,"column_start":5}],"children":[{"spans":[{"suggested_replacement":"x + 1"}]}]}}
+"#;
+        let known_rs = vec!["src/lib.rs".to_string()];
+        let clippy_map = parse_clippy_json_output(clippy_ndjson, Path::new("/repo"), &known_rs);
+        let rs_diags = &clippy_map["src/lib.rs"];
+        assert_eq!(rs_diags.len(), 1);
+        assert_eq!(rs_diags[0].code, "clippy::needless_return");
+        assert_eq!(rs_diags[0].row, 12);
+        assert!(rs_diags[0].fixable);
+
+        let go_ndjson = r#"{"Action":"run","Package":"github.com/acme/demo/pkg/calc","Test":"TestAdd"}
+{"Action":"pass","Package":"github.com/acme/demo/pkg/calc","Test":"TestAdd","Elapsed":0.012}
+{"Action":"fail","Package":"github.com/acme/demo/pkg/calc","Test":"TestDivZero","Elapsed":0.004}
+"#;
+        let mut go_known = BTreeMap::new();
+        go_known.insert("pkg/calc/math_test.go".to_string(), "gh1".to_string());
+        let go_stats = parse_go_test_json_output(go_ndjson, &go_known);
+        assert_eq!(go_stats["pkg/calc/math_test.go"].passed, 1);
+        assert_eq!(go_stats["pkg/calc/math_test.go"].failed, 1);
+        assert_eq!(
+            go_stats["pkg/calc/math_test.go"].failed_nodeids,
+            vec!["pkg/calc/math_test.go::TestDivZero".to_string()]
+        );
+
+        let raw_tb = "node_modules/vitest/dist/index.js:100:1\nsrc/components/Card.tsx:27:5\nE   AssertionError: expected 41 to equal 42\n";
+        let structured = extract_structured_failures(
+            "tests/test_card.py",
+            &["tests/test_card.py::test_val".to_string()],
+            raw_tb,
+        );
+        assert_eq!(structured.len(), 1);
+        assert_eq!(structured[0].file, "src/components/Card.tsx");
+        assert_eq!(structured[0].line, 27);
+        assert!(structured[0].message.contains("AssertionError"));
+        assert_eq!(
+            structured[0].user_frames,
+            vec!["src/components/Card.tsx:27:5".to_string()]
+        );
+
+        let dummy_resp = TestRunResponse {
+            root: PathBuf::from("/repo"),
+            status: "failed".to_string(),
+            mode: "hybrid_delta".to_string(),
+            total_test_files: 1,
+            cached_files_count: 0,
+            joined_background_files_count: 0,
+            executed_files_count: 1,
+            passed: 0,
+            failed: 1,
+            skipped: 0,
+            errors: 0,
+            duration_ms: 25,
+            saved_ms: 0,
+            cached_files: Vec::new(),
+            executed_files: vec![FileRunSummary {
+                test_file: "tests/test_card.py".to_string(),
+                dep_hash: "h1".to_string(),
+                outcome: TestOutcome::Failed,
+                source: "executed".to_string(),
+                passed: 0,
+                failed: 1,
+                skipped: 0,
+                errors: 0,
+                duration_ms: 25,
+                failed_nodeids: vec!["tests/test_card.py::test_val".to_string()],
+            }],
+            failed_nodeids: vec!["tests/test_card.py::test_val".to_string()],
+            ruff_diagnostics: rs_diags.clone(),
+            structured_failures: structured,
+            suspected_culprit_files: vec!["src/components/Card.tsx".to_string()],
+            untested_modified_files: Vec::new(),
+            flaky_tests: Vec::new(),
+            missing_prerequisites: Vec::new(),
+            warnings_summary: Vec::new(),
+            stdout_summary: "=== FAILED ===".to_string(),
+        };
+        let junit = format_junit_xml_report(&dummy_resp);
+        assert!(junit.contains("<testsuites"));
+        assert!(junit.contains("tests/test_card.py::test_val"));
+        let sarif = format_sarif_report(&dummy_resp);
+        assert_eq!(sarif["version"].as_str(), Some("2.1.0"));
+        assert_eq!(sarif["runs"][0]["results"].as_array().unwrap().len(), 2);
     }
 }

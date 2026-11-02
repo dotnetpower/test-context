@@ -167,6 +167,94 @@ pub fn detect_eslint_cmd_for_dir(root: &Path, pkg_dir: &str) -> Option<(PathBuf,
     None
 }
 
+pub fn detect_biome_cmd_for_dir(root: &Path, pkg_dir: &str) -> Option<(PathBuf, PathBuf)> {
+    if let Some(env_bin) = std::env::var_os("TCTX_BIOME_BIN") {
+        if env_bin == "none" || env_bin == "0" {
+            return None;
+        }
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            let workdir = if pkg_dir.is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(pkg_dir)
+            };
+            return Some((p, workdir));
+        }
+    }
+    if !pkg_dir.is_empty() {
+        let sub_root = root.join(pkg_dir);
+        let sub_biome = sub_root.join("node_modules/.bin/biome");
+        if sub_biome.is_file() {
+            return Some((sub_biome, sub_root));
+        }
+    }
+    let root_biome = root.join("node_modules/.bin/biome");
+    if root_biome.is_file() {
+        return Some((root_biome, root.to_path_buf()));
+    }
+    None
+}
+
+pub fn detect_tsc_cmd_for_dir(root: &Path, pkg_dir: &str) -> Option<(PathBuf, PathBuf)> {
+    if let Some(env_bin) = std::env::var_os("TCTX_TSC_BIN") {
+        if env_bin == "none" || env_bin == "0" {
+            return None;
+        }
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            let workdir = if pkg_dir.is_empty() {
+                root.to_path_buf()
+            } else {
+                root.join(pkg_dir)
+            };
+            return Some((p, workdir));
+        }
+    }
+    if !pkg_dir.is_empty() {
+        let sub_root = root.join(pkg_dir);
+        let sub_tsc = sub_root.join("node_modules/.bin/tsc");
+        if sub_tsc.is_file() && sub_root.join("tsconfig.json").is_file() {
+            return Some((sub_tsc, sub_root));
+        }
+    }
+    let root_tsc = root.join("node_modules/.bin/tsc");
+    if root_tsc.is_file() && root.join("tsconfig.json").is_file() {
+        return Some((root_tsc, root.to_path_buf()));
+    }
+    None
+}
+
+pub fn detect_nextest_cmd(_root: &Path) -> Option<Vec<String>> {
+    if let Some(env_bin) = std::env::var_os("TCTX_NEXTEST_BIN") {
+        if env_bin == "none" || env_bin == "0" {
+            return None;
+        }
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            return Some(vec![p.to_string_lossy().into_owned(), "nextest".to_string()]);
+        }
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if dir.join("cargo-nextest").is_file() {
+                return Some(vec!["cargo".to_string(), "nextest".to_string()]);
+            }
+        }
+    }
+    None
+}
+
+pub fn detect_go_cmd(_root: &Path) -> Vec<String> {
+    if let Some(env_bin) = std::env::var_os("TCTX_GO_BIN") {
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            return vec![p.to_string_lossy().into_owned()];
+        }
+    }
+    vec!["go".to_string()]
+}
+
 pub fn detect_cargo_cmd(_root: &Path) -> Vec<String> {
     if let Some(env_bin) = std::env::var_os("TCTX_CARGO_BIN") {
         let p = PathBuf::from(env_bin);

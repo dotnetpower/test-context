@@ -25,6 +25,26 @@ export function formatToolResult(operation: string, value: JsonValue): string {
       if (failedNodeids.length > 0) {
         lines.push(`failed_nodeids=${failedNodeids.join(', ')}`);
       }
+      if (Array.isArray(result.suspected_culprit_files) && result.suspected_culprit_files.length > 0) {
+        const culprits = result.suspected_culprit_files.map((c) => stringValue(c, 'culprit file'));
+        lines.push(`suspected_culprit_files=${culprits.join(', ')}`);
+      }
+      if (Array.isArray(result.structured_failures) && result.structured_failures.length > 0) {
+        for (const [idx, rawFail] of result.structured_failures.slice(0, 5).entries()) {
+          const fail = recordValue(rawFail, `structured failure ${idx}`);
+          lines.push(
+            `failure ${stringValue(fail.file, 'file')}:${integerValue(fail.line, 'line')} ${stringValue(fail.nodeid, 'nodeid')} ${stringValue(fail.message, 'message')}`,
+          );
+        }
+      }
+      if (Array.isArray(result.untested_modified_files) && result.untested_modified_files.length > 0) {
+        const untested = result.untested_modified_files.map((u) => stringValue(u, 'untested file'));
+        lines.push(`untested_modified_files=${untested.join(', ')}`);
+      }
+      if (Array.isArray(result.flaky_tests) && result.flaky_tests.length > 0) {
+        const flaky = result.flaky_tests.map((f) => stringValue(f, 'flaky test'));
+        lines.push(`flaky_tests=${flaky.join(', ')}`);
+      }
       lines.push(summary);
       return lines.join('\n');
     }
@@ -41,6 +61,14 @@ export function formatToolResult(operation: string, value: JsonValue): string {
           .map((c) => stringValue(c, 'chain step'))
           .join(' -> ');
         lines.push(`${file} state=${state} chain=[${chain}]`);
+      }
+      if (Array.isArray(result.untested_modified_files) && result.untested_modified_files.length > 0) {
+        const untested = result.untested_modified_files.map((u) => stringValue(u, 'untested file'));
+        lines.push(`untested_modified_files=${untested.join(', ')}`);
+      }
+      if (Array.isArray(result.suggested_tests) && result.suggested_tests.length > 0) {
+        const suggested = result.suggested_tests.map((s) => stringValue(s, 'suggested test'));
+        lines.push(`suggested_tests=${suggested.join(', ')}`);
       }
       if (Array.isArray(result.ruff_diagnostics) && result.ruff_diagnostics.length > 0) {
         lines.push(`ruff_errors=${result.ruff_diagnostics.length}`);

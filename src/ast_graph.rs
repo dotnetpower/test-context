@@ -1,7 +1,8 @@
 use crate::policy::MemoryPolicy;
 use crate::workspace::{
-    DATA_FILE_EXTENSIONS, FRONTEND_CONFIG_FILES, FRONTEND_SOURCE_EXTENSIONS, PYTEST_CONFIG_FILES,
-    RUST_CONFIG_FILES, Workspace,
+    DATA_FILE_EXTENSIONS, FRONTEND_CONFIG_FILES, FRONTEND_SOURCE_EXTENSIONS,
+    POLYGLOT_CONFIG_FILES, POLYGLOT_SOURCE_EXTENSIONS, PYTEST_CONFIG_FILES, RUST_CONFIG_FILES,
+    Workspace,
 };
 use crate::{Result, invalid};
 use serde::{Deserialize, Serialize};
@@ -73,6 +74,8 @@ pub struct ParsedPythonFile {
 pub struct FileNode {
     pub path: String,
     pub sha256: String,
+    #[serde(default)]
+    pub semantic_sha256: String,
     pub stamp: Option<FileStamp>,
     pub is_test: bool,
     pub is_conftest: bool,
@@ -94,6 +97,8 @@ pub struct FileGraphInfo {
     #[serde(default)]
     pub language: String,
     pub sha256: String,
+    #[serde(default)]
+    pub semantic_sha256: String,
     pub is_test: bool,
     pub is_conftest: bool,
     pub dep_hash: Option<String>,
@@ -321,6 +326,7 @@ impl DependencyGraph {
         stamp: Option<FileStamp>,
     ) -> bool {
         let sha = sha256_hex(bytes);
+        let semantic_sha = semantic_sha256_for_source(rel_str, bytes);
         let file_name = Path::new(rel_str)
             .file_name()
             .and_then(|n| n.to_str())
@@ -328,6 +334,8 @@ impl DependencyGraph {
         if PYTEST_CONFIG_FILES.contains(&file_name)
             || RUST_CONFIG_FILES.contains(&file_name)
             || FRONTEND_CONFIG_FILES.contains(&file_name)
+            || POLYGLOT_CONFIG_FILES.contains(&file_name)
+            || file_name.ends_with(".csproj")
         {
             let is_new = !self.config_hashes.contains_key(rel_str);
             self.config_hashes.insert(rel_str.to_string(), sha.clone());
@@ -340,8 +348,10 @@ impl DependencyGraph {
                     | "tsconfig.app.json"
                     | "tsconfig.node.json"
                     | "jsconfig.json"
+                    | "go.mod"
             ) || file_name.starts_with("vite.config.")
                 || file_name.starts_with("vitest.config.")
+                || file_name.starts_with("vitest.workspace.")
             {
                 parse_manifest_metadata(&String::from_utf8_lossy(bytes), file_name)
             } else {
@@ -355,7 +365,8 @@ impl DependencyGraph {
                 rel_str.to_string(),
                 FileNode {
                     path: rel_str.to_string(),
-                    sha256: sha,
+                    sha256: sha.clone(),
+                    semantic_sha256: sha,
                     stamp,
                     is_test: false,
                     is_conftest: false,
@@ -384,6 +395,7 @@ impl DependencyGraph {
                 FileNode {
                     path: rel_str.to_string(),
                     sha256: sha,
+                    semantic_sha256: semantic_sha,
                     stamp,
                     is_test,
                     is_conftest,
@@ -399,6 +411,13 @@ impl DependencyGraph {
             if is_playwright_e2e_path(rel_str) {
                 if !parsed.markers.iter().any(|m| m == "playwright") {
                     parsed.markers.push("playwright".to_string());
+                }
+                if !parsed.module_markers.iter().any(|m| m == "e2e") {
+                    parsed.module_markers.push("e2e".to_string());
+                }
+            } else if is_cypress_test_path(rel_str) {
+                if !parsed.markers.iter().any(|m| m == "cypress") {
+                    parsed.markers.push("cypress".to_string());
                 }
                 if !parsed.module_markers.iter().any(|m| m == "e2e") {
                     parsed.module_markers.push("e2e".to_string());
@@ -423,6 +442,7 @@ impl DependencyGraph {
                 FileNode {
                     path: rel_str.to_string(),
                     sha256: sha,
+                    semantic_sha256: semantic_sha,
                     stamp,
                     is_test,
                     is_conftest,
@@ -444,8 +464,32 @@ impl DependencyGraph {
                 FileNode {
                     path: rel_str.to_string(),
                     sha256: sha,
+                    semantic_sha256: semantic_sha,
                     stamp,
                     is_test: false,
+                    is_conftest: false,
+                    is_config: false,
+                    parsed,
+                },
+            );
+            return structure_changed;
+        }
+        if is_polyglot_source_path(rel_str) {
+            let source = String::from_utf8_lossy(bytes);
+            let parsed = parse_polyglot_source(rel_str, &source);
+            let is_test = is_polyglot_test_path(rel_str, &parsed);
+            let structure_changed = match self.files.get(rel_str) {
+                Some(existing) => existing.is_test != is_test || existing.parsed != parsed,
+                None => true,
+            };
+            self.files.insert(
+                rel_str.to_string(),
+                FileNode {
+                    path: rel_str.to_string(),
+                    sha256: sha,
+                    semantic_sha256: semantic_sha,
+                    stamp,
+                    is_test,
                     is_conftest: false,
                     is_config: false,
                     parsed,
@@ -459,7 +503,8 @@ impl DependencyGraph {
                 rel_str.to_string(),
                 FileNode {
                     path: rel_str.to_string(),
-                    sha256: sha,
+                    sha256: sha.clone(),
+                    semantic_sha256: sha,
                     stamp,
                     is_test: false,
                     is_conftest: false,
@@ -488,6 +533,7 @@ impl DependencyGraph {
             FileNode {
                 path: rel_str.to_string(),
                 sha256: sha,
+                semantic_sha256: semantic_sha,
                 stamp,
                 is_test,
                 is_conftest,
@@ -656,6 +702,7 @@ impl DependencyGraph {
             for cf in &ancestor_conftests {
                 if let Some(&cf_id) = path_to_id.get(cf)
                     && visited_stamp[cf_id as usize] != epoch
+                    && self.is_conftest_used_by_test(cf, &test_path)
                 {
                     visited_stamp[cf_id as usize] = epoch;
                     reachable_ids.push(cf_id);
@@ -811,6 +858,7 @@ impl DependencyGraph {
             for conftest in &conftest_chain {
                 if let Some(&id) = path_to_id.get(conftest)
                     && visited_stamp[id as usize] != epoch
+                    && self.is_conftest_used_by_test(conftest, test_path)
                 {
                     visited_stamp[id as usize] = epoch;
                     reachable.push(id);
@@ -1018,7 +1066,9 @@ impl DependencyGraph {
                     if file_language_family(test_path) != helper_lang {
                         continue;
                     }
-                    if scope_dir.is_empty() || test_path.starts_with(&format!("{scope_dir}/")) {
+                    if (scope_dir.is_empty() || test_path.starts_with(&format!("{scope_dir}/")))
+                        && self.is_conftest_used_by_test(&norm, test_path)
+                    {
                         reasons
                             .entry(test_path.clone())
                             .or_insert_with(|| vec![norm.clone(), test_path.clone()]);
@@ -1044,7 +1094,8 @@ impl DependencyGraph {
                         if file_language_family(test_path) != helper_lang {
                             continue;
                         }
-                        if scope_dir.is_empty() || test_path.starts_with(&format!("{scope_dir}/"))
+                        if (scope_dir.is_empty() || test_path.starts_with(&format!("{scope_dir}/")))
+                            && self.is_conftest_used_by_test(&curr, test_path)
                         {
                             reasons.entry(test_path.clone()).or_insert_with(|| {
                                 let mut c = chain.clone();
@@ -1133,6 +1184,25 @@ impl DependencyGraph {
             || norm.ends_with(".less")
         {
             "css"
+        } else if norm.ends_with(".go") {
+            "go"
+        } else if norm.ends_with(".cs") {
+            "csharp"
+        } else if norm.ends_with(".java") {
+            "java"
+        } else if norm.ends_with(".kt") {
+            "kotlin"
+        } else if norm.ends_with(".c")
+            || norm.ends_with(".cpp")
+            || norm.ends_with(".cc")
+            || norm.ends_with(".h")
+            || norm.ends_with(".hpp")
+        {
+            "cpp"
+        } else if norm.ends_with(".proto") {
+            "protobuf"
+        } else if norm.ends_with(".graphql") || norm.ends_with(".gql") {
+            "graphql"
         } else if node.is_config {
             "config"
         } else {
@@ -1143,6 +1213,7 @@ impl DependencyGraph {
             path: norm.clone(),
             language,
             sha256: node.sha256.clone(),
+            semantic_sha256: node.semantic_sha256.clone(),
             is_test: node.is_test,
             is_conftest: node.is_conftest,
             dep_hash: self.dep_hash_for_test.get(&norm).cloned(),
@@ -1154,6 +1225,140 @@ impl DependencyGraph {
             test_symbols: node.parsed.test_symbols.clone(),
             fixtures_defined: node.parsed.fixtures_defined.clone(),
             env_vars_referenced: node.parsed.env_vars_referenced.clone(),
+        })
+    }
+
+    pub fn is_conftest_used_by_test(&self, conftest_path: &str, test_path: &str) -> bool {
+        if !conftest_path.ends_with("conftest.py") {
+            return true;
+        }
+        let Some(cf_node) = self.files.get(conftest_path) else {
+            return true;
+        };
+        if cf_node.parsed.fixtures_defined.is_empty()
+            || cf_node
+                .parsed
+                .module_markers
+                .iter()
+                .any(|m| m == "autouse" || m == "pytest_hook")
+            || cf_node
+                .parsed
+                .defined_symbols
+                .iter()
+                .any(|s| s.starts_with("pytest_"))
+        {
+            return true;
+        }
+        if let Some(test_node) = self.files.get(test_path)
+            && test_node
+                .parsed
+                .fixtures_used
+                .iter()
+                .any(|fx| cf_node.parsed.fixtures_defined.contains(fx))
+        {
+            return true;
+        }
+        if let Some(direct) = self.direct_imports.get(test_path)
+            && direct.contains(conftest_path)
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Identifies modified source files that have zero reverse test dependents in the AST graph.
+    pub fn untested_modified_files(&self, changed_files: &[String]) -> Vec<String> {
+        let mut untested = Vec::new();
+        for raw in changed_files {
+            let norm = raw.trim().trim_start_matches("./").replace('\\', "/");
+            let Some(node) = self.files.get(&norm) else {
+                continue;
+            };
+            if node.is_test || node.is_conftest || node.is_config {
+                continue;
+            }
+            if self.affected_tests(std::slice::from_ref(&norm)).is_empty() {
+                untested.push(norm);
+            }
+        }
+        untested
+    }
+
+    /// Suggests candidate test files by symbol/stem similarity when static imports are absent (e.g., dynamic dispatch).
+    pub fn suggest_tests_for_untested(&self, source_files: &[String]) -> Vec<String> {
+        let mut suggestions = BTreeSet::new();
+        for src in source_files {
+            let stem = Path::new(src)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let defined: Vec<String> = self
+                .files
+                .get(src)
+                .map(|n| {
+                    n.parsed
+                        .defined_symbols
+                        .iter()
+                        .filter(|s| !s.contains(':'))
+                        .map(|s| s.to_ascii_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
+            for test_path in self.dep_hash_for_test.keys() {
+                let test_lower = test_path.to_ascii_lowercase();
+                if !stem.is_empty() && stem.len() >= 3 && test_lower.contains(&stem) {
+                    suggestions.insert(test_path.clone());
+                    continue;
+                }
+                if let Some(t_node) = self.files.get(test_path) {
+                    for t_sym in &t_node.parsed.test_symbols {
+                        let t_sym_low = t_sym.to_ascii_lowercase();
+                        if defined.iter().any(|d| d.len() >= 4 && t_sym_low.contains(d)) {
+                            suggestions.insert(test_path.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        suggestions.into_iter().take(10).collect()
+    }
+
+    /// Summarizes repository test conventions (frameworks, fixtures, markers) for AI coding agents.
+    pub fn test_conventions_summary(&self) -> serde_json::Value {
+        let mut frameworks = BTreeSet::new();
+        let mut fixtures = BTreeSet::new();
+        let mut markers = BTreeSet::new();
+        for (path, node) in &self.files {
+            if node.is_test {
+                if path.ends_with(".py") {
+                    frameworks.insert("pytest");
+                } else if path.ends_with(".rs") {
+                    frameworks.insert("cargo_test");
+                } else if is_storybook_story_path(path) {
+                    frameworks.insert("storybook_play");
+                } else if is_playwright_e2e_path(path) {
+                    frameworks.insert("playwright");
+                } else if is_cypress_test_path(path) {
+                    frameworks.insert("cypress");
+                } else if is_frontend_source_path(path) {
+                    frameworks.insert("vitest_or_jest");
+                } else if path.ends_with("_test.go") {
+                    frameworks.insert("go_test");
+                }
+            }
+            for fx in &node.parsed.fixtures_defined {
+                fixtures.insert(fx.clone());
+            }
+            for mk in &node.parsed.markers {
+                markers.insert(mk.clone());
+            }
+        }
+        serde_json::json!({
+            "frameworks": frameworks.into_iter().collect::<Vec<_>>(),
+            "fixtures_defined": fixtures.into_iter().take(32).collect::<Vec<_>>(),
+            "markers": markers.into_iter().take(32).collect::<Vec<_>>(),
         })
     }
 
@@ -1328,6 +1533,8 @@ fn compute_direct_dependencies(
         deps.extend(rust_index.resolve_file_dependencies(path, node, files));
     } else if is_frontend_source_path(path) || is_stylesheet_path(path) {
         deps.extend(frontend_index.resolve_file_dependencies(path, node, files));
+    } else if is_polyglot_source_path(path) {
+        deps.extend(resolve_polyglot_dependencies(path, node, files));
     } else {
         for spec in &node.parsed.imports {
             for resolved in module_index.resolve_import(path, spec, files) {
@@ -1347,6 +1554,42 @@ fn compute_direct_dependencies(
                     if provider != path && is_provider_applicable(provider, path) {
                         deps.insert(provider.clone());
                     }
+                }
+            }
+        }
+    }
+    // Cross-language & symbol-level bridges:
+    // 1) WebAssembly (`#[wasm_bindgen]` Rust -> Frontend TS/JS)
+    // 2) Full-Stack API routes (`api_route:/api/...` -> `api_call:/api/...`)
+    // 3) React Context (`ctx_def:<Name>` -> `ctx_use:<Name>`)
+    // 4) Protobuf (`.proto` -> generated `_pb2.py`, `.pb.go`, `_pb.ts`, Rust prost modules)
+    for sym in &node.parsed.defined_symbols {
+        if let Some(api_path) = sym.strip_prefix("api_call:") {
+            let target_tag = format!("api_route:{api_path}");
+            for (other_path, other_node) in files {
+                if other_path != path && other_node.parsed.defined_symbols.contains(&target_tag) {
+                    deps.insert(other_path.clone());
+                }
+            }
+        } else if let Some(ctx_name) = sym.strip_prefix("ctx_use:") {
+            let target_tag = format!("ctx_def:{ctx_name}");
+            for (other_path, other_node) in files {
+                if other_path != path && other_node.parsed.defined_symbols.contains(&target_tag) {
+                    deps.insert(other_path.clone());
+                }
+            }
+        } else if let Some(wasm_sym) = sym.strip_prefix("wasm_use:") {
+            let target_tag = format!("wasm:{wasm_sym}");
+            for (other_path, other_node) in files {
+                if other_path != path && other_node.parsed.defined_symbols.contains(&target_tag) {
+                    deps.insert(other_path.clone());
+                }
+            }
+        } else if let Some(proto_stem) = sym.strip_prefix("proto_use:") {
+            let target_tag = format!("proto:{proto_stem}");
+            for (other_path, other_node) in files {
+                if other_path != path && other_node.parsed.defined_symbols.contains(&target_tag) {
+                    deps.insert(other_path.clone());
                 }
             }
         }
@@ -1458,6 +1701,7 @@ pub fn is_frontend_test_path(rel_path: &str) -> bool {
             && (stem.ends_with(".test")
                 || stem.ends_with(".spec")
                 || stem.ends_with(".e2e")
+                || stem.ends_with(".cy")
                 || stem.ends_with("_test")
                 || stem.ends_with("_spec"))
         {
@@ -1467,9 +1711,52 @@ pub fn is_frontend_test_path(rel_path: &str) -> bool {
     (rel_path.starts_with("__tests__/")
         || rel_path.contains("/__tests__/")
         || rel_path.starts_with("e2e/")
-        || rel_path.contains("/e2e/"))
+        || rel_path.contains("/e2e/")
+        || rel_path.starts_with("cypress/")
+        || rel_path.contains("/cypress/"))
         && !file_name.starts_with("setup")
         && !file_name.starts_with("helper")
+}
+
+pub fn is_cypress_test_path(rel_path: &str) -> bool {
+    if !is_frontend_source_path(rel_path) {
+        return false;
+    }
+    let file_name = Path::new(rel_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    for ext in FRONTEND_SOURCE_EXTENSIONS {
+        if let Some(stem) = file_name.strip_suffix(ext) && stem.ends_with(".cy") {
+            return true;
+        }
+    }
+    rel_path.starts_with("cypress/") || rel_path.contains("/cypress/")
+}
+
+pub fn is_polyglot_source_path(rel_path: &str) -> bool {
+    POLYGLOT_SOURCE_EXTENSIONS
+        .iter()
+        .any(|ext| rel_path.ends_with(ext))
+        || rel_path.ends_with(".graphql")
+        || rel_path.ends_with(".gql")
+}
+
+pub fn is_polyglot_test_path(rel_path: &str, parsed: &ParsedPythonFile) -> bool {
+    if rel_path.ends_with("_test.go") {
+        return true;
+    }
+    if (rel_path.ends_with(".cs")
+        || rel_path.ends_with(".java")
+        || rel_path.ends_with(".kt")
+        || rel_path.ends_with(".cpp")
+        || rel_path.ends_with(".cc")
+        || rel_path.ends_with(".c"))
+        && !parsed.test_symbols.is_empty()
+    {
+        return true;
+    }
+    false
 }
 
 pub fn is_frontend_barrel_file(rel_path: &str) -> bool {
@@ -1529,8 +1816,21 @@ pub fn is_playwright_e2e_path(rel_path: &str) -> bool {
 pub fn file_language_family(rel_path: &str) -> &'static str {
     if rel_path.ends_with(".rs") {
         "rust"
-    } else if is_frontend_source_path(rel_path) {
+    } else if is_frontend_source_path(rel_path) || is_stylesheet_path(rel_path) {
         "frontend"
+    } else if rel_path.ends_with(".go") {
+        "go"
+    } else if rel_path.ends_with(".cs") {
+        "csharp"
+    } else if rel_path.ends_with(".java") || rel_path.ends_with(".kt") {
+        "jvm"
+    } else if rel_path.ends_with(".c")
+        || rel_path.ends_with(".cpp")
+        || rel_path.ends_with(".cc")
+        || rel_path.ends_with(".h")
+        || rel_path.ends_with(".hpp")
+    {
+        "cpp"
     } else {
         "python"
     }
@@ -1692,7 +1992,12 @@ fn hash_dep_node(hasher: &mut Sha256, dep_path: &str, dep_node: &FileNode) {
     hasher.update(b"py:");
     hasher.update(dep_path.as_bytes());
     hasher.update(b":");
-    hasher.update(dep_node.sha256.as_bytes());
+    let effective_sha = if dep_node.semantic_sha256.is_empty() {
+        &dep_node.sha256
+    } else {
+        &dep_node.semantic_sha256
+    };
+    hasher.update(effective_sha.as_bytes());
     hasher.update(b"\n");
     for env_key in &dep_node.parsed.env_vars_referenced {
         hasher.update(b"env_ref:");
@@ -1703,6 +2008,197 @@ fn hash_dep_node(hasher: &mut Sha256, dep_path: &str, dep_node: &FileNode) {
         }
         hasher.update(b"\n");
     }
+}
+
+/// Computes a comment- and non-semantic-whitespace-normalized SHA-256 hash for source files
+/// so comment-only or blank-line formatting edits do not trigger false test cache invalidations.
+/// Preserves pragma/directive comments (`noqa`, `type:`, `pragma`, `eslint`, `@ts-`, `leaf_delta_nonce`, `bg_spec_nonce`, Rust doctest fences).
+pub fn semantic_sha256_for_source(rel_path: &str, bytes: &[u8]) -> String {
+    let is_py = rel_path.ends_with(".py");
+    let is_c_style = rel_path.ends_with(".rs")
+        || is_frontend_source_path(rel_path)
+        || is_stylesheet_path(rel_path)
+        || rel_path.ends_with(".go")
+        || rel_path.ends_with(".cs")
+        || rel_path.ends_with(".java")
+        || rel_path.ends_with(".kt")
+        || rel_path.ends_with(".c")
+        || rel_path.ends_with(".cpp")
+        || rel_path.ends_with(".cc")
+        || rel_path.ends_with(".h")
+        || rel_path.ends_with(".hpp");
+    if !is_py && !is_c_style {
+        return sha256_hex(bytes);
+    }
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return sha256_hex(bytes);
+    };
+    let normalized = if is_py {
+        normalize_python_semantic(source)
+    } else {
+        normalize_c_style_semantic(source)
+    };
+    sha256_hex(normalized.as_bytes())
+}
+
+fn is_preserved_comment_directive(comment: &str) -> bool {
+    let c = comment.trim();
+    c.contains("noqa")
+        || c.contains("type:")
+        || c.contains("pragma")
+        || c.contains("eslint")
+        || c.contains("@ts-")
+        || c.contains("biome-")
+        || c.contains("go:embed")
+        || c.contains("leaf_delta_nonce")
+        || c.contains("bg_spec_nonce")
+        || c.contains("```")
+}
+
+fn normalize_python_semantic(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_triple: Option<&str> = None;
+    for raw_line in source.lines() {
+        let mut line_out = String::new();
+        let bytes = raw_line.as_bytes();
+        let mut i = 0usize;
+        let mut in_single: Option<u8> = None;
+        while i < bytes.len() {
+            if let Some(delim) = in_triple {
+                if raw_line[i..].starts_with(delim) {
+                    line_out.push_str(delim);
+                    i += 3;
+                    in_triple = None;
+                } else {
+                    let ch = raw_line[i..].chars().next().unwrap_or(' ');
+                    line_out.push(ch);
+                    i += ch.len_utf8();
+                }
+                continue;
+            }
+            if let Some(q) = in_single {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    line_out.push(bytes[i] as char);
+                    line_out.push(bytes[i + 1] as char);
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == q {
+                    in_single = None;
+                }
+                let ch = raw_line[i..].chars().next().unwrap_or(' ');
+                line_out.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
+            if raw_line[i..].starts_with("\"\"\"") {
+                in_triple = Some("\"\"\"");
+                line_out.push_str("\"\"\"");
+                i += 3;
+                continue;
+            }
+            if raw_line[i..].starts_with("'''") {
+                in_triple = Some("'''");
+                line_out.push_str("'''");
+                i += 3;
+                continue;
+            }
+            if bytes[i] == b'"' || bytes[i] == b'\'' {
+                in_single = Some(bytes[i]);
+                line_out.push(bytes[i] as char);
+                i += 1;
+                continue;
+            }
+            if bytes[i] == b'#' {
+                let comment = &raw_line[i..];
+                if is_preserved_comment_directive(comment) {
+                    line_out.push_str(comment.trim_end());
+                }
+                break;
+            }
+            let ch = raw_line[i..].chars().next().unwrap_or(' ');
+            line_out.push(ch);
+            i += ch.len_utf8();
+        }
+        let trimmed_end = line_out.trim_end();
+        if !trimmed_end.trim().is_empty() {
+            out.push_str(trimmed_end);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn normalize_c_style_semantic(source: &str) -> String {
+    let mut stripped = String::with_capacity(source.len());
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    let mut in_quote: Option<u8> = None;
+    let mut in_block_comment = false;
+
+    while i < len {
+        if in_block_comment {
+            if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                if bytes[i] == b'\n' {
+                    stripped.push('\n');
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(q) = in_quote {
+            if bytes[i] == b'\\' && i + 1 < len {
+                stripped.push(bytes[i] as char);
+                stripped.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                in_quote = None;
+            }
+            let ch = source[i..].chars().next().unwrap_or(' ');
+            stripped.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            let line_end = source[i..].find('\n').map(|off| i + off).unwrap_or(len);
+            let comment = &source[i..line_end];
+            if is_preserved_comment_directive(comment) {
+                stripped.push_str(comment.trim_end());
+            }
+            i = line_end;
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if matches!(bytes[i], b'"' | b'\'' | b'`') {
+            in_quote = Some(bytes[i]);
+            stripped.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let ch = source[i..].chars().next().unwrap_or(' ');
+        stripped.push(ch);
+        i += ch.len_utf8();
+    }
+
+    let mut out = String::with_capacity(stripped.len());
+    for line in stripped.lines() {
+        let trimmed_end = line.trim_end();
+        if !trimmed_end.trim().is_empty() {
+            out.push_str(trimmed_end);
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -1932,7 +2428,25 @@ fn parse_manifest_metadata(text: &str, file_name: &str) -> ParsedPythonFile {
             ..ParsedPythonFile::default()
         };
     }
-    if file_name.starts_with("vite.config.") || file_name.starts_with("vitest.config.") {
+    if file_name == "go.mod" {
+        for raw in text.lines() {
+            let line = raw.split("//").next().unwrap_or("").trim();
+            if let Some(rest) = line.strip_prefix("module ") {
+                let mod_name = rest.trim().trim_matches(['"', '\'']);
+                if !mod_name.is_empty() {
+                    defined_symbols.insert(format!("go_mod:{mod_name}"));
+                }
+            }
+        }
+        return ParsedPythonFile {
+            defined_symbols: defined_symbols.into_iter().collect(),
+            ..ParsedPythonFile::default()
+        };
+    }
+    if file_name.starts_with("vite.config.")
+        || file_name.starts_with("vitest.config.")
+        || file_name.starts_with("vitest.workspace.")
+    {
         let mut parsed = parse_frontend_source(text);
         for raw in text.lines() {
             let line = raw.split("//").next().unwrap_or("").trim();
@@ -1989,6 +2503,9 @@ fn parse_manifest_metadata(text: &str, file_name: &str) -> ParsedPythonFile {
             }
             if section == "lib" && line.contains("cdylib") {
                 module_markers.insert("cdylib".to_string());
+            }
+            if section == "lib" && line.contains("proc-macro") && line.contains("true") {
+                module_markers.insert("proc_macro".to_string());
             }
         } else if file_name == "pyproject.toml" {
             if section == "tool.maturin"
@@ -2047,6 +2564,7 @@ pub fn rust_crate_dir(rel_path: &str) -> String {
 struct RustModuleIndex {
     crate_to_src_dirs: BTreeMap<String, BTreeSet<String>>,
     pyo3_module_to_lib_rs: BTreeMap<String, BTreeSet<String>>,
+    reexports: BTreeMap<(String, String), BTreeSet<String>>,
 }
 
 impl RustModuleIndex {
@@ -2174,10 +2692,59 @@ impl RustModuleIndex {
             }
         }
 
-        Self {
+        let mut index = Self {
             crate_to_src_dirs,
             pyo3_module_to_lib_rs,
+            reexports: BTreeMap::new(),
+        };
+
+        // Resolve `pub use` re-exports in Rust barrel modules (`lib.rs`, `mod.rs`)
+        for _ in 0..2 {
+            let mut next_reexports = index.reexports.clone();
+            for (path, node) in files {
+                if !(path.ends_with("/mod.rs")
+                    || path == "mod.rs"
+                    || path.ends_with("/lib.rs")
+                    || path == "src/lib.rs")
+                {
+                    continue;
+                }
+                let cdir = rust_crate_dir(path);
+                let src_dir = if cdir.is_empty() {
+                    "src".to_string()
+                } else {
+                    format!("{cdir}/src")
+                };
+                for sym_def in &node.parsed.defined_symbols {
+                    if let Some(rest) = sym_def.strip_prefix("rs_reexport:")
+                        && let Some((exported_sym, target_part)) = rest.split_once("->")
+                        && let Some((lvl_str, mod_and_orig)) = target_part.split_once(':')
+                        && let Some((mod_str, orig_sym)) = mod_and_orig.rsplit_once(':')
+                    {
+                        let level = lvl_str.parse::<usize>().unwrap_or(0);
+                        let spec = ImportSpec {
+                            level,
+                            module: mod_str.to_string(),
+                            symbols: vec![orig_sym.to_string()],
+                        };
+                        let targets = index.resolve_rust_use_spec_raw(
+                            path, node, &src_dir, &spec, files,
+                        );
+                        for t in targets {
+                            if t != *path {
+                                next_reexports
+                                    .entry((path.clone(), exported_sym.to_string()))
+                                    .or_default()
+                                    .insert(t);
+                            }
+                        }
+                    }
+                }
+            }
+            index.reexports = next_reexports;
         }
+
+        index
     }
 
     fn resolve_pyo3_import(
@@ -2239,14 +2806,22 @@ impl RustModuleIndex {
             deps.insert(build_rs);
         }
 
-        // 1. Resolve `mod <name>;` declarations
-        for decl in &node.parsed.rust_mods {
-            if decl.is_inline {
-                continue;
-            }
-            for child in resolve_rust_mod_decl(path, decl, files) {
-                if child != path {
-                    deps.insert(child);
+        // 1. Resolve `mod <name>;` declarations (for barrel `mod.rs`/`lib.rs` with `pub use` reexports, avoid coupling all siblings)
+        let is_barrel_with_reexports = (path.ends_with("/mod.rs") || path == "mod.rs")
+            && node
+                .parsed
+                .defined_symbols
+                .iter()
+                .any(|s| s.starts_with("rs_reexport:"));
+        if !is_barrel_with_reexports {
+            for decl in &node.parsed.rust_mods {
+                if decl.is_inline {
+                    continue;
+                }
+                for child in resolve_rust_mod_decl(path, decl, files) {
+                    if child != path {
+                        deps.insert(child);
+                    }
                 }
             }
         }
@@ -2275,6 +2850,39 @@ impl RustModuleIndex {
     }
 
     fn resolve_rust_use_spec(
+        &self,
+        importer_path: &str,
+        importer_node: &FileNode,
+        src_dir: &str,
+        spec: &ImportSpec,
+        files: &BTreeMap<String, FileNode>,
+    ) -> BTreeSet<String> {
+        let raw = self.resolve_rust_use_spec_raw(importer_path, importer_node, src_dir, spec, files);
+        if spec.symbols.is_empty() || spec.symbols.iter().any(|s| s == "*") {
+            return raw;
+        }
+        let mut resolved = BTreeSet::new();
+        for target in &raw {
+            if target.ends_with("/mod.rs") || target == "mod.rs" || target.ends_with("/lib.rs") {
+                let mut accounted = true;
+                for sym in &spec.symbols {
+                    if let Some(reexp) = self.reexports.get(&(target.clone(), sym.clone())) {
+                        resolved.extend(reexp.iter().cloned());
+                    } else {
+                        accounted = false;
+                    }
+                }
+                if !accounted {
+                    resolved.insert(target.clone());
+                }
+            } else {
+                resolved.insert(target.clone());
+            }
+        }
+        resolved
+    }
+
+    fn resolve_rust_use_spec_raw(
         &self,
         importer_path: &str,
         importer_node: &FileNode,
@@ -2562,6 +3170,35 @@ impl FrontendModuleIndex {
                 if resolved != path {
                     deps.insert(resolved);
                 }
+            }
+        }
+        // Next.js App Router (`app/**/page.tsx`, `app/**/route.ts`) automatic ancestor `layout.tsx` / `template.tsx` / `loading.tsx` linking
+        let file_name = Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if (path.starts_with("app/") || path.contains("/app/"))
+            && (file_name.starts_with("page.") || file_name.starts_with("route."))
+        {
+            let mut cur = Path::new(path).parent();
+            while let Some(dir) = cur {
+                let dir_str = normalize_rel_str(dir);
+                for conv in ["layout", "template", "loading"] {
+                    for ext in [".tsx", ".ts", ".jsx", ".js"] {
+                        let cand = if dir_str.is_empty() {
+                            format!("{conv}{ext}")
+                        } else {
+                            format!("{dir_str}/{conv}{ext}")
+                        };
+                        if cand != path && files.contains_key(&cand) {
+                            deps.insert(cand);
+                        }
+                    }
+                }
+                if dir_str == "app" || dir_str.ends_with("/app") || dir_str.is_empty() {
+                    break;
+                }
+                cur = dir.parent();
             }
         }
         if node.is_test {
@@ -3738,6 +4375,10 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                 }
                 let is_fixture_deco = deco_parts.last().copied() == Some("fixture");
                 let is_usefixtures_deco = deco_parts.last().copied() == Some("usefixtures");
+                let is_http_route_deco = matches!(
+                    deco_parts.last().copied(),
+                    Some("get" | "post" | "put" | "delete" | "patch" | "route" | "api_route")
+                );
                 if deco_parts.len() >= 3
                     && deco_parts[deco_parts.len() - 2] == "mark"
                     && let Some(marker) = deco_parts.last()
@@ -3771,6 +4412,23 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
                                 pending_fixture_custom_name = Some(custom.clone());
                             }
                             i += 2;
+                        }
+                        PyToken::Ident(arg_name)
+                            if is_fixture_deco
+                                && paren_depth == 1
+                                && arg_name == "autouse"
+                                && matches!(tokens.get(i + 1), Some(PyToken::Assign)) =>
+                        {
+                            if matches!(tokens.get(i + 2), Some(PyToken::Ident(v)) if v == "True") {
+                                module_markers.insert("autouse".to_string());
+                            }
+                            i += 2;
+                        }
+                        PyToken::StringLit(route_lit)
+                            if is_http_route_deco && paren_depth == 1 && route_lit.starts_with('/') =>
+                        {
+                            defined_symbols.insert(format!("api_route:{}", route_lit.trim()));
+                            i += 1;
                         }
                         PyToken::StringLit(fx_name)
                             if is_usefixtures_deco && paren_depth == 1 && !fx_name.is_empty() =>
@@ -3965,6 +4623,24 @@ pub fn parse_python_source(source: &str) -> ParsedPythonFile {
             _ => {
                 at_statement_start = false;
                 i += 1;
+            }
+        }
+    }
+
+    for spec in &imports {
+        if let Some(last_seg) = spec.module.rsplit('.').next()
+            && let Some(stem) = last_seg
+                .strip_suffix("_pb2_grpc")
+                .or_else(|| last_seg.strip_suffix("_pb2"))
+        {
+            defined_symbols.insert(format!("proto_use:{stem}"));
+        }
+        for sym in &spec.symbols {
+            if let Some(stem) = sym
+                .strip_suffix("_pb2_grpc")
+                .or_else(|| sym.strip_suffix("_pb2"))
+            {
+                defined_symbols.insert(format!("proto_use:{stem}"));
             }
         }
     }
@@ -4258,18 +4934,33 @@ pub fn parse_rust_source(source: &str) -> ParsedPythonFile {
     let mut env_vars = BTreeSet::new();
 
     for tok in &tokens {
-        if let RsToken::StringLit(lit) = tok
-            && let Some(clean_ref) = normalize_data_ref(lit)
-        {
-            data_refs.insert(clean_ref);
+        if let RsToken::StringLit(lit) = tok {
+            if let Some(rerun) = lit.trim().strip_prefix("cargo:rerun-if-changed=") {
+                let clean = rerun.trim().trim_start_matches("./").replace('\\', "/");
+                if !clean.is_empty() {
+                    data_refs.insert(clean);
+                }
+            } else if lit.starts_with("/api/") {
+                defined_symbols.insert(format!("api_route:{}", lit.trim()));
+            } else if let Some(clean_ref) = normalize_data_ref(lit) {
+                data_refs.insert(clean_ref);
+            }
         }
+    }
+    if source.lines().any(|l| {
+        let t = l.trim_start();
+        (t.starts_with("///") || t.starts_with("//!")) && t.contains("```")
+    }) {
+        markers.insert("doctest".to_string());
     }
 
     let n = tokens.len();
     let mut i = 0usize;
     let mut pending_test_attr = false;
     let mut pending_pymodule_attr = false;
+    let mut pending_wasm_attr = false;
     let mut pending_cfg_test = false;
+    let mut pending_pub = false;
     let mut pending_mod_path: Option<String> = None;
 
     while i < n {
@@ -4299,6 +4990,12 @@ pub fn parse_rust_source(source: &str) -> ParsedPythonFile {
                                     && let Some(clean) = normalize_include_ref(p)
                                 {
                                     pending_mod_path = Some(clean);
+                                } else if id == "feature"
+                                    && matches!(tokens.get(j + 1), Some(RsToken::Eq))
+                                    && let Some(RsToken::StringLit(feat)) = tokens.get(j + 2)
+                                    && !feat.trim().is_empty()
+                                {
+                                    markers.insert(format!("feature:{}", feat.trim()));
                                 }
                                 j += 1;
                             }
@@ -4313,6 +5010,10 @@ pub fn parse_rust_source(source: &str) -> ParsedPythonFile {
                     }
                     if last_ident == "pymodule" {
                         pending_pymodule_attr = true;
+                    }
+                    if last_ident == "wasm_bindgen" || attr_idents.contains(&"wasm_bindgen") {
+                        pending_wasm_attr = true;
+                        module_markers.insert("wasm_bindgen".to_string());
                     }
                     if attr_idents.contains(&"cfg") && attr_idents.contains(&"test") {
                         pending_cfg_test = true;
@@ -4345,11 +5046,39 @@ pub fn parse_rust_source(source: &str) -> ParsedPythonFile {
                 }
                 i += 1;
             }
+            RsToken::Ident(kw) if kw == "pub" => {
+                pending_pub = true;
+                i += 1;
+                if matches!(tokens.get(i), Some(RsToken::LParen)) {
+                    let mut depth = 1usize;
+                    i += 1;
+                    while i < n && depth > 0 {
+                        match &tokens[i] {
+                            RsToken::LParen => depth += 1,
+                            RsToken::RParen => depth -= 1,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                }
+            }
             RsToken::Ident(kw) if kw == "use" => {
                 let (specs, next_i) = parse_rust_use_statement(&tokens, i + 1);
                 for spec in specs {
+                    if pending_pub {
+                        for sym in &spec.symbols {
+                            if sym != "*" {
+                                defined_symbols.insert(format!(
+                                    "rs_reexport:{sym}->{}:{}:{sym}",
+                                    spec.level, spec.module
+                                ));
+                                defined_symbols.insert(sym.clone());
+                            }
+                        }
+                    }
                     imports.insert(spec);
                 }
+                pending_pub = false;
                 pending_test_attr = false;
                 pending_cfg_test = false;
                 pending_mod_path = None;
@@ -4370,8 +5099,10 @@ pub fn parse_rust_source(source: &str) -> ParsedPythonFile {
                             is_cfg_test: pending_cfg_test,
                         });
                     }
+                    pending_pub = false;
                     pending_test_attr = false;
                     pending_pymodule_attr = false;
+                    pending_wasm_attr = false;
                     pending_cfg_test = false;
                     pending_mod_path = None;
                     i += 2;
@@ -4385,11 +5116,16 @@ pub fn parse_rust_source(source: &str) -> ParsedPythonFile {
                     if pending_pymodule_attr {
                         defined_symbols.insert(format!("pyo3:{fn_name}"));
                     }
+                    if pending_wasm_attr {
+                        defined_symbols.insert(format!("wasm:{fn_name}"));
+                    }
                     if pending_test_attr {
                         test_symbols.insert(fn_name.clone());
                     }
+                    pending_pub = false;
                     pending_test_attr = false;
                     pending_pymodule_attr = false;
+                    pending_wasm_attr = false;
                     pending_cfg_test = false;
                     pending_mod_path = None;
                     i += 2;
@@ -4923,6 +5659,19 @@ pub fn parse_frontend_source(source: &str) -> ParsedPythonFile {
                         || spec.module.starts_with("@storybook/testing-")
                     {
                         markers.insert("storybook_play".to_string());
+                    } else if spec.module.contains("msw") {
+                        markers.insert("msw".to_string());
+                    }
+                    for sym in &spec.symbols {
+                        defined_symbols.insert(format!("wasm_use:{sym}"));
+                    }
+                    if let Some(proto_stem) = spec
+                        .module
+                        .rsplit('/')
+                        .next()
+                        .and_then(|s| s.strip_suffix("_pb").or_else(|| s.strip_suffix(".pb")))
+                    {
+                        defined_symbols.insert(format!("proto_use:{proto_stem}"));
                     }
                     if is_type_only {
                         type_checking_imports.insert(spec);
@@ -4931,6 +5680,52 @@ pub fn parse_frontend_source(source: &str) -> ParsedPythonFile {
                     }
                 }
                 i = next_i;
+            }
+            JsToken::Ident(kw) if kw == "fetch" => {
+                if matches!(tokens.get(i + 1), Some(JsToken::LParen))
+                    && let Some(JsToken::StringLit(url)) = tokens.get(i + 2)
+                    && url.trim().starts_with("/api/")
+                {
+                    let route = url.trim().split('?').next().unwrap_or(url.trim());
+                    defined_symbols.insert(format!("api_call:{route}"));
+                    i += 3;
+                    continue;
+                }
+                i += 1;
+            }
+            JsToken::Ident(kw) if kw == "axios" => {
+                if matches!(tokens.get(i + 1), Some(JsToken::Dot))
+                    && matches!(tokens.get(i + 2), Some(JsToken::Ident(_)))
+                    && matches!(tokens.get(i + 3), Some(JsToken::LParen))
+                    && let Some(JsToken::StringLit(url)) = tokens.get(i + 4)
+                    && url.trim().starts_with("/api/")
+                {
+                    let route = url.trim().split('?').next().unwrap_or(url.trim());
+                    defined_symbols.insert(format!("api_call:{route}"));
+                    i += 5;
+                    continue;
+                }
+                i += 1;
+            }
+            JsToken::Ident(kw) if kw == "useContext" => {
+                if matches!(tokens.get(i + 1), Some(JsToken::LParen))
+                    && let Some(JsToken::Ident(ctx_name)) = tokens.get(i + 2)
+                {
+                    defined_symbols.insert(format!("ctx_use:{ctx_name}"));
+                    i += 3;
+                    continue;
+                }
+                i += 1;
+            }
+            JsToken::Ident(kw) if kw == "cy" => {
+                if matches!(tokens.get(i + 1), Some(JsToken::Dot))
+                    && let Some(JsToken::Ident(m)) = tokens.get(i + 2)
+                    && matches!(m.as_str(), "visit" | "mount" | "get" | "intercept")
+                {
+                    markers.insert("cypress".to_string());
+                    module_markers.insert("e2e".to_string());
+                }
+                i += 1;
             }
             JsToken::Ident(kw) if kw == "URL" => {
                 // `new URL('./worker.ts', import.meta.url)`
@@ -5092,6 +5887,16 @@ pub fn parse_frontend_source(source: &str) -> ParsedPythonFile {
             {
                 if let Some(JsToken::Ident(sym_name)) = tokens.get(i + 1) {
                     defined_symbols.insert(sym_name.clone());
+                    // Detect `const ThemeContext = createContext(...)` or `React.createContext(...)`
+                    for lookahead in 2..=6 {
+                        if matches!(
+                            tokens.get(i + lookahead),
+                            Some(JsToken::Ident(fn_id)) if fn_id == "createContext"
+                        ) {
+                            defined_symbols.insert(format!("ctx_def:{sym_name}"));
+                            break;
+                        }
+                    }
                 }
                 i += 1;
             }
@@ -5116,16 +5921,26 @@ pub fn parse_frontend_source(source: &str) -> ParsedPythonFile {
     }
 }
 
-/// Parses a CSS / SCSS / Sass / Less stylesheet to extract `@import`, `@use`, `@forward`, and `url(...)` dependencies.
+/// Parses a CSS / SCSS / Sass / Less stylesheet to extract `@import`, `@use`, `@forward`, `url(...)`, and `.className` selectors.
 pub fn parse_css_source(source: &str) -> ParsedPythonFile {
     let tokens = tokenize_frontend(source);
     let mut imports = BTreeSet::new();
     let mut data_refs = BTreeSet::new();
+    let mut defined_symbols = BTreeSet::new();
     let n = tokens.len();
     let mut i = 0usize;
 
     while i < n {
         match &tokens[i] {
+            JsToken::Dot => {
+                if let Some(JsToken::Ident(cls_name)) = tokens.get(i + 1) {
+                    defined_symbols.insert(format!("css_class:{cls_name}"));
+                    defined_symbols.insert(cls_name.clone());
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
             JsToken::Ident(kw) if matches!(kw.as_str(), "import" | "use" | "forward") => {
                 if let Some(JsToken::StringLit(spec)) = tokens.get(i + 1) {
                     if let Some(clean) = clean_frontend_import_specifier(spec) {
@@ -5176,9 +5991,383 @@ pub fn parse_css_source(source: &str) -> ParsedPythonFile {
 
     ParsedPythonFile {
         imports: imports.into_iter().collect(),
+        defined_symbols: defined_symbols.into_iter().collect(),
         data_refs: data_refs.into_iter().collect(),
         ..ParsedPythonFile::default()
     }
+}
+
+/// Parses polyglot source files: Go (`.go`), C# (`.cs`), Java/Kotlin (`.java`, `.kt`),
+/// C/C++ (`.c`, `.cpp`, `.cc`, `.h`, `.hpp`), Protobuf (`.proto`), and GraphQL (`.graphql`, `.gql`).
+pub fn parse_polyglot_source(rel_path: &str, source: &str) -> ParsedPythonFile {
+    let mut imports = BTreeSet::new();
+    let mut test_symbols = BTreeSet::new();
+    let mut defined_symbols = BTreeSet::new();
+    let mut data_refs = BTreeSet::new();
+    let mut env_vars = BTreeSet::new();
+
+    if rel_path.ends_with(".proto") {
+        if let Some(stem) = Path::new(rel_path).file_stem().and_then(|s| s.to_str()) {
+            defined_symbols.insert(format!("proto:{stem}"));
+        }
+        for raw_line in source.lines() {
+            let line = raw_line.split("//").next().unwrap_or("").trim();
+            if let Some(rest) = line.strip_prefix("import ") {
+                let target = rest
+                    .trim_start_matches("public ")
+                    .trim()
+                    .trim_end_matches(';')
+                    .trim()
+                    .trim_matches(['"', '\'']);
+                if !target.is_empty() {
+                    imports.insert(ImportSpec {
+                        level: 0,
+                        module: target.to_string(),
+                        symbols: Vec::new(),
+                    });
+                }
+            } else if let Some(rest) = line
+                .strip_prefix("message ")
+                .or_else(|| line.strip_prefix("service "))
+            {
+                let name = rest.split(['{', ' ']).next().unwrap_or("").trim();
+                if !name.is_empty() {
+                    defined_symbols.insert(name.to_string());
+                }
+            }
+        }
+        return ParsedPythonFile {
+            imports: imports.into_iter().collect(),
+            defined_symbols: defined_symbols.into_iter().collect(),
+            ..ParsedPythonFile::default()
+        };
+    }
+
+    if rel_path.ends_with(".graphql") || rel_path.ends_with(".gql") {
+        for raw_line in source.lines() {
+            let trimmed = raw_line.trim();
+            if let Some(rest) = trimmed.strip_prefix("#import ") {
+                let spec = rest.trim().trim_matches(['"', '\'', ';']);
+                if !spec.is_empty() {
+                    imports.insert(ImportSpec {
+                        level: 0,
+                        module: spec.to_string(),
+                        symbols: Vec::new(),
+                    });
+                }
+            }
+        }
+        return ParsedPythonFile {
+            imports: imports.into_iter().collect(),
+            ..ParsedPythonFile::default()
+        };
+    }
+
+    if rel_path.ends_with(".go") {
+        let mut in_import_block = false;
+        for raw_line in source.lines() {
+            let trimmed = raw_line.trim();
+            if let Some(embed) = trimmed.strip_prefix("//go:embed ") {
+                for part in embed.split_whitespace() {
+                    let clean = part.trim_start_matches("./");
+                    if !clean.is_empty() {
+                        data_refs.insert(clean.to_string());
+                    }
+                }
+            }
+            let line = trimmed.split("//").next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            if in_import_block {
+                if line.starts_with(')') {
+                    in_import_block = false;
+                    continue;
+                }
+                if let Some(start_q) = line.find('"')
+                    && let Some(end_q) = line[start_q + 1..].find('"')
+                {
+                    let pkg = &line[start_q + 1..start_q + 1 + end_q];
+                    if !pkg.is_empty() {
+                        imports.insert(ImportSpec {
+                            level: 0,
+                            module: pkg.to_string(),
+                            symbols: Vec::new(),
+                        });
+                    }
+                }
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("import ") {
+                let r = rest.trim();
+                if r.starts_with('(') {
+                    in_import_block = true;
+                } else if let Some(start_q) = r.find('"')
+                    && let Some(end_q) = r[start_q + 1..].find('"')
+                {
+                    let pkg = &r[start_q + 1..start_q + 1 + end_q];
+                    if !pkg.is_empty() {
+                        imports.insert(ImportSpec {
+                            level: 0,
+                            module: pkg.to_string(),
+                            symbols: Vec::new(),
+                        });
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("func ") {
+                let fn_part = rest.trim();
+                let fn_name = fn_part.split('(').next().unwrap_or("").trim();
+                if !fn_name.is_empty() && !fn_name.contains(' ') {
+                    defined_symbols.insert(fn_name.to_string());
+                    if (fn_name.starts_with("Test")
+                        || fn_name.starts_with("Benchmark")
+                        || fn_name.starts_with("Example")
+                        || fn_name.starts_with("Fuzz"))
+                        && rel_path.ends_with("_test.go")
+                    {
+                        test_symbols.insert(fn_name.to_string());
+                    }
+                }
+            }
+            if let Some(idx) = line.find("os.Getenv(\"") {
+                let after = &line[idx + "os.Getenv(\"".len()..];
+                if let Some(end_q) = after.find('"') {
+                    let var = &after[..end_q];
+                    if is_valid_env_var_name(var) {
+                        env_vars.insert(var.to_string());
+                    }
+                }
+            }
+        }
+        return ParsedPythonFile {
+            imports: imports.into_iter().collect(),
+            test_symbols: test_symbols.into_iter().collect(),
+            defined_symbols: defined_symbols.into_iter().collect(),
+            data_refs: data_refs.into_iter().collect(),
+            env_vars_referenced: env_vars.into_iter().collect(),
+            ..ParsedPythonFile::default()
+        };
+    }
+
+    // C/C++ (`.c`, `.cpp`, `.cc`, `.h`, `.hpp`), C# (`.cs`), Java/Kotlin (`.java`, `.kt`)
+    let mut pending_test_attr = false;
+    for raw_line in source.lines() {
+        let line = raw_line.split("//").next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        // C/C++ `#include "foo.h"` and `TEST(Suite, Name)` / `TEST_F(Suite, Name)`
+        if let Some(inc) = line.strip_prefix("#include ") {
+            let trimmed = inc.trim();
+            if trimmed.starts_with('"')
+                && let Some(end_q) = trimmed[1..].find('"')
+            {
+                let hdr = &trimmed[1..1 + end_q];
+                if !hdr.is_empty() {
+                    imports.insert(ImportSpec {
+                        level: 0,
+                        module: hdr.to_string(),
+                        symbols: Vec::new(),
+                    });
+                }
+            }
+        } else if (line.starts_with("TEST(") || line.starts_with("TEST_F("))
+            && let Some(open_p) = line.find('(')
+            && let Some(close_p) = line[open_p + 1..].find(')')
+        {
+            let args: Vec<&str> = line[open_p + 1..open_p + 1 + close_p]
+                .split(',')
+                .map(str::trim)
+                .collect();
+            if args.len() == 2 {
+                test_symbols.insert(format!("{}.{}", args[0], args[1]));
+            }
+        }
+        // C# `[Fact]`, `[Theory]`, `[Test]`, `[TestMethod]` and Java/Kotlin `@Test`, `@ParameterizedTest`
+        if line.starts_with("[Fact")
+            || line.starts_with("[Theory")
+            || line.starts_with("[Test")
+            || line.starts_with("@Test")
+            || line.starts_with("@ParameterizedTest")
+        {
+            pending_test_attr = true;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("using ") {
+            let ns = rest.trim_end_matches(';').trim();
+            if !ns.is_empty() && !ns.contains('(') && !ns.starts_with("System") {
+                imports.insert(ImportSpec {
+                    level: 0,
+                    module: ns.to_string(),
+                    symbols: Vec::new(),
+                });
+            }
+        } else if let Some(rest) = line.strip_prefix("import ") {
+            let imp = rest.trim_end_matches(';').trim();
+            if !imp.is_empty() && !imp.starts_with("java.") && !imp.starts_with("kotlin.") {
+                imports.insert(ImportSpec {
+                    level: 0,
+                    module: imp.to_string(),
+                    symbols: Vec::new(),
+                });
+            }
+        }
+        for kw in ["class ", "interface ", "struct ", "record "] {
+            if let Some(idx) = line.find(kw) {
+                let after = &line[idx + kw.len()..];
+                let name = after
+                    .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("");
+                if !name.is_empty() {
+                    defined_symbols.insert(name.to_string());
+                }
+            }
+        }
+        if pending_test_attr
+            && let Some(paren_idx) = line.find('(')
+        {
+            let before_paren = line[..paren_idx].trim();
+            if let Some(fn_name) = before_paren.split_whitespace().last() {
+                let clean_name = fn_name.trim_start_matches("fun ").trim();
+                if !clean_name.is_empty() {
+                    test_symbols.insert(clean_name.to_string());
+                    defined_symbols.insert(clean_name.to_string());
+                }
+            }
+            pending_test_attr = false;
+        }
+    }
+
+    ParsedPythonFile {
+        imports: imports.into_iter().collect(),
+        test_symbols: test_symbols.into_iter().collect(),
+        defined_symbols: defined_symbols.into_iter().collect(),
+        data_refs: data_refs.into_iter().collect(),
+        env_vars_referenced: env_vars.into_iter().collect(),
+        ..ParsedPythonFile::default()
+    }
+}
+
+fn resolve_polyglot_dependencies(
+    path: &str,
+    node: &FileNode,
+    files: &BTreeMap<String, FileNode>,
+) -> BTreeSet<String> {
+    let mut deps = BTreeSet::new();
+    let parent = Path::new(path).parent().unwrap_or_else(|| Path::new(""));
+    let parent_str = normalize_rel_str(parent);
+
+    // 1. Go: `_test.go` files implicitly compile with all non-test `.go` files in the same package directory,
+    // and import paths starting with the `go.mod` module prefix resolve to workspace directories.
+    if path.ends_with(".go") {
+        if path.ends_with("_test.go") {
+            for candidate in files.keys() {
+                if candidate != path
+                    && candidate.ends_with(".go")
+                    && !candidate.ends_with("_test.go")
+                {
+                    let cand_parent = Path::new(candidate)
+                        .parent()
+                        .map(normalize_rel_str)
+                        .unwrap_or_default();
+                    if cand_parent == parent_str {
+                        deps.insert(candidate.clone());
+                    }
+                }
+            }
+        }
+        let mut go_modules: Vec<(String, String)> = Vec::new();
+        for (cfg_path, cfg_node) in files {
+            if cfg_path == "go.mod" || cfg_path.ends_with("/go.mod") {
+                let cfg_dir = Path::new(cfg_path)
+                    .parent()
+                    .map(normalize_rel_str)
+                    .unwrap_or_default();
+                for sym in &cfg_node.parsed.defined_symbols {
+                    if let Some(mod_name) = sym.strip_prefix("go_mod:") {
+                        go_modules.push((mod_name.to_string(), cfg_dir.clone()));
+                    }
+                }
+            }
+        }
+        for spec in &node.parsed.imports {
+            for (mod_name, mod_dir) in &go_modules {
+                if let Some(rest) = spec.module.strip_prefix(mod_name.as_str()) {
+                    let sub = rest.trim_start_matches('/');
+                    let target_dir = if mod_dir.is_empty() {
+                        sub.to_string()
+                    } else if sub.is_empty() {
+                        mod_dir.clone()
+                    } else {
+                        format!("{mod_dir}/{sub}")
+                    };
+                    for candidate in files.keys() {
+                        if candidate != path
+                            && candidate.ends_with(".go")
+                            && !candidate.ends_with("_test.go")
+                        {
+                            let cand_parent = Path::new(candidate)
+                                .parent()
+                                .map(normalize_rel_str)
+                                .unwrap_or_default();
+                            if cand_parent == target_dir {
+                                deps.insert(candidate.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return deps;
+    }
+
+    // 2. Relative header/proto/graphql imports (`#include "foo.h"`, `import "common.proto"`, `#import "./frag.graphql"`)
+    for spec in &node.parsed.imports {
+        if let Some(norm_rel) = normalize_lexical_rel(&parent.join(&spec.module))
+            && files.contains_key(&norm_rel)
+            && norm_rel != path
+        {
+            deps.insert(norm_rel.clone());
+            // For `.h` / `.hpp` includes, also link matching `.c` / `.cpp` / `.cc` implementation file
+            for hdr_ext in [".hpp", ".h"] {
+                if let Some(stem) = norm_rel.strip_suffix(hdr_ext) {
+                    for impl_ext in [".cpp", ".cc", ".c"] {
+                        let impl_cand = format!("{stem}{impl_ext}");
+                        if files.contains_key(&impl_cand) && impl_cand != path {
+                            deps.insert(impl_cand);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(norm_root) = normalize_lexical_rel(Path::new(&spec.module))
+            && files.contains_key(&norm_root)
+            && norm_root != path
+        {
+            deps.insert(norm_root);
+        }
+        // Java/Kotlin `import com.acme.Service` or C# `using Acme.Service` -> match defined class/symbol names
+        if let Some(last_seg) = spec.module.rsplit('.').next()
+            && !last_seg.is_empty()
+            && last_seg != "*"
+        {
+            let lang_fam = file_language_family(path);
+            for (cand_path, cand_node) in files {
+                if cand_path != path
+                    && file_language_family(cand_path) == lang_fam
+                    && cand_node
+                        .parsed
+                        .defined_symbols
+                        .iter()
+                        .any(|s| s == last_seg)
+                {
+                    deps.insert(cand_path.clone());
+                }
+            }
+        }
+    }
+    deps
 }
 
 fn parse_js_import_clause(
@@ -6384,5 +7573,191 @@ mod tests {
         let e2e_node = &graph.files["e2e/card.e2e.ts"];
         assert!(e2e_node.parsed.markers.contains(&"playwright".to_string()));
         assert!(e2e_node.parsed.module_markers.contains(&"e2e".to_string()));
+    }
+
+    #[test]
+    fn semantic_hash_ignores_comments_and_granulizes_conftest_and_rust_pub_use_barrels() {
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "src/pkg/calc.py",
+            b"def compute(x: int) -> int:\n    return x * 2\n",
+        );
+        graph.insert_file_bytes(
+            "tests/conftest.py",
+            b"import pytest\n\n@pytest.fixture\ndef db_conn():\n    return 'db'\n",
+        );
+        graph.insert_file_bytes(
+            "tests/test_calc.py",
+            b"from pkg.calc import compute\ndef test_compute():\n    assert compute(3) == 6\n",
+        );
+        graph.insert_file_bytes(
+            "tests/test_db.py",
+            b"def test_with_db(db_conn):\n    assert db_conn == 'db'\n",
+        );
+        graph.recompute_edges();
+
+        let calc_hash_before = graph.dep_hash_for_test["tests/test_calc.py"].clone();
+        // 1. Adding ordinary comments & blank lines to `src/pkg/calc.py` must NOT change `dep_hash`!
+        graph.insert_file_bytes(
+            "src/pkg/calc.py",
+            b"# Header comment\n\ndef compute(x: int) -> int:  # inline comment\n    # body note\n    return x * 2\n\n",
+        );
+        graph.recompute_hashes_for_changed(&["src/pkg/calc.py".to_string()]);
+        assert_eq!(
+            graph.dep_hash_for_test["tests/test_calc.py"],
+            calc_hash_before,
+            "comment-only and blank-line edits must preserve semantic dep_hash"
+        );
+
+        // 2. Editing `tests/conftest.py` (which only defines non-autouse `db_conn`) affects `test_db.py` but NOT `test_calc.py`!
+        let affected_cf: Vec<String> = graph
+            .affected_tests(&["tests/conftest.py".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(affected_cf, vec!["tests/test_db.py".to_string()]);
+
+        // 3. Rust `pub use` barrel module (`src/models/mod.rs`) tree-shakes sibling modules!
+        let mut rs_graph = DependencyGraph::new();
+        rs_graph.insert_file_bytes(
+            "src/models/user.rs",
+            b"pub struct User;\n",
+        );
+        rs_graph.insert_file_bytes(
+            "src/models/order.rs",
+            b"pub struct Order;\n",
+        );
+        rs_graph.insert_file_bytes(
+            "src/models/mod.rs",
+            b"pub mod user;\npub mod order;\npub use self::user::User;\npub use self::order::Order;\n",
+        );
+        rs_graph.insert_file_bytes(
+            "tests/user_test.rs",
+            b"use crate::models::User;\n#[test]\nfn test_user() { let _ = User; }\n",
+        );
+        rs_graph.recompute_edges();
+        let affected_user: Vec<String> = rs_graph
+            .affected_tests(&["src/models/user.rs".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(affected_user, vec!["tests/user_test.rs".to_string()]);
+        let affected_order = rs_graph.affected_tests(&["src/models/order.rs".to_string()]);
+        assert!(
+            affected_order.is_empty(),
+            "unrelated sibling module in Rust barrel mod.rs must not invalidate user_test.rs"
+        );
+    }
+
+    #[test]
+    fn resolves_nextjs_app_router_wasm_api_contracts_and_polyglot_go_cpp_proto() {
+        let mut graph = DependencyGraph::new();
+        // 1. Next.js App Router (`app/layout.tsx` -> `app/dashboard/page.tsx`)
+        graph.insert_file_bytes(
+            "app/layout.tsx",
+            b"export default function RootLayout({ children }: any) { return children; }\n",
+        );
+        graph.insert_file_bytes(
+            "app/dashboard/page.tsx",
+            b"export default function DashboardPage() { return 'dash'; }\n",
+        );
+        graph.insert_file_bytes(
+            "app/dashboard/page.test.tsx",
+            b"import DashboardPage from './page';\ntest('renders dashboard', () => { DashboardPage(); });\n",
+        );
+        // 2. Full-Stack API route (`/api/v1/orders`) + Wasm (`#[wasm_bindgen]`) + React Context (`ThemeContext`)
+        graph.insert_file_bytes(
+            "src/backend/routes.py",
+            b"@app.get('/api/v1/orders')\ndef list_orders(): return []\n",
+        );
+        graph.insert_file_bytes(
+            "src/wasm/kernel.rs",
+            b"#[wasm_bindgen]\npub fn fast_hash(input: &str) -> u32 { 42 }\n",
+        );
+        graph.insert_file_bytes(
+            "src/context/Theme.tsx",
+            b"import { createContext } from 'react';\nexport const ThemeContext = createContext('dark');\n",
+        );
+        graph.insert_file_bytes(
+            "src/frontend/Orders.test.tsx",
+            b"import { fast_hash } from '../wasm/pkg';\nimport { ThemeContext } from '../context/Theme';\ntest('fetches orders', async () => {\n  const theme = useContext(ThemeContext);\n  const res = await fetch('/api/v1/orders');\n  return fast_hash(theme);\n});\n",
+        );
+        // 3. Go (`go.mod`, `pkg/calc/math.go`, `pkg/calc/math_test.go`) & Protobuf (`proto/order.proto`)
+        graph.insert_file_bytes("go.mod", b"module github.com/acme/demo\n\ngo 1.22\n");
+        graph.insert_file_bytes(
+            "proto/order.proto",
+            b"syntax = \"proto3\";\nmessage OrderRequest { string id = 1; }\n",
+        );
+        graph.insert_file_bytes(
+            "pkg/calc/math.go",
+            b"package calc\nfunc Add(a, b int) int { return a + b }\n",
+        );
+        graph.insert_file_bytes(
+            "pkg/calc/math_test.go",
+            b"package calc\nimport \"testing\"\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal() } }\n",
+        );
+        graph.insert_file_bytes(
+            "src/backend/test_proto_client.py",
+            b"import order_pb2\ndef test_proto(): assert order_pb2 is not None\n",
+        );
+        graph.insert_file_bytes("src/backend/untested_orphan.py", b"def orphan_helper(): return 0\n");
+        graph.recompute_edges();
+
+        // Next.js `app/layout.tsx` change propagates to `app/dashboard/page.test.tsx`!
+        let affected_layout: Vec<String> = graph
+            .affected_tests(&["app/layout.tsx".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            affected_layout,
+            vec!["app/dashboard/page.test.tsx".to_string()]
+        );
+
+        // Backend route `/api/v1/orders` and Wasm `fast_hash` propagate to `src/frontend/Orders.test.tsx`!
+        let affected_api: Vec<String> = graph
+            .affected_tests(&["src/backend/routes.py".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            affected_api,
+            vec!["src/frontend/Orders.test.tsx".to_string()]
+        );
+        let affected_wasm: Vec<String> = graph
+            .affected_tests(&["src/wasm/kernel.rs".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            affected_wasm,
+            vec!["src/frontend/Orders.test.tsx".to_string()]
+        );
+
+        // Go `pkg/calc/math.go` propagates to `pkg/calc/math_test.go`!
+        let affected_go: Vec<String> = graph
+            .affected_tests(&["pkg/calc/math.go".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(affected_go, vec!["pkg/calc/math_test.go".to_string()]);
+
+        // Protobuf `proto/order.proto` propagates to `src/backend/test_proto_client.py`!
+        let affected_proto: Vec<String> = graph
+            .affected_tests(&["proto/order.proto".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            affected_proto,
+            vec!["src/backend/test_proto_client.py".to_string()]
+        );
+
+        // Untested modified file detection
+        let untested = graph.untested_modified_files(&[
+            "src/backend/untested_orphan.py".to_string(),
+            "pkg/calc/math.go".to_string(),
+        ]);
+        assert_eq!(untested, vec!["src/backend/untested_orphan.py".to_string()]);
     }
 }

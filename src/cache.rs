@@ -199,6 +199,56 @@ impl RootCache {
         self.history_by_key.get(&key)
     }
 
+    /// Returns sorted list of test files that have exhibited flaky (non-deterministic pass/fail) transitions on an identical `dep_hash`.
+    pub fn flaky_test_files(&self) -> Vec<String> {
+        let mut files = BTreeSet::new();
+        for q_key in &self.quarantined_keys {
+            if let Some((tf, _)) = q_key.rsplit_once('@') {
+                files.insert(tf.to_string());
+            }
+        }
+        files.into_iter().collect()
+    }
+
+    pub fn is_flaky_test_file(&self, test_file: &str) -> bool {
+        let prefix = format!("{test_file}@");
+        self.quarantined_keys.iter().any(|k| k.starts_with(&prefix))
+    }
+
+    /// Exports portable cache records for CI/CD cache sharing (`tctx cache-export`).
+    pub fn export_bundle(&self) -> serde_json::Value {
+        let records: Vec<&CachedTestRecord> = self.history_by_key.values().collect();
+        serde_json::json!({
+            "schema": self.schema,
+            "records_count": records.len(),
+            "quarantined_keys": self.quarantined_keys,
+            "records": records,
+        })
+    }
+
+    /// Imports portable cache records from a bundle (`tctx cache-import`) and returns the number of imported records.
+    pub fn import_bundle(&mut self, bundle: &serde_json::Value, policy: &MemoryPolicy) -> usize {
+        let Some(arr) = bundle.get("records").and_then(serde_json::Value::as_array) else {
+            return 0;
+        };
+        let mut count = 0usize;
+        for item in arr {
+            if let Ok(rec) = serde_json::from_value::<CachedTestRecord>(item.clone()) {
+                self.insert(rec, policy);
+                count += 1;
+            }
+        }
+        if let Some(q_arr) = bundle
+            .get("quarantined_keys")
+            .and_then(serde_json::Value::as_array)
+        {
+            for q in q_arr.iter().filter_map(serde_json::Value::as_str) {
+                self.quarantined_keys.insert(q.to_string());
+            }
+        }
+        count
+    }
+
     pub fn insert(&mut self, record: CachedTestRecord, policy: &MemoryPolicy) {
         let mut record = record;
         if record.outcome == TestOutcome::Skipped || record.skipped > 0 {
