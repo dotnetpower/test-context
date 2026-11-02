@@ -41,11 +41,18 @@ For Windows Agents windows backed by WSL, run `./scripts/install-vscode-extensio
 
 ## Contributed Language Model Tools
 
-- `#tctxNativeRun` (`test-context-native_testRun`): Run `pytest` and `cargo test` incrementally with instant cache hits for tests already verified in the background, plus pre-flight Ruff diagnostics and optional `ruff_fix: true` auto-remediation.
-- `#tctxNativeAffected` (`test-context-native_testAffected`): Inspect which Python/Rust test files are affected by modified source files or `git diff`, along with their live background cache state and pre-checked Ruff errors.
-- `#tctxNativeGraph` (`test-context-native_testGraph`): Query direct imports, reverse importers, transitive dependencies, `conftest.py` / `tests/common` chains, referenced env vars, and Merkle `dep_hash` for any Python or Rust file.
-- `#tctxNativeStatus` (`test-context-native_testStatus`): View daemon health, indexed Python/Rust counts, cached test counts, Ruff diagnostic counts, background worker queue, and total time saved.
-- `#tctxNativeSync` (`test-context-native_testSync`): Force AST graph synchronization and schedule background test execution.
+- `#tctxNativeRun` (`test-context-native_testRun`): Run `pytest`, `cargo test`, `vitest`, `jest`, `node --test`, and `go test` incrementally with `< 1ms` instant cache hits for tests already verified against the current semantic Merkle `dep_hash`, plus pre-flight Ruff/ESLint/Clippy diagnostics and optional `ruff_fix: true` auto-remediation. Automatically normalizes absolute target paths and scopes large workspaces (`> 64` tests) to uncommitted `git diff` changes when `targets` is omitted.
+- `#tctxNativeAffected` (`test-context-native_testAffected`): Inspect which Python, Rust, Frontend, or Go test files are transitively affected by modified source/stylesheet files or `git diff`, ranked by shortest dependency hop distance with live background cache state, untested modified file alerts, and pre-checked lint diagnostics.
+- `#tctxNativeGraph` (`test-context-native_testGraph`): Query direct imports, reverse importers, transitive dependencies, `conftest.py` / `tests/common` / `setupTests.ts` chains, cross-language bridges (PyO3, Wasm, Full-Stack `/api/...` routes, Protobuf), referenced env vars, and semantic Merkle `dep_hash` for any indexed file.
+- `#tctxNativeStatus` (`test-context-native_testStatus`): View daemon health, indexed Python/Rust/Frontend file counts, cached test counts, background worker queue, Warm Pytest Zygote status, and cumulative time saved.
+- `#tctxNativeSync` (`test-context-native_testSync`): Synchronize the polyglot AST dependency graph with disk and schedule background test execution.
 - `#tctxNativeInvalidate` (`test-context-native_testInvalidate`): Invalidate cached test results for specific files or the entire workspace.
 - `#tctxNativeWorkspaces` (`test-context-native_testWorkspaces`): List registered `tctx` workspaces.
+
+## Enterprise Scale & Copilot UX Highlights
+
+- **Monorepo Speed (`9,000+` files)**: Parallel multi-core AST indexing loads a 9,042-file / 3,434-test repository in **`~670ms`**, and `u32` integer adjacency + parent-pointer BFS resolves reverse test impact in **`~5ms`**.
+- **Semantic AST Hashing**: Comment-only and blank-line formatting edits preserve `semantic_sha256` without invalidating cached test passes, while directive comments (`noqa`, `type:`, `eslint`, `@ts-`, `go:embed`, Rust doctest fences) are preserved.
+- **Zero-Config WSL & Multi-Root Resolution**: Automatically resolves workspace roots from target file hints, `vscode-remote://` URIs, and Windows WSL UNC paths (`\\wsl.localhost\...`), with transparent Unix socket auto-reconnect inside `tctx native-bridge`.
+- **Context Token Compaction (92.7% Reduction)**: Compacts passing test boilerplate and bounds large dependency lists so Copilot responses stay inline (`< 8 KB`) without `/tmp` file offloading.
 
