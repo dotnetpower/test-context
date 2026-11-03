@@ -7,7 +7,14 @@ import {
   shouldReportTrace,
   validateDaemonStatus,
 } from '../src/resultFormatter.js';
-import { resolveRegisteredRoot } from '../src/rootResolver.js';
+import {
+  buildAffectedArguments,
+  buildGraphArguments,
+  buildInvalidateArguments,
+  buildRunArguments,
+  normalizeTargetForRoot,
+  resolveRegisteredRoot,
+} from '../src/rootResolver.js';
 import { classifyOutcome, UsageSummary } from '../src/usage.js';
 
 void test('formatToolResult formats instant_cache_hit test_run output', () => {
@@ -85,6 +92,8 @@ void test('status and workspace logs are readable text rather than JSON', () => 
       uncached_or_stale_files: 1,
       background_pending_queue: 0,
       background_in_flight: 0,
+      watched_directories: 3,
+      last_watcher_error: 'watch /repo/future: path not found',
       cache_storage: {
         history_records: 4,
         latest_records: 4,
@@ -103,6 +112,8 @@ void test('status and workspace logs are readable text rather than JSON', () => 
   });
   assert.match(status, /^daemon status=ready/mu);
   assert.match(status, /^workspace root=\/repo/mu);
+  assert.match(status, /^watcher directories=3$/mu);
+  assert.match(status, /^watcher error=watch \/repo\/future: path not found$/mu);
   assert.doesNotMatch(status, /[{}"]/u);
 
   const workspaces = formatToolResult('test_workspaces', [
@@ -131,6 +142,7 @@ void test('status and workspace logs are readable text rather than JSON', () => 
   });
   assert.match(unloaded, /workspace root=\/repo state=registered_unloaded/u);
   assert.doesNotMatch(unloaded, /python_files=/u);
+  assert.doesNotMatch(unloaded, /^watcher /mu);
 });
 
 void test('trace logs are concise and exclude nested daemon payloads', () => {
@@ -168,6 +180,73 @@ void test('resolveRegisteredRoot selects deepest matching workspace root', () =>
   ];
   const resolved = resolveRegisteredRoot(workspaces, '/home/user/dev/repo/sub/tests', []);
   assert.equal(resolved, '/home/user/dev/repo/sub');
+  assert.equal(resolveRegisteredRoot(workspaces, 'sub', []), '/home/user/dev/repo/sub');
+  assert.equal(
+    resolveRegisteredRoot(workspaces, '[service.py](/home/user/dev/repo/src/service.py:42)', []),
+    '/home/user/dev/repo',
+  );
+});
+
+void test('subagent argument builders normalize aliases, line numbers, URIs, and root-as-file inputs', () => {
+  assert.equal(
+    normalizeTargetForRoot('/repo', '[test_a.py](file:///repo/tests/test_a.py:18)::test_ok'),
+    'tests/test_a.py::test_ok',
+  );
+  assert.deepEqual(
+    buildRunArguments(
+      {
+        root: '/repo/tests/test_service.py::test_Fast',
+        filter: 'test_Fast',
+        marker: 'unit',
+        fix: true,
+        args: '-q',
+      },
+      '/repo',
+    ),
+    {
+      targets: ['tests/test_service.py::test_Fast'],
+      rerun_failed: true,
+      no_cache: false,
+      pytest_args: ['-q'],
+      ruff_fix: true,
+      k: 'test_Fast',
+      mark: 'unit',
+    },
+  );
+  assert.deepEqual(
+    buildGraphArguments(
+      {
+        root: '/repo/src/pkg/service.py:42',
+      },
+      '/repo',
+    ),
+    {
+      file: 'src/pkg/service.py',
+    },
+  );
+  assert.deepEqual(
+    buildAffectedArguments(
+      {
+        targets: '`/repo/src/a.py:10`, `/repo/src/b.py#L20`',
+      },
+      '/repo',
+    ),
+    {
+      files: ['src/a.py', 'src/b.py'],
+      git_diff: true,
+    },
+  );
+  assert.deepEqual(
+    buildInvalidateArguments(
+      {
+        filePath: '/repo/tests/test_a.py::test_one',
+      },
+      '/repo',
+    ),
+    {
+      files: ['tests/test_a.py'],
+    },
+  );
 });
 
 void test('validateDaemonStatus validates required capabilities', () => {

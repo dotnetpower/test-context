@@ -9,11 +9,22 @@ import {
   formatTraceLog,
   shouldReportTrace,
 } from './resultFormatter.js';
-import { resolveRegisteredRootAfterRefresh, resolveWslRoot } from './rootResolver.js';
+import {
+  buildAffectedArguments,
+  buildGraphArguments,
+  buildInvalidateArguments,
+  buildRunArguments,
+  extractInputPathHints,
+  extractRawRootInput,
+  resolveRegisteredRootAfterRefresh,
+  resolveWslRoot,
+  RootResolutionError,
+  toPosixPathIfPossible,
+} from './rootResolver.js';
 import type { DaemonRequest, JsonValue, WorkspaceSpec } from './types.js';
 import { classifyOutcome, type UsageEvent } from './usage.js';
 
-const REGISTRY_CACHE_MS = 300_000;
+const REGISTRY_CACHE_MS = 15_000;
 
 export const NATIVE_TOOL_NAMES = [
   'test-context-native_testRun',
@@ -67,7 +78,7 @@ export interface ToolDefinition<T> {
   operation: string;
   invocationMessage(input: T): string;
   needsRoot: boolean;
-  arguments(input: T): Record<string, JsonValue>;
+  arguments(input: T, root?: string | null): Record<string, JsonValue>;
 }
 
 class WorkspaceRegistry {
@@ -167,19 +178,16 @@ export class NativeToolBridge implements vscode.Disposable {
     const traceId = randomUUID();
     let root: string | null = null;
     try {
+      const rawRoot = extractRawRootInput(input);
+      const hints = extractInputPathHints(input);
       root = definition.needsRoot
-        ? await this.resolveRoot(
-            (input as RootInput).root,
-            token,
-            true,
-            extractInputPathHints(input),
-          )
+        ? await this.resolveRoot(rawRoot, token, true, hints)
         : null;
       if (root) {
         this.lastResolvedRoot = root;
       }
       const result = await this.client.requestTraced<JsonValue>(
-        request(root, definition.operation, definition.arguments(input)),
+        request(root, definition.operation, definition.arguments(input, root)),
         token,
         traceId,
         performance.now() - started,
@@ -251,16 +259,33 @@ export class NativeToolBridge implements vscode.Disposable {
   ): Promise<string> {
     ensureTrustedWorkspace();
     const candidates = workspaceCandidates(inputHints, this.lastResolvedRoot);
+    const relativeTargets = inputHints.filter(
+      (h) => !h.startsWith('/') && !h.startsWith('\\\\') && !/^[a-zA-Z]:[\\/]/u.test(h),
+    );
     const workspaces = await this.registry.list(token);
     if (this.client.usesWslBridge) {
       try {
-        return resolveWslRoot(workspaces, explicit, candidates);
+        return resolveWslRoot(workspaces, explicit, candidates, relativeTargets);
       } catch (error: unknown) {
         if (!(error instanceof Error) || error.name !== 'RootResolutionError') {
           throw error;
         }
         const refreshed = await this.registry.list(token, true);
-        return resolveWslRoot(refreshed, explicit, candidates);
+        try {
+          return resolveWslRoot(refreshed, explicit, candidates, relativeTargets);
+        } catch (refreshError: unknown) {
+          if (
+            refreshError instanceof RootResolutionError &&
+            this.lastResolvedRoot &&
+            explicit === undefined
+          ) {
+            const stickyPosix = toPosixPathIfPossible(this.lastResolvedRoot);
+            if (stickyPosix) {
+              return stickyPosix;
+            }
+          }
+          throw refreshError;
+        }
       }
     }
     return resolveRegisteredRootAfterRefresh(
@@ -269,6 +294,7 @@ export class NativeToolBridge implements vscode.Disposable {
       explicit,
       candidates,
       allowPreparation ? this.registerMissingRoot : undefined,
+      relativeTargets,
     );
   }
 
@@ -326,24 +352,7 @@ const testRunDefinition: ToolDefinition<TestRunInput> = {
     input.targets && input.targets.length > 0
       ? `Running incremental pytest via Test Context for ${input.targets.join(', ')}`
       : 'Running incremental pytest via Test Context',
-  arguments: (input) => {
-    const args: Record<string, JsonValue> = {
-      targets: input.targets ?? [],
-      rerun_failed: input.rerun_failed ?? true,
-      no_cache: input.no_cache ?? false,
-      pytest_args: input.pytest_args ?? [],
-    };
-    if (input.ruff_fix === true) {
-      args.ruff_fix = true;
-    }
-    if (input.k !== undefined) {
-      args.k = input.k;
-    }
-    if (input.mark !== undefined) {
-      args.mark = input.mark;
-    }
-    return args;
-  },
+  arguments: (input, root) => buildRunArguments(input, root),
 };
 
 const testAffectedDefinition: ToolDefinition<TestAffectedInput> = {
@@ -351,10 +360,7 @@ const testAffectedDefinition: ToolDefinition<TestAffectedInput> = {
   operation: 'test_affected',
   needsRoot: true,
   invocationMessage: () => 'Finding affected pytest tests via AST reverse dependency graph',
-  arguments: (input) => ({
-    files: input.files ?? [],
-    git_diff: input.git_diff ?? true,
-  }),
+  arguments: (input, root) => buildAffectedArguments(input, root),
 };
 
 const testGraphDefinition: ToolDefinition<TestGraphInput> = {
@@ -362,9 +368,7 @@ const testGraphDefinition: ToolDefinition<TestGraphInput> = {
   operation: 'test_graph',
   needsRoot: true,
   invocationMessage: (input) => `Inspecting Python AST dependency graph for ${input.file}`,
-  arguments: (input) => ({
-    file: input.file,
-  }),
+  arguments: (input, root) => buildGraphArguments(input, root),
 };
 
 const testStatusDefinition: ToolDefinition<TestStatusInput> = {
@@ -390,9 +394,7 @@ const testInvalidateDefinition: ToolDefinition<TestInvalidateInput> = {
   operation: 'test_invalidate',
   needsRoot: true,
   invocationMessage: () => 'Invalidating cached test results and queueing background re-verification',
-  arguments: (input) => ({
-    files: input.files ?? [],
-  }),
+  arguments: (input, root) => buildInvalidateArguments(input, root),
 };
 
 const testWorkspacesDefinition: ToolDefinition<EmptyInput> = {
@@ -420,28 +422,6 @@ function ensureTrustedWorkspace(): void {
   if (!vscode.workspace.isTrusted) {
     throw new Error('Trust this workspace before using Test Context native tools.');
   }
-}
-
-function extractInputPathHints(input: unknown): string[] {
-  if (typeof input !== 'object' || input === null) {
-    return [];
-  }
-  const rec = input as Record<string, unknown>;
-  const hints: string[] = [];
-  if (typeof rec.file === 'string' && rec.file.trim().length > 0) {
-    hints.push(rec.file.split('::')[0]!.trim());
-  }
-  for (const key of ['targets', 'files'] as const) {
-    const arr = rec[key];
-    if (Array.isArray(arr)) {
-      for (const item of arr) {
-        if (typeof item === 'string' && item.trim().length > 0) {
-          hints.push(item.split('::')[0]!.trim());
-        }
-      }
-    }
-  }
-  return hints;
 }
 
 function uriCandidatePaths(uri: vscode.Uri): string[] {
@@ -480,6 +460,27 @@ function workspaceCandidates(
     }
     for (const p of uriCandidatePaths(activeUri)) {
       pushUnique(p);
+    }
+  }
+  for (const editor of vscode.window.visibleTextEditors ?? []) {
+    const folder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
+    if (folder) {
+      for (const p of uriCandidatePaths(folder.uri)) {
+        pushUnique(p);
+      }
+    }
+    for (const p of uriCandidatePaths(editor.document.uri)) {
+      pushUnique(p);
+    }
+  }
+  for (const group of vscode.window.tabGroups?.all ?? []) {
+    for (const tab of group.tabs) {
+      const input = tab.input as { uri?: vscode.Uri } | undefined;
+      if (input?.uri) {
+        for (const p of uriCandidatePaths(input.uri)) {
+          pushUnique(p);
+        }
+      }
     }
   }
   for (const folder of vscode.workspace.workspaceFolders ?? []) {

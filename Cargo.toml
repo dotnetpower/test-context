@@ -1,6 +1,6 @@
 [package]
 name = "test-context"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Shared local Rust Python AST dependency graph, speculative background pytest runner, and incremental test cache for AI coding agents"
 

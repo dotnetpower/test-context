@@ -204,6 +204,12 @@ function formatStatus(value: JsonValue): string {
     lines.push(
       `workspace root=${logScalar(workspace.root)} python_files=${logScalar(workspace.indexed_python_files)} rust_files=${logScalar(workspace.indexed_rust_files, '0')} frontend_files=${logScalar(workspace.indexed_frontend_files, '0')} test_files=${logScalar(workspace.total_test_files)} cached_passed=${logScalar(workspace.cached_passed_files)} stale=${logScalar(workspace.uncached_or_stale_files)} queue=${logScalar(workspace.background_pending_queue)} in_flight=${logScalar(workspace.background_in_flight)}`,
     );
+    if (workspace.watched_directories !== undefined) {
+      lines.push(`watcher directories=${logScalar(workspace.watched_directories)}`);
+    }
+    if (typeof workspace.last_watcher_error === 'string' && workspace.last_watcher_error) {
+      lines.push(`watcher error=${workspace.last_watcher_error}`);
+    }
     if (cache) {
       lines.push(
         `cache history=${logScalar(cache.history_records)} latest=${logScalar(cache.latest_records)} memory=${logScalar(cache.estimated_memory_bytes)}B wal=${logScalar(cache.wal_bytes)}B patterns=${logScalar(cache.invocation_patterns)}`,

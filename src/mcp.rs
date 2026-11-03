@@ -14,7 +14,7 @@ pub fn tools() -> Value {
                     "properties": {
                         "root": {
                             "type": "string",
-                            "description": "Optional absolute registered workspace root. Omit for the current workspace."
+                            "description": "Optional absolute registered workspace/worktree root. Always pass explicitly when known (especially in subagents, Windows/WSL Agent Sessions, and multi-root setups); omit to resolve from the current workspace."
                         },
                         "targets": {
                             "type": "array",

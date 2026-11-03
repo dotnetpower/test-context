@@ -31,6 +31,7 @@ When GitHub Copilot (or a developer) invokes tests:
 - **Rust Multi-Target Precompilation & Module Filtering**: Pre-compiles `--lib` and `--test <integration>` targets in a single multi-core `cargo test --no-run` pass and passes `-- <mod_filters...>` to `cargo test --lib` so only affected Rust modules run.
 - **Warm Pytest Zygote**: Pre-imports safe third-party packages (`fastapi`, `pydantic`, `numpy`, `pandas`, `sqlalchemy`, etc.) in a single-threaded fork-safe parent process with `PR_SET_PDEATHSIG` and process-group reaping, eliminating Python startup overhead.
 - **Self-Healing Concurrency & Fault Tolerance**: Per-root cold load gates (`root_load_gate`), lock-free linter/Git subprocess execution, automatic `PoisonError` recovery and `catch_unwind` isolation across all daemon and runner threads, `O(1)` incremental cache memory accounting, and automatic idle Zygote reclamation under RSS pressure (`> 64 MiB`).
+- **Watch Lifecycle Cleanup**: Deleted or moved-out directory subtrees are unwatched and removed from the dependency graph, freeing watch capacity for recreated paths. Overflow recovery, periodic safety reconciliation, and explicit sync also prune missing watch directories. Watch registration/removal failures are exposed as `last_watcher_error` in loaded workspace status.
 
 ### 3. VS Code GitHub Copilot Native Integration (`dotnetpower.test-context-native`)
 - **7 Native VS Code Language Model Tools**: `#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeInvalidate`, and `#tctxNativeWorkspaces`.
@@ -53,12 +54,12 @@ Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store
 
 | Task | TCTX off (`pytest`) | TCTX on | Speedup [95% CI] |
 |---|---:|---:|---:|
-| Warm suite (`warm_suite`) | 1000.90 ms | **0.56 ms** (median 0.53 ms) | **1796.00×** [1710.88, 1867.12] |
-| Post-edit background pre-run (`bg_speculative`) | 994.27 ms | **0.81 ms** (median 0.51 ms) | **1230.61×** [817.21, 1915.37] |
-| Reverted edit Merkle hit (`merkle_revert`) | 988.26 ms | **0.60 ms** (median 0.55 ms) | **1643.59×** [1413.96, 1850.33] |
-| Immediate 0ms-delay leaf edit (`leaf_delta`) | 981.56 ms | **78.14 ms** (median 74.92 ms) | **12.56×** [12.00, 13.18] |
-| Impact query + Ruff pre-check (`affected_graph`) | 960.91 ms | **0.47 ms** (median 0.45 ms) | **2049.69×** [1957.13, 2155.51] |
-| Fixed mixed suite (`all`, 320 pairs) | 985.18 ms | **16.11 ms** (median 0.53 ms) | **61.13×** [57.39, 64.72] |
+| Warm suite (`warm_suite`) | 1036.64 ms | **0.61 ms** (median 0.55 ms) | **1693.30×** [1483.04, 1866.03] |
+| Post-edit background pre-run (`bg_speculative`) | 1004.61 ms | **0.57 ms** (median 0.53 ms) | **1763.31×** [1594.86, 1934.22] |
+| Reverted edit Merkle hit (`merkle_revert`) | 1009.18 ms | **0.85 ms** (median 0.54 ms) | **1183.76×** [764.93, 1824.79] |
+| Immediate 0ms-delay leaf edit (`leaf_delta`) | 1031.66 ms | **82.83 ms** (median 76.75 ms) | **12.46×** [11.93, 13.03] |
+| Impact query + Ruff pre-check (`affected_graph`) | 968.01 ms | **0.52 ms** (median 0.49 ms) | **1850.15×** [1798.47, 1915.56] |
+| Fixed mixed suite (`all`, 320 pairs) | 1010.02 ms | **17.08 ms** (median 0.56 ms) | **59.15×** [56.74, 61.75] |
 
 ### 2. Rust (`cargo test`) & Enterprise Monorepo (`9,042 files / 3,434 tests`) Benchmarks
 
@@ -112,4 +113,3 @@ tctx --root /path/to/repo authorize-worktrees
 # 7. Package and install the VS Code Native Extension (Linux & Windows WSL)
 ./scripts/install-vscode-extension.sh
 ```
-

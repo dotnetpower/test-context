@@ -20,7 +20,7 @@ code --install-extension "$extension/dist/test-context-native.vsix" --force
 code --list-extensions --show-versions | grep -Fx "$expected"
 
 mcp_options=(--executable "$HOME/.local/bin/tctx")
-if [[ "${TCTX_INSTALL_MCP:-0}" == "1" ]]; then
+if [[ "${TCTX_INSTALL_MCP:-1}" == "1" ]]; then
     mcp_options+=(--enable)
 fi
 
@@ -95,6 +95,8 @@ fi
 python3 "$extension/scripts/configure-mcp.py" \
     --file "$mcp_file" "${mcp_options[@]}"
 
+python3 "$root/scripts/configure_subagents.py" || true
+
 printf 'Native tools installed as the default. At a safe boundary reload the affected window, then run: Test Context: Getting Started\n'
 printf 'Windows Agent Sessions use the WSL native bridge when installed from WSL.\n'
-printf 'For an MCP fallback installation, rerun with TCTX_INSTALL_MCP=1.\n'
+printf 'MCP fallback enabled in mcp.json for subagents and background sessions (set TCTX_INSTALL_MCP=0 to disable).\n'

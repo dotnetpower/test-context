@@ -702,7 +702,15 @@ def main():
                             {"files": ["src/ai-service/routers/description_generator.py"]},
                         )
                     )
-                    assert aff_on["total_affected_test_files"] == 4
+                    expected_affected = {
+                        "src/ai-service/tests/test_app_integration.py",
+                        "src/ai-service/tests/test_description_generator.py",
+                        "src/ai-service/tests/test_health.py",
+                    }
+                    assert aff_on["total_affected_test_files"] == len(expected_affected), aff_on
+                    assert {
+                        test["test_file"] for test in aff_on["affected_tests"]
+                    } == expected_affected, aff_on
                     records.append(
                         {
                             "session": session,

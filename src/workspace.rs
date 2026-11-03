@@ -556,6 +556,11 @@ pub fn run_command_with_timeout_tracked(
     active_pgids: Option<&Mutex<BTreeSet<i32>>>,
 ) -> Result<BoundedOutput> {
     let started = Instant::now();
+    if command.get_envs().all(|(k, _)| k != "PATH")
+        && let Some(aug_path) = crate::catalog::augmented_user_path()
+    {
+        command.env("PATH", aug_path);
+    }
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());

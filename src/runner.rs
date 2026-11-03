@@ -231,6 +231,7 @@ struct RootState {
     last_activity: Instant,
     background_running: bool,
     last_background_error: Option<String>,
+    last_watcher_error: Option<String>,
     background_resources: BTreeSet<String>,
     background_runs_deferred_load: u64,
     last_safety_scan: Instant,
@@ -350,6 +351,7 @@ impl ManagedRoot {
             last_activity: Instant::now(),
             background_running: false,
             last_background_error: None,
+            last_watcher_error: None,
             background_resources: BTreeSet::new(),
             background_runs_deferred_load: 0,
             last_safety_scan: Instant::now(),
@@ -409,11 +411,20 @@ impl ManagedRoot {
             if !event.need_rescan()
                 && !event.paths.is_empty()
                 && event.paths.iter().all(|path| {
+                    if watcher_filter_for_callback
+                        .lock()
+                        .map(|directories| directories.contains(path))
+                        .unwrap_or(false)
+                    {
+                        return path.is_dir()
+                            && !matches!(
+                                event.kind,
+                                notify::EventKind::Remove(_)
+                                    | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                            );
+                    }
                     if path.is_dir() {
-                        return watcher_filter_for_callback
-                            .lock()
-                            .map(|directories| directories.contains(path))
-                            .unwrap_or(false);
+                        return false;
                     }
                     path.strip_prefix(&watcher_workspace.root)
                         .ok()
@@ -875,8 +886,85 @@ impl ManagedRoot {
         }
     }
 
+    fn remove_watch_dirs_locked(&self, guard: &mut RootState, directories: &[PathBuf]) {
+        if directories.is_empty() {
+            return;
+        }
+        let mut watcher = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(watcher) = watcher.as_mut() else {
+            return;
+        };
+        for directory in directories {
+            if let Err(error) = watcher.unwatch(directory) {
+                let already_removed = match &error.kind {
+                    notify::ErrorKind::WatchNotFound => true,
+                    notify::ErrorKind::Io(error) => error.kind() == std::io::ErrorKind::NotFound,
+                    _ => false,
+                };
+                if !already_removed {
+                    guard.last_watcher_error =
+                        Some(format!("unwatch {}: {error}", directory.display()));
+                    continue;
+                }
+            }
+            guard.watched_dirs.remove(directory);
+            self.watcher_filter_dirs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(directory);
+        }
+    }
+
+    fn prune_missing_watch_dirs_locked(&self, guard: &mut RootState) {
+        let missing: Vec<PathBuf> = guard
+            .watched_dirs
+            .iter()
+            .filter(|directory| !directory.is_dir())
+            .cloned()
+            .collect();
+        self.remove_watch_dirs_locked(guard, &missing);
+    }
+
+    fn add_watch_dirs_locked(&self, guard: &mut RootState, directories: BTreeSet<PathBuf>) {
+        if directories.is_empty() {
+            return;
+        }
+        let mut watcher = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(watcher) = watcher.as_mut() else {
+            return;
+        };
+        for directory in directories {
+            if guard.watched_dirs.contains(&directory)
+                || guard.watched_dirs.len() >= guard.spec.policy.max_watch_dirs
+            {
+                continue;
+            }
+            match watcher.watch(&directory, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    self.watcher_filter_dirs
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(directory.clone());
+                    guard.watched_dirs.insert(directory);
+                }
+                Err(error) => {
+                    guard.last_watcher_error =
+                        Some(format!("watch {}: {error}", directory.display()));
+                }
+            }
+        }
+    }
+
     fn drain_fs_events_locked(&self, guard: &mut RootState) {
         let mut raw_paths = BTreeSet::new();
+        let mut retired_watch_roots = BTreeSet::new();
+        let mut directory_moves = Vec::new();
         let mut overflowed = self.fs_overflow.swap(false, Ordering::AcqRel);
         if let Ok(rx) = self.fs_events_rx.lock() {
             while let Ok(event) = rx.try_recv() {
@@ -884,13 +972,34 @@ impl ManagedRoot {
                 if event.need_rescan() {
                     overflowed = true;
                 }
+                if matches!(
+                    event.kind,
+                    notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                        notify::event::RenameMode::Both
+                    ))
+                ) && let [from, to] = event.paths.as_slice()
+                    && guard.watched_dirs.contains(from)
+                {
+                    directory_moves.push((from.clone(), to.clone()));
+                }
                 for p in event.paths {
+                    if guard.watched_dirs.contains(&p)
+                        && (!p.is_dir()
+                            || matches!(
+                                event.kind,
+                                notify::EventKind::Remove(_)
+                                    | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                            ))
+                    {
+                        retired_watch_roots.insert(p.clone());
+                    }
                     raw_paths.insert(p);
                 }
             }
         }
         if overflowed {
             invalidate_git_dirty_cache(&guard.workspace.root);
+            self.prune_missing_watch_dirs_locked(guard);
             Self::reconcile_live_files_locked(guard, None);
             guard.last_safety_scan = Instant::now();
             return;
@@ -899,17 +1008,55 @@ impl ManagedRoot {
             return;
         }
 
+        for (from, to) in directory_moves {
+            for path in guard.watched_dirs.iter().cloned().chain(
+                guard
+                    .graph
+                    .files
+                    .keys()
+                    .map(|rel| guard.workspace.root.join(rel)),
+            ) {
+                if let Ok(suffix) = path.strip_prefix(&from) {
+                    raw_paths.insert(to.join(suffix));
+                }
+            }
+        }
+
+        if !retired_watch_roots.is_empty() {
+            let retired_directories: Vec<PathBuf> = guard
+                .watched_dirs
+                .iter()
+                .filter(|directory| {
+                    retired_watch_roots
+                        .iter()
+                        .any(|root| directory.starts_with(root))
+                })
+                .cloned()
+                .collect();
+            self.remove_watch_dirs_locked(guard, &retired_directories);
+            raw_paths.extend(retired_directories);
+            raw_paths.extend(
+                guard
+                    .graph
+                    .files
+                    .keys()
+                    .map(|rel| guard.workspace.root.join(rel))
+                    .filter(|path| {
+                        retired_watch_roots
+                            .iter()
+                            .any(|root| path.starts_with(root))
+                    }),
+            );
+        }
+
         let mut changed_rels = Vec::new();
         let mut structure_changed = false;
-        let mut new_watch_dirs = Vec::new();
+        let mut new_watch_dirs = BTreeSet::new();
 
         for path in raw_paths {
             if path.is_dir() {
-                if path.starts_with(&guard.workspace.root)
-                    && guard.watched_dirs.len() < guard.spec.policy.max_watch_dirs
-                    && guard.watched_dirs.insert(path.clone())
-                {
-                    new_watch_dirs.push(path);
+                if path.starts_with(&guard.workspace.root) && !guard.watched_dirs.contains(&path) {
+                    new_watch_dirs.insert(path);
                 }
                 continue;
             }
@@ -931,10 +1078,9 @@ impl ManagedRoot {
             if let Some(stamp) = live_stamp {
                 if let Some(parent) = full.parent()
                     && parent.starts_with(&guard.workspace.root)
-                    && guard.watched_dirs.len() < guard.spec.policy.max_watch_dirs
-                    && guard.watched_dirs.insert(parent.to_path_buf())
+                    && !guard.watched_dirs.contains(parent)
                 {
-                    new_watch_dirs.push(parent.to_path_buf());
+                    new_watch_dirs.insert(parent.to_path_buf());
                 }
                 if guard
                     .graph
@@ -975,17 +1121,7 @@ impl ManagedRoot {
             }
         }
 
-        if !new_watch_dirs.is_empty()
-            && let Ok(mut w_opt) = self.watcher.lock()
-            && let Some(ref mut w) = *w_opt
-        {
-            for dir in new_watch_dirs {
-                let _ = w.watch(&dir, RecursiveMode::NonRecursive);
-                if let Ok(mut directories) = self.watcher_filter_dirs.lock() {
-                    directories.insert(dir);
-                }
-            }
-        }
+        self.add_watch_dirs_locked(guard, new_watch_dirs);
 
         if !changed_rels.is_empty() {
             invalidate_git_dirty_cache(&guard.workspace.root);
@@ -1057,8 +1193,9 @@ impl ManagedRoot {
         }
     }
 
-    fn maybe_safety_reconcile_locked(guard: &mut RootState) {
+    fn maybe_safety_reconcile_locked(&self, guard: &mut RootState) {
         if guard.last_safety_scan.elapsed() >= Duration::from_secs(300) {
+            self.prune_missing_watch_dirs_locked(guard);
             Self::reconcile_live_files_locked(guard, None);
             guard.last_safety_scan = Instant::now();
         }
@@ -1249,10 +1386,14 @@ impl ManagedRoot {
         let mut new_graph = DependencyGraph::build(&workspace, &spec.policy)?;
         let environment_hash = environment_fingerprint_for_graph(&spec, &new_graph);
         new_graph.apply_environment_hash(environment_hash);
+        let watch_dirs =
+            workspace.watch_directories_for(new_graph.files.keys().map(Path::new), &spec.policy)?;
         {
             let mut guard = self.lock_state();
             guard.last_activity = Instant::now();
             guard.graph = new_graph;
+            self.prune_missing_watch_dirs_locked(&mut guard);
+            self.add_watch_dirs_locked(&mut guard, watch_dirs.into_iter().collect());
             guard.generation = guard.generation.saturating_add(1);
             if guard.spec.policy.background_enabled {
                 let candidates: Vec<(String, String)> = guard
@@ -1425,6 +1566,7 @@ impl ManagedRoot {
             "background_in_flight": guard.in_flight.len(),
             "background_running": guard.background_running,
             "last_background_error": guard.last_background_error,
+            "last_watcher_error": guard.last_watcher_error,
             "total_saved_ms": guard.cache.total_saved_ms,
             "total_cache_hits": guard.cache.total_cache_hits,
             "total_delta_runs": guard.cache.total_delta_runs,
@@ -1460,7 +1602,7 @@ impl ManagedRoot {
         self.drain_fs_events_locked(&mut guard);
         let norm_file = normalize_target_for_root(&guard.workspace.root, file);
         Self::ingest_explicit_paths_locked(&mut guard, std::slice::from_ref(&norm_file));
-        Self::maybe_safety_reconcile_locked(&mut guard);
+        self.maybe_safety_reconcile_locked(&mut guard);
         guard.graph.file_graph_info(&norm_file).ok_or_else(|| {
             let suggestions = guard
                 .graph
@@ -1483,7 +1625,7 @@ impl ManagedRoot {
             guard.last_activity = Instant::now();
             self.drain_fs_events_locked(&mut guard);
             Self::ingest_explicit_paths_locked(&mut guard, files);
-            Self::maybe_safety_reconcile_locked(&mut guard);
+            self.maybe_safety_reconcile_locked(&mut guard);
             guard.workspace.root.clone()
         };
 
@@ -1570,7 +1712,7 @@ impl ManagedRoot {
             guard.last_activity = Instant::now();
             self.drain_fs_events_locked(&mut guard);
             Self::ingest_explicit_paths_locked(&mut guard, files);
-            Self::maybe_safety_reconcile_locked(&mut guard);
+            self.maybe_safety_reconcile_locked(&mut guard);
             let root_path = guard.workspace.root.clone();
             let norm_files = normalize_targets_for_root(&root_path, files);
 
@@ -1852,7 +1994,7 @@ impl ManagedRoot {
             // In large workspaces (> 64 test files), if `targets` is omitted and no `-k`/`-m` filter is set,
             // automatically scope to tests affected by current git dirty files so an omitted `targets` argument
             // in Copilot does not accidentally trigger a multi-thousand-file full suite run.
-            Self::maybe_safety_reconcile_locked(&mut guard);
+            self.maybe_safety_reconcile_locked(&mut guard);
             let effective_targets: Vec<String> = if norm_targets.is_empty()
                 && req.k.is_none()
                 && req.mark.is_none()
@@ -5608,23 +5750,89 @@ pub fn extract_missing_prerequisites(output: &str) -> Vec<String> {
     prereqs.into_iter().take(8).collect()
 }
 
+pub fn clean_path_or_target(raw: &str) -> String {
+    let mut s = raw.trim();
+    while s.len() >= 2
+        && ((s.starts_with('`') && s.ends_with('`'))
+            || (s.starts_with('"') && s.ends_with('"'))
+            || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s = s[1..s.len() - 1].trim();
+    }
+    if s.starts_with('[')
+        && let Some((_, rest)) = s.split_once("](")
+        && let Some(target) = rest.strip_suffix(')')
+    {
+        s = target.trim();
+        if s.starts_with('<') && s.ends_with('>') && s.len() >= 2 {
+            s = s[1..s.len() - 1].trim();
+        }
+    }
+    if let Some(rest) = s.strip_prefix("file://") {
+        let lower = rest.to_ascii_lowercase();
+        if (lower.starts_with("wsl.localhost/") || lower.starts_with("wsl$/"))
+            && let Some((_, after_host)) = rest.split_once('/')
+            && let Some((_, distro_rel)) = after_host.split_once('/')
+        {
+            return format!("/{distro_rel}");
+        }
+        s = rest;
+    }
+    let norm = s.replace('\\', "/");
+    let lower_norm = norm.to_ascii_lowercase();
+    if (lower_norm.starts_with("//wsl.localhost/") || lower_norm.starts_with("//wsl$/"))
+        && let Some(after_prefix) = norm.strip_prefix("//")
+        && let Some((_, after_host)) = after_prefix.split_once('/')
+        && let Some((_, distro_rel)) = after_host.split_once('/')
+    {
+        return format!("/{distro_rel}");
+    }
+    s.to_string()
+}
+
+pub fn strip_line_or_fragment_suffix(file_part: &str) -> &str {
+    let without_frag = match file_part.rsplit_once('#') {
+        Some((base, _)) if !base.is_empty() => base,
+        _ => file_part,
+    };
+    if let Some((base, suffix)) = without_frag.split_once(':')
+        && base.len() > 1
+        && !base.contains("://")
+        && suffix.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    {
+        return base;
+    }
+    without_frag
+}
+
 pub fn normalize_target_for_root(root: &Path, raw: &str) -> String {
-    let trimmed = raw.trim();
-    let (file_part, node_part) = match trimmed.split_once("::") {
+    let cleaned = clean_path_or_target(raw);
+    let trimmed = cleaned.trim();
+    let (raw_file_part, node_part) = match trimmed.split_once("::") {
         Some((f, n)) => (f.trim(), Some(n.trim())),
         None => (trimmed, None),
     };
+    let file_part = strip_line_or_fragment_suffix(raw_file_part);
     let norm_slashes = file_part.replace('\\', "/");
     let root_str = root.to_string_lossy().replace('\\', "/");
     let root_trimmed = root_str.trim_end_matches('/');
     let root_prefix = format!("{root_trimmed}/");
-    let rel_file = if norm_slashes == root_trimmed {
+    let mut rel_file = if norm_slashes == root_trimmed {
         ".".to_string()
     } else if let Some(stripped) = norm_slashes.strip_prefix(&root_prefix) {
         stripped.trim_start_matches("./").to_string()
     } else {
         norm_slashes.trim_start_matches("./").to_string()
     };
+    if !rel_file.starts_with('/')
+        && let Some(root_name) = root.file_name().and_then(|n| n.to_str())
+        && !root_name.is_empty()
+        && let Some(stripped_base) = rel_file.strip_prefix(&format!("{root_name}/"))
+        && !stripped_base.is_empty()
+        && (root.join(stripped_base).exists() || !root.join(&rel_file).exists())
+    {
+        rel_file = stripped_base.to_string();
+    }
     match node_part {
         Some(node) if !node.is_empty() => format!("{rel_file}::{node}"),
         _ => rel_file,
@@ -6093,6 +6301,219 @@ fn match_testcase_to_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn watcher_fixture(max_watch_dirs: usize) -> (tempfile::TempDir, Arc<ManagedRoot>) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(root.join("pkg/nested")).unwrap();
+        std::fs::write(root.join("pkg/nested/module.py"), "VALUE = 1\n").unwrap();
+        let managed = ManagedRoot::load(Spec {
+            root,
+            scopes: Vec::new(),
+            globs: Vec::new(),
+            excludes: Vec::new(),
+            default_excludes: true,
+            pytest_cmd: Vec::new(),
+            policy: crate::policy::MemoryPolicy {
+                background_enabled: false,
+                max_watch_dirs,
+                ..Default::default()
+            },
+            allow_worktrees: false,
+            managed_parent: None,
+        })
+        .unwrap();
+        (temp, managed)
+    }
+
+    fn wait_for_watcher(managed: &ManagedRoot, predicate: impl Fn(&RootState) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut guard = managed.lock_state();
+            managed.drain_fs_events_locked(&mut guard);
+            if predicate(&guard) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watch state did not converge: directories={:?}, files={:?}",
+                guard.watched_dirs,
+                guard.graph.files.keys().collect::<Vec<_>>()
+            );
+            drop(guard);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn watcher_removes_deleted_and_moved_directory_subtrees() {
+        for move_outside in [false, true] {
+            let (temp, managed) = watcher_fixture(3);
+            let root = temp.path().join("repo");
+            if move_outside {
+                std::fs::rename(root.join("pkg"), temp.path().join("moved")).unwrap();
+            } else {
+                std::fs::remove_dir_all(root.join("pkg")).unwrap();
+            }
+            wait_for_watcher(&managed, |state| {
+                state.watched_dirs == BTreeSet::from([root.clone()])
+                    && !state.graph.files.contains_key("pkg/nested/module.py")
+            });
+            assert_eq!(
+                *managed.watcher_filter_dirs.lock().unwrap(),
+                BTreeSet::from([root])
+            );
+            managed.shutdown();
+        }
+    }
+
+    #[test]
+    fn watcher_releases_capacity_and_rewatches_recreated_directories() {
+        let (temp, managed) = watcher_fixture(3);
+        let root = temp.path().join("repo");
+        for value in [2, 3] {
+            std::fs::remove_dir_all(root.join("pkg")).unwrap();
+            wait_for_watcher(&managed, |state| state.watched_dirs.len() == 1);
+            std::fs::create_dir(root.join("pkg")).unwrap();
+            wait_for_watcher(&managed, |state| state.watched_dirs.len() == 2);
+            std::fs::create_dir(root.join("pkg/nested")).unwrap();
+            wait_for_watcher(&managed, |state| state.watched_dirs.len() == 3);
+            let source = format!("VALUE = {value}\n");
+            std::fs::write(root.join("pkg/nested/module.py"), &source).unwrap();
+            wait_for_watcher(&managed, |state| {
+                state
+                    .graph
+                    .files
+                    .get("pkg/nested/module.py")
+                    .is_some_and(|node| node.sha256 == sha256_hex(source.as_bytes()))
+            });
+        }
+        managed.shutdown();
+    }
+
+    #[test]
+    fn watcher_overflow_reconciles_missing_directories() {
+        let (temp, managed) = watcher_fixture(3);
+        std::fs::remove_dir_all(temp.path().join("repo/pkg")).unwrap();
+        managed.fs_overflow.store(true, Ordering::Release);
+        {
+            let mut guard = managed.lock_state();
+            managed.drain_fs_events_locked(&mut guard);
+            assert_eq!(guard.watched_dirs.len(), 1);
+            assert!(!guard.graph.files.contains_key("pkg/nested/module.py"));
+        }
+        managed.shutdown();
+    }
+
+    #[test]
+    fn watcher_file_deletion_keeps_parent_watches_for_recreation() {
+        let (temp, managed) = watcher_fixture(3);
+        let file = temp.path().join("repo/pkg/nested/module.py");
+        std::fs::remove_file(&file).unwrap();
+        wait_for_watcher(&managed, |state| {
+            !state.graph.files.contains_key("pkg/nested/module.py")
+        });
+        assert_eq!(managed.lock_state().watched_dirs.len(), 3);
+        std::fs::write(file, "VALUE = 2\n").unwrap();
+        wait_for_watcher(&managed, |state| {
+            state
+                .graph
+                .files
+                .get("pkg/nested/module.py")
+                .is_some_and(|node| node.sha256 == sha256_hex(b"VALUE = 2\n"))
+        });
+        managed.shutdown();
+    }
+
+    #[test]
+    fn watcher_moves_within_workspace_preserve_nested_watches() {
+        let (temp, managed) = watcher_fixture(3);
+        let root = temp.path().join("repo");
+        std::fs::rename(root.join("pkg"), root.join("renamed")).unwrap();
+        wait_for_watcher(&managed, |state| {
+            state.watched_dirs
+                == BTreeSet::from([
+                    root.clone(),
+                    root.join("renamed"),
+                    root.join("renamed/nested"),
+                ])
+                && state.graph.files.contains_key("renamed/nested/module.py")
+                && !state.graph.files.contains_key("pkg/nested/module.py")
+        });
+        std::fs::write(root.join("renamed/nested/module.py"), "VALUE = 2\n").unwrap();
+        wait_for_watcher(&managed, |state| {
+            state
+                .graph
+                .files
+                .get("renamed/nested/module.py")
+                .is_some_and(|node| node.sha256 == sha256_hex(b"VALUE = 2\n"))
+        });
+        managed.shutdown();
+    }
+
+    #[test]
+    fn watcher_root_deletion_removes_all_watches() {
+        let (temp, managed) = watcher_fixture(3);
+        std::fs::remove_dir_all(temp.path().join("repo")).unwrap();
+        wait_for_watcher(&managed, |state| {
+            state.watched_dirs.is_empty() && state.graph.files.is_empty()
+        });
+        assert!(managed.watcher_filter_dirs.lock().unwrap().is_empty());
+        managed.shutdown();
+    }
+
+    #[test]
+    fn watcher_safety_scan_and_sync_prune_missing_directories() {
+        for explicit_sync in [false, true] {
+            let (temp, managed) = watcher_fixture(3);
+            std::fs::remove_dir_all(temp.path().join("repo/pkg")).unwrap();
+            if explicit_sync {
+                managed.sync(false).unwrap();
+            } else {
+                let mut guard = managed.lock_state();
+                guard.last_safety_scan = Instant::now() - Duration::from_secs(301);
+                managed.maybe_safety_reconcile_locked(&mut guard);
+            }
+            assert_eq!(managed.lock_state().watched_dirs.len(), 1);
+            assert_eq!(managed.watcher_filter_dirs.lock().unwrap().len(), 1);
+            managed.shutdown();
+        }
+    }
+
+    #[test]
+    fn watcher_failed_registration_is_reported_without_consuming_capacity() {
+        let (temp, managed) = watcher_fixture(4);
+        let directory = temp.path().join("repo/future");
+        {
+            let mut guard = managed.lock_state();
+            managed.add_watch_dirs_locked(&mut guard, BTreeSet::from([directory.clone()]));
+            assert_eq!(guard.watched_dirs.len(), 3);
+            assert!(
+                guard
+                    .last_watcher_error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("future"))
+            );
+            assert!(
+                !managed
+                    .watcher_filter_dirs
+                    .lock()
+                    .unwrap()
+                    .contains(&directory)
+            );
+            std::fs::create_dir(&directory).unwrap();
+            managed.add_watch_dirs_locked(&mut guard, BTreeSet::from([directory.clone()]));
+            assert!(guard.watched_dirs.contains(&directory));
+            assert!(
+                managed
+                    .watcher_filter_dirs
+                    .lock()
+                    .unwrap()
+                    .contains(&directory)
+            );
+        }
+        managed.shutdown();
+    }
 
     #[test]
     fn junit_xml_parser_handles_angle_brackets_inside_quoted_attributes() {
@@ -6630,6 +7051,31 @@ ok 3 - skipped browser check # SKIP no display
         assert_eq!(
             normalize_target_for_root(root, "./src/ast_graph.rs"),
             "src/ast_graph.rs"
+        );
+        assert_eq!(
+            normalize_target_for_root(
+                root,
+                "[daemon.rs](/home/user/dev/test-context/src/daemon.rs:42)"
+            ),
+            "src/daemon.rs"
+        );
+        assert_eq!(
+            normalize_target_for_root(
+                root,
+                "`file:///home/user/dev/test-context/src/mcp.rs#L10-L25`"
+            ),
+            "src/mcp.rs"
+        );
+        assert_eq!(
+            normalize_target_for_root(
+                root,
+                "\\\\wsl.localhost\\Ubuntu\\home\\user\\dev\\test-context\\tests\\integration_test.rs::test_case"
+            ),
+            "tests/integration_test.rs::test_case"
+        );
+        assert_eq!(
+            normalize_target_for_root(root, "test-context/src/runner.rs:100:5"),
+            "src/runner.rs"
         );
 
         let verbose_pass = concat!(

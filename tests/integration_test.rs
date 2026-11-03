@@ -223,7 +223,7 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
         vec!["tests/test_isolated.py".to_string()]
     );
 
-    // 7. Verify MCP JSON-RPC dispatch
+    // 7. Verify MCP JSON-RPC dispatch (including subagent alias, unregistered default_root, and root-as-file recovery)
     let mcp_tools = shared_mcp::dispatch_with_root(
         json!({
             "jsonrpc": "2.0",
@@ -235,6 +235,44 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     )
     .unwrap();
     assert_eq!(mcp_tools["result"]["tools"].as_array().unwrap().len(), 7);
+
+    let unregistered_cwd = temp.path().join("unregistered-home");
+    std::fs::create_dir_all(&unregistered_cwd).unwrap();
+    let mcp_status_unregistered = shared_mcp::dispatch_with_root(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "test_status",
+                "arguments": {}
+            }
+        }),
+        Some(&unregistered_cwd),
+    )
+    .unwrap();
+    assert_eq!(mcp_status_unregistered["result"]["isError"], json!(false));
+
+    let mcp_graph_from_subpath_root = shared_mcp::dispatch_with_root(
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "test_graph",
+                "arguments": {
+                    "root": format!("{}:1", repo.join("src/pkg/service.py").display())
+                }
+            }
+        }),
+        Some(&unregistered_cwd),
+    )
+    .unwrap();
+    assert_eq!(mcp_graph_from_subpath_root["result"]["isError"], json!(false));
+    let graph_text = mcp_graph_from_subpath_root["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(graph_text.contains("src/pkg/service.py"));
 
     managed.shutdown();
 

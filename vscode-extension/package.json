@@ -2,7 +2,7 @@
   "name": "test-context-native",
   "displayName": "Test Context by dotnetpower",
   "description": "Fast Python, Rust & React/Vite AST graph, background pytest/cargo/vitest runner, Ruff/ESLint pre-check, and instant test cache.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "dotnetpower",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -177,7 +177,7 @@
           "properties": {
             "root": {
               "type": "string",
-              "description": "Optional absolute registered workspace root. Omit for the current workspace."
+              "description": "Optional absolute registered workspace/worktree root. Always pass explicitly when known (especially in subagents, Windows/WSL Agent Sessions, and multi-root setups); omit for the current workspace."
             },
             "targets": {
               "type": "array",

@@ -28,8 +28,9 @@ pub fn doctor(root: &Path) -> Result<Value> {
                 .output()
                 .is_ok_and(|out| out.status.success())
         });
-        let node_h = scope.spawn(|| {
-            std::process::Command::new("node")
+        let node_bin = catalog::detect_node_bin();
+        let node_h = scope.spawn(move || {
+            std::process::Command::new(node_bin)
                 .arg("--version")
                 .output()
                 .is_ok_and(|out| out.status.success())

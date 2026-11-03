@@ -113,7 +113,87 @@ pub fn detect_frontend_test_cmd(root: &Path, managed_parent: Option<&Path>) -> V
             return vec![jest.to_string_lossy().into_owned()];
         }
     }
-    vec!["node".to_string(), "--test".to_string()]
+    vec![detect_node_bin(), "--test".to_string()]
+}
+
+pub fn detect_node_bin() -> String {
+    if let Some(env_bin) = std::env::var_os("TCTX_NODE_BIN") {
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            return p.to_string_lossy().into_owned();
+        }
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let cand = dir.join("node");
+            if cand.is_file() {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        let nvm_versions = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(&nvm_versions) {
+            let mut candidates: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path().join("bin/node"))
+                .filter(|p| p.is_file())
+                .collect();
+            candidates.sort();
+            if let Some(best) = candidates.pop() {
+                return best.to_string_lossy().into_owned();
+            }
+        }
+        for rel in [
+            ".volta/bin/node",
+            ".fnm/current/bin/node",
+            ".asdf/shims/node",
+            ".local/share/mise/shims/node",
+        ] {
+            let cand = home.join(rel);
+            if cand.is_file() {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+    }
+    for sys in ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"] {
+        let cand = Path::new(sys);
+        if cand.is_file() {
+            return sys.to_string();
+        }
+    }
+    "node".to_string()
+}
+
+pub fn augmented_user_path() -> Option<std::ffi::OsString> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let mut changed = false;
+    let node_bin = PathBuf::from(detect_node_bin());
+    if node_bin.is_absolute()
+        && let Some(parent) = node_bin.parent()
+        && !dirs.iter().any(|d| d == parent)
+    {
+        dirs.insert(0, parent.to_path_buf());
+        changed = true;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        for rel in [".cargo/bin", ".local/bin"] {
+            let extra = home.join(rel);
+            if extra.is_dir() && !dirs.iter().any(|d| d == &extra) {
+                dirs.insert(0, extra);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        std::env::join_paths(dirs).ok()
+    } else {
+        None
+    }
 }
 
 pub fn detect_frontend_runner_for_dir(

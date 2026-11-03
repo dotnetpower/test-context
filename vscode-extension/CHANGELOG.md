@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2
+
+- Release watches and graph entries for deleted or moved-out directory subtrees, recover watch capacity, and rewatch recreated paths.
+- Preserve nested watches across directory renames and clean up missing watches during overflow recovery, safety reconciliation, and sync.
+- Surface watch registration/removal failures and watched-directory counts in workspace status.
+- Normalize native and MCP argument aliases, Markdown links, line suffixes, file URIs, and WSL paths for reliable workspace and test-target resolution.
+- Improve Node.js discovery for daemon environments and enable MCP fallback and subagent tool configuration during installation.
+- Refresh the 8-session, 320-pair Python benchmark using the release binary and assert the exact fixture-aware affected-test set.
+
 ## 0.1.1
 
 - Resolved multi-byte UTF-8 escape char-boundary panics across Python, Rust, and Frontend semantic normalizers and tokenizers.
@@ -16,4 +25,3 @@
 - Speculative background Ruff pre-flight diagnostics (`ruff_diagnostics`) and automatic remediation via `ruff_fix: true`.
 - Persistent framed-JSON Unix socket IPC (`TCTXJ1`) with the shared Rust `tctx daemon` and WSL native bridge for Windows Agents.
 - Packaged walkthrough media, benchmark chart (`resources/benchmark.png`), and Marketplace metadata.
-
