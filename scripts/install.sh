@@ -42,7 +42,7 @@ else
     systemctl --user restart test-context.service
 fi
 for attempt in $(seq 1 50); do
-    if "$HOME/.local/bin/tctx" ping >/dev/null; then
+    if "$HOME/.local/bin/tctx" ping >/dev/null 2>&1; then
         python3 scripts/configure_subagents.py || true
         exit 0
     fi

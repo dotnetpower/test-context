@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -831,6 +832,189 @@ impl RootCache {
             "invocation_patterns": self.invocation_patterns.len(),
         })
     }
+}
+
+pub fn gc_cache_dir(
+    registered_roots: &[PathBuf],
+    orphan_min_age: Duration,
+    apply: bool,
+) -> Result<serde_json::Value> {
+    let cache_dir = catalog::cache_dir()?;
+    if !cache_dir.exists() {
+        return Ok(serde_json::json!({
+            "applied": apply,
+            "removed_files": 0,
+            "reclaimed_bytes": 0,
+            "removed_legacy_files": 0,
+            "removed_orphan_files": 0,
+        }));
+    }
+    let active_hashes: BTreeSet<String> = registered_roots
+        .iter()
+        .filter(|root| root.exists())
+        .map(|root| sha256_hex(root.to_string_lossy().as_bytes()))
+        .collect();
+    let active_wal_suffix = format!(".v{}.wal.jsonl", current_cache_schema());
+    let mut removed_files = 0usize;
+    let mut reclaimed_bytes = 0u64;
+    let mut removed_legacy_files = 0usize;
+    let mut removed_orphan_files = 0usize;
+    let mut candidate_orphan_hashes = BTreeSet::new();
+
+    let entries: Vec<_> = std::fs::read_dir(&cache_dir)?
+        .filter_map(|e| e.ok())
+        .collect();
+    for entry in &entries {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .unwrap_or(Duration::ZERO);
+
+        if name.contains(".tmp.") && age >= Duration::from_secs(60) {
+            reclaimed_bytes = reclaimed_bytes.saturating_add(meta.len());
+            removed_files += 1;
+            removed_legacy_files += 1;
+            if apply {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+
+        if name.ends_with(".wal.jsonl") && !name.ends_with(&active_wal_suffix) {
+            reclaimed_bytes = reclaimed_bytes.saturating_add(meta.len());
+            removed_files += 1;
+            removed_legacy_files += 1;
+            if apply {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+
+        if name.ends_with(".ast.bin") && !name.ends_with(".v4.ast.bin") {
+            reclaimed_bytes = reclaimed_bytes.saturating_add(meta.len());
+            removed_files += 1;
+            removed_legacy_files += 1;
+            if apply {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+
+        let Some((hash, rest)) = name.split_once('.') else {
+            continue;
+        };
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+
+        if active_hashes.contains(hash) {
+            if rest == "json"
+                && let Ok(mut f) = std::fs::File::open(&path)
+            {
+                let mut head = vec![0u8; 512];
+                if let Ok(n) = f.read(&mut head) {
+                    let prefix = String::from_utf8_lossy(&head[..n]);
+                    let current_tag = format!("\"schema\":{}", current_cache_schema());
+                    let current_tag_sp = format!("\"schema\": {}", current_cache_schema());
+                    if prefix.contains("\"schema\"")
+                        && !prefix.contains(&current_tag)
+                        && !prefix.contains(&current_tag_sp)
+                    {
+                        let lock_path = cache_dir.join(format!("{hash}.lock"));
+                        let lock_ok = std::fs::OpenOptions::new()
+                            .create(true)
+                            .read(true)
+                            .write(true)
+                            .truncate(false)
+                            .mode(0o600)
+                            .open(&lock_path)
+                            .ok()
+                            .and_then(|lf| lf.try_lock_exclusive().ok().map(|()| lf));
+                        if lock_ok.is_some() {
+                            reclaimed_bytes = reclaimed_bytes.saturating_add(meta.len());
+                            removed_files += 1;
+                            removed_legacy_files += 1;
+                            if apply {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if age >= orphan_min_age {
+            candidate_orphan_hashes.insert(hash.to_string());
+        }
+    }
+
+    for hash in candidate_orphan_hashes {
+        let wal_file = cache_dir.join(format!("{hash}{active_wal_suffix}"));
+        let ast_file = cache_dir.join(format!("{hash}.v4.ast.bin"));
+        let json_file = cache_dir.join(format!("{hash}.json"));
+        let lock_file = cache_dir.join(format!("{hash}.lock"));
+        let recent_sibling = [&wal_file, &ast_file, &json_file].iter().any(|p| {
+            std::fs::symlink_metadata(p)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < orphan_min_age)
+        });
+        if recent_sibling {
+            continue;
+        }
+        let lock_guard = if lock_file.exists() {
+            match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_file)
+            {
+                Ok(lf) => {
+                    if lf.try_lock_exclusive().is_err() {
+                        continue;
+                    }
+                    Some(lf)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        for target in [&wal_file, &ast_file, &json_file, &lock_file] {
+            if let Ok(meta) = std::fs::symlink_metadata(target) {
+                reclaimed_bytes = reclaimed_bytes.saturating_add(meta.len());
+                removed_files += 1;
+                removed_orphan_files += 1;
+                if apply {
+                    let _ = std::fs::remove_file(target);
+                }
+            }
+        }
+        drop(lock_guard);
+    }
+
+    Ok(serde_json::json!({
+        "applied": apply,
+        "removed_files": removed_files,
+        "reclaimed_bytes": reclaimed_bytes,
+        "removed_legacy_files": removed_legacy_files,
+        "removed_orphan_files": removed_orphan_files,
+    }))
+}
+
+impl RootCache {
 
     pub fn estimated_bytes(&self) -> usize {
         if let Some(cached) = self.cached_memory_bytes {

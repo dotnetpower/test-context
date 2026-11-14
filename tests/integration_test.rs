@@ -686,6 +686,70 @@ fn end_to_end_ast_graph_background_cache_and_delta_pytest() {
     let explained = rust_managed.explain_failures().unwrap();
     assert!(explained["failing_test_files"].is_array());
 
+    // 14. Verify ephemeral `.worktrees/` pruning, legacy WAL GC, `test_status(load=true)` `loaded_roots` consistency, and untested source handling.
+    let wt_repo = temp.path().join("demo.worktrees").join("ephemeral-branch");
+    std::fs::create_dir_all(&wt_repo).unwrap();
+    write_file(&wt_repo, "test_wt.py", "def test_wt():\n    assert True\n");
+    let _ = catalog::register(Spec {
+        root: wt_repo.clone(),
+        scopes: vec![".".to_string()],
+        globs: Vec::new(),
+        excludes: Vec::new(),
+        default_excludes: true,
+        pytest_cmd: Vec::new(),
+        policy: MemoryPolicy {
+            background_enabled: false,
+            ..MemoryPolicy::default()
+        },
+        allow_worktrees: false,
+        managed_parent: None,
+    })
+    .unwrap();
+    std::fs::remove_dir_all(&wt_repo).unwrap();
+
+    let cache_dir = catalog::cache_dir().unwrap();
+    let legacy_wal = cache_dir.join(format!("{}.v5.wal.jsonl", "a".repeat(64)));
+    std::fs::write(&legacy_wal, b"{}\n").unwrap();
+
+    let pruned = test_context::registration::prune(true).unwrap();
+    assert_eq!(pruned["pruned_roots"].as_array().unwrap().len(), 1);
+    assert!(!legacy_wal.exists());
+
+    let status_val = daemon::request_or_local(&Request {
+        root: Some(rust_repo.clone()),
+        name: "test_status".to_string(),
+        arguments: json!({ "load": true }),
+        compact: false,
+    })
+    .unwrap();
+    assert_eq!(
+        status_val["daemon"]["loaded_roots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        status_val["workspace"]["indexed_python_files"].as_u64(),
+        Some(1)
+    );
+
+    write_file(&rust_repo, "src/untested_draft.py", "def draft():\n    return 1\n");
+    let live_spec = catalog::resolve_spec(&rust_repo).unwrap();
+    let live_managed = ManagedRoot::load(live_spec).unwrap();
+    let untested_run = live_managed
+        .run_tests(&TestRunRequest {
+            targets: vec!["src/untested_draft.py".to_string()],
+            ..TestRunRequest::default()
+        })
+        .unwrap();
+    assert_eq!(untested_run.status, "no_tests");
+    assert_eq!(
+        untested_run.untested_modified_files,
+        vec!["src/untested_draft.py".to_string()]
+    );
+    live_managed.shutdown();
+
     rust_managed.shutdown();
 }
 

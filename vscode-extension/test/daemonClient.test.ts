@@ -272,14 +272,58 @@ void test('timeout reconnects and succeeds on the second connection', async () =
     }
   });
   const client = new DaemonClient(() => settings(mock.path, 30));
+    try {
+      const result = await client.request<{ recovered: boolean }>(
+        daemonRequest('ping'),
+        new TestCancellation(),
+      );
+      assert.deepEqual(result, { recovered: true });
+      assert.equal(mock.connections(), 2);
+    } finally {
+      client.dispose();
+      await mock.cleanup();
+    }
+  });
+
+void test('fast read-only status/graph queries bypass an in-flight test_run without HOL blocking', async () => {
+  let releaseRun!: () => void;
+  const runGate = new Promise<void>((resolve) => {
+    releaseRun = resolve;
+  });
+  const mock = await createMockDaemon((raw, socket) => {
+    const req = raw as DaemonRequest;
+    if (req.name === 'test_run') {
+      void runGate.then(() => {
+        writeResponse(socket, { result: { status: 'passed' } });
+      });
+    } else if (req.name === 'test_status') {
+      writeResponse(socket, { result: { daemon: { ok: true } } });
+    }
+  });
+
+  const client = new DaemonClient(() => settings(mock.path, 5_000));
   try {
-    const result = await client.request<{ recovered: boolean }>(
-      daemonRequest('ping'),
+    const slowRun = client.request(
+      { root: '/tmp/repo', name: 'test_run', arguments: {}, compact: false },
       new TestCancellation(),
     );
-    assert.deepEqual(result, { recovered: true });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+
+    const statusStart = performance.now();
+    const fastStatus = await client.request<{ daemon: { ok: boolean } }>(
+      { root: '/tmp/repo', name: 'test_status', arguments: {}, compact: false },
+      new TestCancellation(),
+    );
+    const statusElapsed = performance.now() - statusStart;
+    assert.equal(fastStatus.daemon.ok, true);
+    assert.ok(statusElapsed < 500, `expected fast lane <500ms, got ${statusElapsed}ms`);
     assert.equal(mock.connections(), 2);
+
+    releaseRun();
+    const runResult = await slowRun;
+    assert.deepEqual(runResult, { status: 'passed' });
   } finally {
+    releaseRun();
     client.dispose();
     await mock.cleanup();
   }

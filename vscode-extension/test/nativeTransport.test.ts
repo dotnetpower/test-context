@@ -58,7 +58,11 @@ void test('WSL launch uses tctx native IPC without MCP or a network port', () =>
     'native-bridge',
   ]);
   assert.ok(launch.command.endsWith('\\System32\\wsl.exe'));
-  assert.ok(nativeEndpoint(settings, 'win32').includes('Ubuntu-22.04'));
+  assert.equal(nativeEndpoint(settings, 'win32'), 'wsl:Ubuntu-22.04:/home/test/.local/bin/tctx');
+  assert.equal(
+    nativeEndpoint({ ...settings, socketPath: '/tmp/custom.sock' }, 'win32'),
+    'wsl:Ubuntu-22.04:/home/test/.local/bin/tctx:/tmp/custom.sock',
+  );
   assert.throws(() => wslLaunch({ ...settings, wslDistribution: '--shutdown' }));
   assert.throws(() => wslLaunch({ ...settings, wslDistribution: 'bad\nname' }));
   assert.throws(() => wslLaunch({ ...settings, wslExecutablePath: 'relative/tctx' }));

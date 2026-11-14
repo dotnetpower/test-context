@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.3
+
+- Add persisted `bincode` AST + edge snapshots (`.v4.ast.bin`), multi-core directory scanning, `O(1)` scoped config hashing, and persisted Python runtime metadata caching for up to 6–25× faster cold workspace loads.
+- Support root `.gitignore` DFA filtering (including negation and directory-only rules) and restrict non-test Rust string `data_refs` to static fixtures/compile-time includes so mutable runtime state files never cause false invalidations.
+- Split Rust `api_semantic_sha256` from inline `#[cfg(test)]` blocks so editing unit tests inside a module preserves downstream importer caches, and isolate monorepo sub-crate `Cargo.toml` invalidation and target expansion.
+- Preserve verified test results in `test_run` when unrelated files are edited concurrently, execute precompiled Cargo test binaries concurrently in parallel, wire `cargo-nextest` support, and separate Cargo compilation timeouts from execution timeouts.
+- Add structured daemon/MCP operational logging and bounded `metrics.jsonl` telemetry, automatic zombie `.worktrees/` and legacy/orphan cache GC, and `test_status(load=true)` `loaded_roots` consistency.
+- Add a dedicated read-only fast IPC lane in `DaemonClient` to eliminate Head-of-Line blocking during long `test_run` calls, debounce workspace-folder probes, and recognize short-flag WSL MCP configurations.
+
 ## 0.1.2
 
 - Release watches and graph entries for deleted or moved-out directory subtrees, recover watch capacity, and rewatch recreated paths.

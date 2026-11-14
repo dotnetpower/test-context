@@ -68,6 +68,10 @@ pub fn dispatch_with_root(request: Value, default_root: Option<&PathBuf>) -> Opt
     let result = match method {
         "initialize" => {
             let version = params["protocolVersion"].as_str().unwrap_or("2025-06-18");
+            eprintln!(
+                "[tctx-mcp] status=initialized version={} protocol={version}",
+                env!("CARGO_PKG_VERSION")
+            );
             let supported = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
             Ok(json!({
                 "protocolVersion": if supported.contains(&version) { version } else { "2025-06-18" },
@@ -111,22 +115,36 @@ pub fn dispatch_with_root(request: Value, default_root: Option<&PathBuf>) -> Opt
                             }],
                             "isError": false
                         })),
-                        Err(err) => Ok(json!({
-                            "content": [{
-                                "type": "text",
-                                "text": err.to_string()
-                            }],
-                            "isError": true
-                        })),
+                        Err(err) => {
+                            let msg = err.to_string();
+                            eprintln!(
+                                "[tctx-mcp] op={name} outcome=error err={}",
+                                msg.lines().next().unwrap_or(&msg)
+                            );
+                            Ok(json!({
+                                "content": [{
+                                    "type": "text",
+                                    "text": msg
+                                }],
+                                "isError": true
+                            }))
+                        }
                     }
                 }
-                Err(err) => Ok(json!({
-                    "content": [{
-                        "type": "text",
-                        "text": err.to_string()
-                    }],
-                    "isError": true
-                })),
+                Err(err) => {
+                    let msg = err.to_string();
+                    eprintln!(
+                        "[tctx-mcp] op={name} outcome=root_error err={}",
+                        msg.lines().next().unwrap_or(&msg)
+                    );
+                    Ok(json!({
+                        "content": [{
+                            "type": "text",
+                            "text": msg
+                        }],
+                        "isError": true
+                    }))
+                }
             }
         }
         _ => Err((-32601, format!("unknown method: {method}"))),

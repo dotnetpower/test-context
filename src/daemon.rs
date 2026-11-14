@@ -24,11 +24,20 @@ pub const MAX_ACTIVE_CONNECTIONS: usize = 64;
 pub const MAX_CONNECTION_WORKERS: usize = 8;
 pub const PERSISTENT_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_RESIDENT_ROOTS: usize = 8;
-pub const MAX_DAEMON_RSS_BYTES: u64 = 192 * 1024 * 1024;
-pub const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(900);
-pub const LARGE_ROOT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+pub const MAX_DAEMON_RSS_BYTES: u64 = 1024 * 1024 * 1024;
+pub const IDLE_ROOT_TIMEOUT: Duration = Duration::from_secs(1_800);
+pub const LARGE_ROOT_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 pub const LARGE_ROOT_FILE_THRESHOLD: usize = 5_000;
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn configured_max_daemon_rss_bytes() -> u64 {
+    std::env::var("TCTX_MAX_RSS_MB")
+        .ok()
+        .and_then(|val| val.trim().parse::<u64>().ok())
+        .filter(|mb| (128..=16_384).contains(mb))
+        .and_then(|mb| mb.checked_mul(1024 * 1024))
+        .unwrap_or(MAX_DAEMON_RSS_BYTES)
+}
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn trim_allocator() -> bool {
@@ -192,10 +201,61 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+struct DaemonMetrics {
+    total_requests: u64,
+    error_requests: u64,
+    test_runs: u64,
+    total_saved_ms: u64,
+    total_cached_files: u64,
+    total_executed_files: u64,
+}
+
+impl DaemonMetrics {
+    fn to_json(&self) -> Value {
+        json!({
+            "total_requests": self.total_requests,
+            "error_requests": self.error_requests,
+            "test_runs": self.test_runs,
+            "total_saved_ms": self.total_saved_ms,
+            "total_cached_files": self.total_cached_files,
+            "total_executed_files": self.total_executed_files,
+        })
+    }
+}
+
+fn append_metrics_jsonl(entry: &Value) {
+    let Ok(dir) = catalog::state_dir() else {
+        return;
+    };
+    let path = dir.join("metrics.jsonl");
+    if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        if meta.len() >= 2 * 1024 * 1024 {
+            let _ = std::fs::rename(&path, dir.join("metrics.jsonl.1"));
+        }
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    else {
+        return;
+    };
+    if let Ok(mut line) = serde_json::to_vec(entry) {
+        line.push(b'\n');
+        let _ = file.write_all(&line);
+    }
+}
+
 struct DaemonHub {
     roots: Mutex<BTreeMap<PathBuf, Arc<ManagedRoot>>>,
     load_gate: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>,
     traces: Mutex<VecDeque<Value>>,
+    metrics: Mutex<DaemonMetrics>,
     started_at: Instant,
     local_oneshot: bool,
     shutting_down: AtomicBool,
@@ -211,6 +271,14 @@ impl DaemonHub {
             roots: Mutex::new(BTreeMap::new()),
             load_gate: Mutex::new(BTreeMap::new()),
             traces: Mutex::new(VecDeque::new()),
+            metrics: Mutex::new(DaemonMetrics {
+                total_requests: 0,
+                error_requests: 0,
+                test_runs: 0,
+                total_saved_ms: 0,
+                total_cached_files: 0,
+                total_executed_files: 0,
+            }),
             started_at: Instant::now(),
             local_oneshot,
             shutting_down: AtomicBool::new(false),
@@ -299,7 +367,7 @@ impl DaemonHub {
                 }
             }
             if guard.len() > 1
-                && daemon_rss_bytes().is_some_and(|rss| rss > MAX_DAEMON_RSS_BYTES)
+                && daemon_rss_bytes().is_some_and(|rss| rss > configured_max_daemon_rss_bytes())
                 && let Some(oldest_key) = guard
                     .iter()
                     .filter(|(_, root)| root.is_evictable())
@@ -310,11 +378,16 @@ impl DaemonHub {
                 evicted.push(old);
             }
         }
-        let had_evictions = !evicted.is_empty();
+        let evicted_count = evicted.len();
+        let had_evictions = evicted_count > 0;
         for root in evicted {
             root.shutdown();
         }
-        let high_rss = daemon_rss_bytes().is_some_and(|rss| rss > 64 * 1024 * 1024);
+        if had_evictions && !self.local_oneshot {
+            eprintln!("[tctx-daemon] event=roots_evicted count={evicted_count}");
+        }
+        let high_rss =
+            daemon_rss_bytes().is_some_and(|rss| rss > configured_max_daemon_rss_bytes() / 2);
         if high_rss {
             let roots = self.lock_roots().values().cloned().collect::<Vec<_>>();
             for root in roots {
@@ -352,6 +425,7 @@ impl DaemonHub {
         if !self.local_oneshot {
             self.evict_idle_or_excess_roots();
         }
+        let load_started = Instant::now();
         let spec_for_load = spec.clone();
         let loaded = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             ManagedRoot::load(spec_for_load)
@@ -366,6 +440,14 @@ impl DaemonHub {
                 .into());
             }
         };
+        if !self.local_oneshot {
+            eprintln!(
+                "[tctx-daemon] event=root_loaded root={} files={} load_ms={:.1}",
+                spec.root.display(),
+                loaded.indexed_file_count(),
+                load_started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let mut guard = self.lock_roots();
         if let Some(old) = guard.insert(spec.root, Arc::clone(&loaded)) {
             old.shutdown();
@@ -433,11 +515,70 @@ impl DaemonHub {
             .into()),
         };
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let now_ms = crate::cache::now_unix_ms();
 
         match outcome {
             Ok(value) => {
+                if !self.local_oneshot {
+                    let mut m = self
+                        .metrics
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    m.total_requests = m.total_requests.saturating_add(1);
+                    if req.name == "test_run" {
+                        m.test_runs = m.test_runs.saturating_add(1);
+                        let saved = value["saved_ms"].as_u64().unwrap_or(0);
+                        let cached = value["cached_files_count"].as_u64().unwrap_or(0);
+                        let executed = value["executed_files_count"].as_u64().unwrap_or(0);
+                        m.total_saved_ms = m.total_saved_ms.saturating_add(saved);
+                        m.total_cached_files = m.total_cached_files.saturating_add(cached);
+                        m.total_executed_files = m.total_executed_files.saturating_add(executed);
+                        drop(m);
+                        let status_s = value["status"].as_str().unwrap_or("unknown");
+                        let mode_s = value["mode"].as_str().unwrap_or("unknown");
+                        eprintln!(
+                            "[tctx-daemon] op=test_run status={status_s} mode={mode_s} cached={cached} executed={executed} saved_ms={saved} duration_ms={elapsed_ms:.1} root={}",
+                            req.root
+                                .as_deref()
+                                .map_or_else(|| "-".to_string(), |p| p.display().to_string())
+                        );
+                        append_metrics_jsonl(&json!({
+                            "unix_ms": now_ms,
+                            "op": "test_run",
+                            "root": req.root,
+                            "status": status_s,
+                            "mode": mode_s,
+                            "cached_files": cached,
+                            "executed_files": executed,
+                            "saved_ms": saved,
+                            "duration_ms": elapsed_ms,
+                        }));
+                    } else {
+                        drop(m);
+                        if matches!(
+                            req.name.as_str(),
+                            "test_affected" | "test_graph" | "test_sync" | "test_invalidate" | "test_ruff"
+                        ) {
+                            append_metrics_jsonl(&json!({
+                                "unix_ms": now_ms,
+                                "op": req.name,
+                                "root": req.root,
+                                "ok": true,
+                                "duration_ms": elapsed_ms,
+                            }));
+                        }
+                        if elapsed_ms >= 200.0 && req.name != "test_trace" {
+                            eprintln!(
+                                "[tctx-daemon] op={} outcome=slow duration_ms={elapsed_ms:.1} root={}",
+                                req.name,
+                                req.root
+                                    .as_deref()
+                                    .map_or_else(|| "-".to_string(), |p| p.display().to_string())
+                            );
+                        }
+                    }
+                }
                 if let Some(tid) = trace_id {
-                    let now_ms = crate::cache::now_unix_ms();
                     self.record_trace(json!({
                         "trace_id": tid,
                         "operation": req.name,
@@ -458,7 +599,35 @@ impl DaemonHub {
                     Ok(value)
                 }
             }
-            Err(err) => Err(err.to_string()),
+            Err(err) => {
+                let err_msg = err.to_string();
+                if !self.local_oneshot {
+                    let mut m = self
+                        .metrics
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    m.total_requests = m.total_requests.saturating_add(1);
+                    m.error_requests = m.error_requests.saturating_add(1);
+                    drop(m);
+                    eprintln!(
+                        "[tctx-daemon] op={} outcome=error duration_ms={elapsed_ms:.1} root={} err={}",
+                        req.name,
+                        req.root
+                            .as_deref()
+                            .map_or_else(|| "-".to_string(), |p| p.display().to_string()),
+                        err_msg.lines().next().unwrap_or(&err_msg)
+                    );
+                    append_metrics_jsonl(&json!({
+                        "unix_ms": now_ms,
+                        "op": req.name,
+                        "root": req.root,
+                        "ok": false,
+                        "duration_ms": elapsed_ms,
+                        "error": err_msg.lines().next().unwrap_or(&err_msg),
+                    }));
+                }
+                Err(err_msg)
+            }
         }
     }
 
@@ -480,8 +649,6 @@ impl DaemonHub {
                 Ok(json!({"recorded": true}))
             }
             "test_status" => {
-                let registered = catalog::load()?;
-                let loaded_roots: Vec<PathBuf> = self.lock_roots().keys().cloned().collect();
                 let root_status = if let Some(root_path) = &req.root {
                     if let Some(managed) = self.loaded_root(root_path)? {
                         Some(managed.status())
@@ -504,6 +671,13 @@ impl DaemonHub {
                 } else {
                     None
                 };
+                let registered = catalog::load()?;
+                let loaded_roots: Vec<PathBuf> = self.lock_roots().keys().cloned().collect();
+                let metrics = self
+                    .metrics
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .to_json();
                 Ok(json!({
                     "daemon": {
                         "ok": true,
@@ -512,6 +686,7 @@ impl DaemonHub {
                         "uptime_secs": self.started_at.elapsed().as_secs(),
                         "registered_roots": registered.len(),
                         "loaded_roots": loaded_roots,
+                        "metrics": metrics,
                     },
                     "capabilities": Self::capabilities(),
                     "workspace": root_status,
@@ -740,12 +915,31 @@ pub fn serve() -> Result<()> {
     std::fs::rename(&tmp_sock, &sock_path)?;
     let runtime_identity = Arc::new(RuntimeIdentity::capture(&dir, &sock_path, &lock_file)?);
 
+    if let Ok(gc_res) = registration::prune(true) {
+        let pruned_count = gc_res["pruned_roots"]
+            .as_array()
+            .map_or(0, std::vec::Vec::len);
+        let removed_cache = gc_res["cache_gc"]["removed_files"].as_u64().unwrap_or(0);
+        let reclaimed = gc_res["cache_gc"]["reclaimed_bytes"].as_u64().unwrap_or(0);
+        if pruned_count > 0 || removed_cache > 0 {
+            eprintln!(
+                "[tctx-daemon] event=startup_gc pruned_roots={pruned_count} removed_cache_files={removed_cache} reclaimed_bytes={reclaimed}"
+            );
+        }
+    }
+
     let hub = Arc::new(DaemonHub::new());
     let active_connections = Arc::new(AtomicUsize::new(0));
     let worker_count = connection_worker_count(
         std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(4),
+    );
+    eprintln!(
+        "[tctx-daemon] status=started version={} pid={} workers={worker_count} sock={}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        sock_path.display()
     );
     let (connection_tx, connection_rx) = sync_channel::<ConnectionWork>(MAX_ACTIVE_CONNECTIONS);
     let connection_rx = Arc::new(Mutex::new(connection_rx));
@@ -784,6 +978,7 @@ pub fn serve() -> Result<()> {
                 .name("tctx-maint".to_string())
                 .spawn(move || {
                     let mut last_identity_check = Instant::now();
+                    let mut last_gc_check = Instant::now();
                     while !STOP_REQUESTED.load(Ordering::Acquire) {
                         std::thread::sleep(Duration::from_millis(100));
                         if last_identity_check.elapsed() < Duration::from_secs(5) {
@@ -798,6 +993,21 @@ pub fn serve() -> Result<()> {
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             hub_maint.evict_idle_or_excess_roots();
                         }));
+                        if last_gc_check.elapsed() >= Duration::from_secs(3_600) {
+                            if let Ok(gc_res) = registration::prune(true) {
+                                let pruned = gc_res["pruned_roots"]
+                                    .as_array()
+                                    .map_or(0, std::vec::Vec::len);
+                                let removed =
+                                    gc_res["cache_gc"]["removed_files"].as_u64().unwrap_or(0);
+                                if pruned > 0 || removed > 0 {
+                                    eprintln!(
+                                        "[tctx-daemon] event=periodic_gc pruned_roots={pruned} removed_cache_files={removed}"
+                                    );
+                                }
+                            }
+                            last_gc_check = Instant::now();
+                        }
                         last_identity_check = Instant::now();
                     }
                 })?,

@@ -33,7 +33,7 @@ impl Default for MemoryPolicy {
             max_cached_results: 50_000,
             max_cache_bytes: 128 * 1024 * 1024,
             max_node_results_per_file: 10_000,
-            pytest_timeout_secs: 180,
+            pytest_timeout_secs: 300,
             background_batch_size: 4,
             background_enabled: true,
             background_safe_only: true,

@@ -284,7 +284,7 @@ while True:
 
     args = req.get("args", [])
     capture_dynamic_deps = bool(req.get("capture_dynamic_deps", False))
-    timeout_secs = float(req.get("timeout_secs", 180.0))
+    timeout_secs = float(req.get("timeout_secs", 300.0))
     started = time.perf_counter()
 
     task_count = len(os.listdir("/proc/self/task")) if os.path.isdir("/proc/self/task") else threading.active_count()

@@ -51,17 +51,23 @@ pub fn authorize(root: &Path, allow: bool) -> Result<Value> {
 }
 
 pub fn prune(apply: bool) -> Result<Value> {
-    let specs = catalog::load()?;
+    let mut specs = catalog::load()?;
     let missing = catalog::missing_managed_roots(&specs)?;
     if apply && !missing.is_empty() {
         catalog::mutate(|entries| {
             entries.retain(|spec| !missing.contains(&spec.root));
             Ok(())
         })?;
+        specs.retain(|spec| !missing.contains(&spec.root));
+    } else if !apply {
+        specs.retain(|spec| !missing.contains(&spec.root));
     }
+    let active_roots: Vec<PathBuf> = specs.into_iter().map(|s| s.root).collect();
+    let cache_gc = crate::cache::gc_cache_dir(&active_roots, Duration::from_secs(300), apply)?;
     Ok(json!({
         "applied": apply,
         "pruned_roots": missing,
+        "cache_gc": cache_gc,
     }))
 }
 

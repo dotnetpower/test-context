@@ -62,12 +62,25 @@ export class TracedRequestError extends Error {
   }
 }
 
+const FAST_READ_ONLY_OPS = new Set([
+  'ping',
+  'test_status',
+  'test_graph',
+  'test_affected',
+  'test_workspaces',
+  'test_trace',
+  'test_explain',
+]);
+
 export class DaemonClient {
   private socket: Duplex | undefined;
   private socketPath: string | undefined;
   private receiveBuffer = Buffer.alloc(0);
   private pending: PendingResponse | undefined;
   private queue: Promise<void> = Promise.resolve();
+  private inFlightCount = 0;
+  private fastLane: DaemonClient | undefined;
+  private fastLaneIdleTimer: NodeJS.Timeout | undefined;
   private disposed = false;
   private tracingAvailable: boolean | undefined;
 
@@ -75,6 +88,7 @@ export class DaemonClient {
     private readonly settings: () => ClientSettings,
     private readonly serviceStarter: (settings: ClientSettings) => Promise<void> = startNativeService,
     private readonly connector = connectNativeTransport,
+    private readonly allowFastLane = true,
   ) {}
 
   public get usesWslBridge(): boolean {
@@ -133,14 +147,51 @@ export class DaemonClient {
     cancellation: CancellationLike,
     trace?: ClientTrace,
   ): Promise<T> {
+    if (
+      this.allowFastLane &&
+      this.inFlightCount > 0 &&
+      FAST_READ_ONLY_OPS.has(request.name)
+    ) {
+      if (this.fastLaneIdleTimer) {
+        clearTimeout(this.fastLaneIdleTimer);
+        this.fastLaneIdleTimer = undefined;
+      }
+      this.fastLane ??= new DaemonClient(
+        this.settings,
+        this.serviceStarter,
+        this.connector,
+        false,
+      );
+      if (this.tracingAvailable !== undefined && this.fastLane.tracingAvailable === undefined) {
+        this.fastLane.tracingAvailable = this.tracingAvailable;
+      }
+      return this.fastLane.enqueue<T>(request, cancellation, trace).finally(() => {
+        if (!this.disposed && this.fastLane && this.fastLane.inFlightCount === 0) {
+          if (this.fastLaneIdleTimer) {
+            clearTimeout(this.fastLaneIdleTimer);
+          }
+          this.fastLaneIdleTimer = setTimeout(() => {
+            this.fastLaneIdleTimer = undefined;
+            if (this.fastLane && this.fastLane.inFlightCount === 0) {
+              this.fastLane.dispose();
+              this.fastLane = undefined;
+            }
+          }, 15_000);
+          this.fastLaneIdleTimer.unref?.();
+        }
+      });
+    }
     const queuedAt = performance.now();
+    this.inFlightCount += 1;
     const execute = (): Promise<T> => {
       if (trace) {
         trace.queue_ms = performance.now() - queuedAt;
       }
       return this.requestWithRetry<T>(request, cancellation, trace);
     };
-    const run = this.queue.then(execute, execute);
+    const run = this.queue.then(execute, execute).finally(() => {
+      this.inFlightCount = Math.max(0, this.inFlightCount - 1);
+    });
     this.queue = run.then(
       () => undefined,
       () => undefined,
@@ -150,11 +201,18 @@ export class DaemonClient {
 
   public dispose(): void {
     this.disposed = true;
+    if (this.fastLaneIdleTimer) {
+      clearTimeout(this.fastLaneIdleTimer);
+      this.fastLaneIdleTimer = undefined;
+    }
+    this.fastLane?.dispose();
+    this.fastLane = undefined;
     this.disconnect(new Error('Test Context native client was disposed.'));
   }
 
   public reset(): void {
     if (!this.disposed) {
+      this.fastLane?.reset();
       this.disconnect(new Error('Test Context native connection was reset.'));
     }
   }

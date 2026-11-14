@@ -83,4 +83,4 @@ jobs:
             release-artifacts/test-context-native.vsix.sha256 \
             --verify-tag \
             --title "Test Context ${RELEASE_TAG#v}" \
-            --notes "Install the VSIX from Extensions > Install from VSIX. Includes 7 native VS Code Language Model Tools for Python pytest, Rust cargo test, PyO3 hybrid graphs, and Ruff pre-flight checks."
+            --notes "Install the VSIX from Extensions > Install from VSIX. Includes 7 native VS Code Language Model Tools for Python pytest, Rust cargo test, Frontend Vitest/Jest/Node, PyO3 hybrid graphs, and Ruff/Clippy/ESLint pre-flight checks."

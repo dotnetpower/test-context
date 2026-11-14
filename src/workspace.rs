@@ -2,7 +2,7 @@ use crate::exclusion_policy::{is_excluded_dir_name, is_excluded_rel_path};
 use crate::policy::MemoryPolicy;
 use crate::{Result, invalid};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -84,6 +84,17 @@ pub const DATA_FILE_EXTENSIONS: &[&str] = &[
 ];
 
 #[derive(Clone, Debug)]
+struct GitignoreMatcher {
+    ignore: GlobSet,
+    ignore_ranks: Vec<usize>,
+    dir_only_ignore: GlobSet,
+    dir_only_ignore_ranks: Vec<usize>,
+    allow: GlobSet,
+    allow_ranks: Vec<usize>,
+    allow_ancestors: BTreeSet<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
 pub struct Workspace {
     pub root: PathBuf,
     pub scopes: Vec<String>,
@@ -92,11 +103,177 @@ pub struct Workspace {
     pub default_excludes: bool,
     include_matcher: GlobSet,
     exclude_matcher: GlobSet,
+    gitignore: GitignoreMatcher,
+}
+
+fn compile_root_gitignore(root: &Path, enabled: bool) -> GitignoreMatcher {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let empty = || GitignoreMatcher {
+        ignore: GlobSetBuilder::new().build().unwrap_or_default(),
+        ignore_ranks: Vec::new(),
+        dir_only_ignore: GlobSetBuilder::new().build().unwrap_or_default(),
+        dir_only_ignore_ranks: Vec::new(),
+        allow: GlobSetBuilder::new().build().unwrap_or_default(),
+        allow_ranks: Vec::new(),
+        allow_ancestors: BTreeSet::new(),
+    };
+    if !enabled {
+        return empty();
+    }
+    let path = root.join(".gitignore");
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return empty();
+    };
+    let mut raw_bytes = Vec::new();
+    if file.take(256 * 1024).read_to_end(&mut raw_bytes).is_err() {
+        return empty();
+    }
+    let text = String::from_utf8_lossy(&raw_bytes);
+    let mut ignore_builder = GlobSetBuilder::new();
+    let mut ignore_ranks = Vec::new();
+    let mut dir_only_builder = GlobSetBuilder::new();
+    let mut dir_only_ranks = Vec::new();
+    let mut allow_builder = GlobSetBuilder::new();
+    let mut allow_ranks = Vec::new();
+    let mut allow_ancestors = BTreeSet::new();
+
+    for (line_idx, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim_end_matches('\r');
+        let trimmed_start = line.trim_start();
+        if trimmed_start.is_empty() || trimmed_start.starts_with('#') {
+            continue;
+        }
+        let (negated, rest) = if let Some(after_bang) = line.strip_prefix('!') {
+            (true, after_bang)
+        } else if let Some(escaped) = line.strip_prefix("\\!") {
+            (false, escaped)
+        } else if let Some(escaped_hash) = line.strip_prefix("\\#") {
+            (false, escaped_hash)
+        } else {
+            (false, line)
+        };
+        let raw_trimmed = rest.trim();
+        let dir_only = raw_trimmed.ends_with('/');
+        let cleaned = raw_trimmed.trim_end_matches('/');
+        if cleaned.is_empty() || cleaned == "." || cleaned == "**" {
+            continue;
+        }
+        let anchored = cleaned.starts_with('/') || cleaned.contains('/');
+        let base = cleaned.trim_start_matches('/');
+        if base.is_empty() {
+            continue;
+        }
+        if negated {
+            let mut cur = Path::new(base).parent();
+            while let Some(anc) = cur {
+                if anc.as_os_str().is_empty() {
+                    break;
+                }
+                let clean_anc: PathBuf = anc
+                    .components()
+                    .take_while(|c| {
+                        let s = c.as_os_str().to_string_lossy();
+                        !s.contains(['*', '?', '['])
+                    })
+                    .collect();
+                if !clean_anc.as_os_str().is_empty() {
+                    allow_ancestors.insert(clean_anc);
+                }
+                cur = anc.parent();
+            }
+            let candidates = if anchored {
+                vec![base.to_string(), format!("{base}/**")]
+            } else {
+                vec![
+                    base.to_string(),
+                    format!("**/{base}"),
+                    format!("{base}/**"),
+                    format!("**/{base}/**"),
+                ]
+            };
+            for cand in candidates {
+                if let Ok(glob) = Glob::new(&cand) {
+                    allow_builder.add(glob);
+                    allow_ranks.push(line_idx + 1);
+                }
+            }
+        } else if dir_only {
+            let self_dir_cands = if anchored {
+                vec![base.to_string()]
+            } else {
+                vec![base.to_string(), format!("**/{base}")]
+            };
+            for cand in self_dir_cands {
+                if let Ok(glob) = Glob::new(&cand) {
+                    dir_only_builder.add(glob);
+                    dir_only_ranks.push(line_idx + 1);
+                }
+            }
+            let desc_cands = if anchored {
+                vec![format!("{base}/*"), format!("{base}/**/*")]
+            } else {
+                vec![
+                    format!("{base}/*"),
+                    format!("{base}/**/*"),
+                    format!("**/{base}/*"),
+                    format!("**/{base}/**/*"),
+                ]
+            };
+            for cand in desc_cands {
+                if let Ok(glob) = Glob::new(&cand) {
+                    ignore_builder.add(glob);
+                    ignore_ranks.push(line_idx + 1);
+                }
+            }
+        } else {
+            let candidates = if anchored {
+                vec![base.to_string(), format!("{base}/**")]
+            } else {
+                vec![
+                    base.to_string(),
+                    format!("**/{base}"),
+                    format!("{base}/**"),
+                    format!("**/{base}/**"),
+                ]
+            };
+            for cand in candidates {
+                if let Ok(glob) = Glob::new(&cand) {
+                    ignore_builder.add(glob);
+                    ignore_ranks.push(line_idx + 1);
+                }
+            }
+        }
+    }
+
+    let Ok(ignore) = ignore_builder.build() else {
+        return empty();
+    };
+    let Ok(dir_only_ignore) = dir_only_builder.build() else {
+        return empty();
+    };
+    let Ok(allow) = allow_builder.build() else {
+        return empty();
+    };
+    GitignoreMatcher {
+        ignore,
+        ignore_ranks,
+        dir_only_ignore,
+        dir_only_ignore_ranks: dir_only_ranks,
+        allow,
+        allow_ranks,
+        allow_ancestors,
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Inventory {
     pub files: Vec<PathBuf>,
+    pub file_stamps: BTreeMap<PathBuf, crate::ast_graph::FileStamp>,
     pub total_path_bytes: usize,
     pub metadata_source_bytes: usize,
 }
@@ -204,6 +381,7 @@ impl Workspace {
             builder.add(Glob::new(pat).map_err(|e| invalid(format!("invalid exclude glob: {e}")))?);
         }
         let exclude_matcher = builder.build()?;
+        let gitignore = compile_root_gitignore(&root, default_excludes);
         Ok(Self {
             root,
             scopes,
@@ -212,7 +390,62 @@ impl Workspace {
             default_excludes,
             include_matcher,
             exclude_matcher,
+            gitignore,
         })
+    }
+
+    pub fn is_gitignored_rel(&self, rel: &Path) -> bool {
+        self.is_gitignored_entry(rel, false)
+    }
+
+    fn is_gitignored_dir_prunable(&self, rel: &Path) -> bool {
+        if self.gitignore.allow_ancestors.contains(rel) {
+            return false;
+        }
+        self.is_gitignored_entry(rel, true)
+    }
+
+    fn is_gitignored_entry(&self, rel: &Path, is_dir: bool) -> bool {
+        if !self.default_excludes
+            || (self.gitignore.ignore_ranks.is_empty()
+                && self.gitignore.dir_only_ignore_ranks.is_empty())
+        {
+            return false;
+        }
+        let mut max_ignore = self
+            .gitignore
+            .ignore
+            .matches(rel)
+            .into_iter()
+            .filter_map(|idx| self.gitignore.ignore_ranks.get(idx).copied())
+            .max()
+            .unwrap_or(0);
+        if is_dir && !self.gitignore.dir_only_ignore_ranks.is_empty() {
+            let dir_rank = self
+                .gitignore
+                .dir_only_ignore
+                .matches(rel)
+                .into_iter()
+                .filter_map(|idx| self.gitignore.dir_only_ignore_ranks.get(idx).copied())
+                .max()
+                .unwrap_or(0);
+            max_ignore = max_ignore.max(dir_rank);
+        }
+        if max_ignore == 0 {
+            return false;
+        }
+        if self.gitignore.allow_ranks.is_empty() {
+            return true;
+        }
+        let max_allow = self
+            .gitignore
+            .allow
+            .matches(rel)
+            .into_iter()
+            .filter_map(|idx| self.gitignore.allow_ranks.get(idx).copied())
+            .max()
+            .unwrap_or(0);
+        max_ignore > max_allow
     }
 
     pub fn is_permitted_rel(&self, rel: &Path) -> bool {
@@ -222,7 +455,7 @@ impl Workspace {
         if self.default_excludes && is_excluded_rel_path(rel) {
             return false;
         }
-        if self.exclude_matcher.is_match(rel) {
+        if self.exclude_matcher.is_match(rel) || self.is_gitignored_rel(rel) {
             return false;
         }
         let in_scope = self.scopes.iter().any(|scope| {
@@ -263,7 +496,7 @@ impl Workspace {
         if self.default_excludes && is_excluded_rel_path(rel) {
             return false;
         }
-        if self.exclude_matcher.is_match(rel) {
+        if self.exclude_matcher.is_match(rel) || self.is_gitignored_rel(rel) {
             return false;
         }
         let Some(file_name) = rel.file_name().and_then(|n| n.to_str()) else {
@@ -276,6 +509,7 @@ impl Workspace {
 
     pub fn files_limited(&self, policy: &MemoryPolicy) -> Result<Inventory> {
         let mut files = BTreeSet::new();
+        let mut file_stamps = BTreeMap::new();
         let mut stack = Vec::new();
         for scope in &self.scopes {
             let start = if scope == "." {
@@ -290,60 +524,199 @@ impl Workspace {
         let mut total_path_bytes = 0usize;
         let mut metadata_source_bytes = 0usize;
 
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let file_type = match entry.file_type() {
-                    Ok(ft) => ft,
+        while let Some(mut dir_batch) = if stack.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut stack))
+        } {
+            if dir_batch.len() >= 8 {
+                let workers = std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(4)
+                    .clamp(2, 8)
+                    .min(dir_batch.len());
+                let chunk_size = dir_batch.len().div_ceil(workers).max(1);
+                type DirScanItem = (
+                    Vec<PathBuf>,
+                    Vec<(PathBuf, usize, crate::ast_graph::FileStamp)>,
+                );
+                let batch_results: Vec<DirScanItem> = std::thread::scope(|scope_pool| {
+                    let handles: Vec<_> = dir_batch
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            scope_pool.spawn(move || {
+                                let mut sub_dirs = Vec::new();
+                                let mut sub_files = Vec::new();
+                                for dir in chunk {
+                                    let Ok(entries) = std::fs::read_dir(dir) else {
+                                        continue;
+                                    };
+                                    for entry in entries.flatten() {
+                                        let Ok(file_type) = entry.file_type() else {
+                                            continue;
+                                        };
+                                        if file_type.is_symlink() {
+                                            continue;
+                                        }
+                                        let path = entry.path();
+                                        let Ok(rel) = path.strip_prefix(&self.root) else {
+                                            continue;
+                                        };
+                                        if file_type.is_dir() {
+                                            if let Some(name) =
+                                                path.file_name().and_then(|n| n.to_str())
+                                                && self.default_excludes
+                                                && is_excluded_dir_name(name)
+                                            {
+                                                continue;
+                                            }
+                                            if self.exclude_matcher.is_match(rel)
+                                                || self.is_gitignored_dir_prunable(rel)
+                                            {
+                                                continue;
+                                            }
+                                            sub_dirs.push(path);
+                                        } else if file_type.is_file()
+                                            && let Some(file_name) =
+                                                path.file_name().and_then(|n| n.to_str())
+                                            && !(self.default_excludes
+                                                && is_excluded_dir_name(file_name))
+                                            && self.matches_permitted_filename_or_glob(
+                                                rel, file_name,
+                                            )
+                                        {
+                                            if self.exclude_matcher.is_match(rel)
+                                                || self.is_gitignored_rel(rel)
+                                            {
+                                                continue;
+                                            }
+                                            let Ok(meta) = entry.metadata() else {
+                                                continue;
+                                            };
+                                            let len = usize::try_from(meta.len())
+                                                .unwrap_or(usize::MAX);
+                                            if len > policy.max_file_bytes {
+                                                continue;
+                                            }
+                                            use std::os::unix::fs::MetadataExt;
+                                            let stamp = crate::ast_graph::FileStamp {
+                                                mtime_sec: meta.mtime(),
+                                                mtime_nsec: meta.mtime_nsec(),
+                                                size: meta.len(),
+                                                ino: meta.ino(),
+                                                ctime_sec: meta.ctime(),
+                                                ctime_nsec: meta.ctime_nsec(),
+                                            };
+                                            sub_files.push((rel.to_path_buf(), len, stamp));
+                                        }
+                                    }
+                                }
+                                (sub_dirs, sub_files)
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .filter_map(|h| h.join().ok())
+                        .collect()
+                });
+                for (sub_dirs, sub_files) in batch_results {
+                    stack.extend(sub_dirs);
+                    for (rel_buf, len, stamp) in sub_files {
+                        if files.insert(rel_buf.clone()) {
+                            total_path_bytes =
+                                total_path_bytes.saturating_add(rel_buf.as_os_str().len());
+                            metadata_source_bytes = metadata_source_bytes.saturating_add(len);
+                            if files.len() > policy.max_files {
+                                return Err(
+                                    invalid("workspace exceeds max_files policy limit").into()
+                                );
+                            }
+                            if total_path_bytes > policy.max_total_path_bytes {
+                                return Err(invalid(
+                                    "workspace exceeds max_total_path_bytes policy limit",
+                                )
+                                .into());
+                            }
+                            file_stamps.insert(rel_buf, stamp);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            while let Some(dir) = dir_batch.pop() {
+                let entries = match std::fs::read_dir(&dir) {
+                    Ok(entries) => entries,
                     Err(_) => continue,
                 };
-                if file_type.is_symlink() {
-                    continue;
-                }
-                let path = entry.path();
-                let Ok(rel) = path.strip_prefix(&self.root) else {
-                    continue;
-                };
-                if self.exclude_matcher.is_match(rel) {
-                    continue;
-                }
-                if file_type.is_dir() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                        && self.default_excludes
-                        && is_excluded_dir_name(name)
-                    {
-                        continue;
-                    }
-                    stack.push(path);
-                } else if file_type.is_file()
-                    && let Some(file_name) = path.file_name().and_then(|n| n.to_str())
-                    && !(self.default_excludes && is_excluded_dir_name(file_name))
-                    && self.matches_permitted_filename_or_glob(rel, file_name)
-                {
-                    let meta = match entry.metadata() {
-                        Ok(m) => m,
+                for entry in entries.flatten() {
+                    let file_type = match entry.file_type() {
+                        Ok(ft) => ft,
                         Err(_) => continue,
                     };
-                    let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
-                    if len > policy.max_file_bytes {
+                    if file_type.is_symlink() {
                         continue;
                     }
-                    let rel_buf = rel.to_path_buf();
-                    if files.insert(rel_buf.clone()) {
-                        total_path_bytes =
-                            total_path_bytes.saturating_add(rel_buf.as_os_str().len());
-                        metadata_source_bytes = metadata_source_bytes.saturating_add(len);
-                        if files.len() > policy.max_files {
-                            return Err(invalid("workspace exceeds max_files policy limit").into());
+                    let path = entry.path();
+                    let Ok(rel) = path.strip_prefix(&self.root) else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                            && self.default_excludes
+                            && is_excluded_dir_name(name)
+                        {
+                            continue;
                         }
-                        if total_path_bytes > policy.max_total_path_bytes {
-                            return Err(invalid(
-                                "workspace exceeds max_total_path_bytes policy limit",
-                            )
-                            .into());
+                        if self.exclude_matcher.is_match(rel)
+                            || self.is_gitignored_dir_prunable(rel)
+                        {
+                            continue;
+                        }
+                        stack.push(path);
+                    } else if file_type.is_file()
+                        && let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                        && !(self.default_excludes && is_excluded_dir_name(file_name))
+                        && self.matches_permitted_filename_or_glob(rel, file_name)
+                    {
+                        if self.exclude_matcher.is_match(rel) || self.is_gitignored_rel(rel) {
+                            continue;
+                        }
+                        let meta = match entry.metadata() {
+                            Ok(m) => m,
+                            Err(_) => continue,
+                        };
+                        let len = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+                        if len > policy.max_file_bytes {
+                            continue;
+                        }
+                        use std::os::unix::fs::MetadataExt;
+                        let stamp = crate::ast_graph::FileStamp {
+                            mtime_sec: meta.mtime(),
+                            mtime_nsec: meta.mtime_nsec(),
+                            size: meta.len(),
+                            ino: meta.ino(),
+                            ctime_sec: meta.ctime(),
+                            ctime_nsec: meta.ctime_nsec(),
+                        };
+                        let rel_buf = rel.to_path_buf();
+                        if files.insert(rel_buf.clone()) {
+                            total_path_bytes =
+                                total_path_bytes.saturating_add(rel_buf.as_os_str().len());
+                            metadata_source_bytes = metadata_source_bytes.saturating_add(len);
+                            if files.len() > policy.max_files {
+                                return Err(
+                                    invalid("workspace exceeds max_files policy limit").into()
+                                );
+                            }
+                            if total_path_bytes > policy.max_total_path_bytes {
+                                return Err(invalid(
+                                    "workspace exceeds max_total_path_bytes policy limit",
+                                )
+                                .into());
+                            }
+                            file_stamps.insert(rel_buf, stamp);
                         }
                     }
                 }
@@ -352,6 +725,7 @@ impl Workspace {
 
         Ok(Inventory {
             files: files.into_iter().collect(),
+            file_stamps,
             total_path_bytes,
             metadata_source_bytes,
         })
@@ -736,5 +1110,38 @@ mod tests {
         assert!(workspace.is_permitted_rel(Path::new("rust-toolchain.toml")));
         assert!(workspace.is_permitted_data_rel(Path::new("snapshots/output.snap")));
         assert!(workspace.is_permitted_data_rel(Path::new("testdata/expected.golden")));
+    }
+
+    #[test]
+    fn root_gitignore_excludes_mutable_runtime_dirs_and_honors_negation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "workspaces/\ndata/eval/*\n!data/eval/golden_fixture.json\ndata/autonomy/x_social_state.json\n",
+        )
+        .unwrap();
+        let workspace = Workspace::new(root.path(), Vec::new(), Vec::new()).unwrap();
+        assert!(!workspace.is_permitted_rel(Path::new("workspaces/wt1/tests/test_a.py")));
+        assert!(!workspace.is_permitted_data_rel(Path::new("data/eval/live_state.json")));
+        assert!(!workspace.is_permitted_data_rel(Path::new("data/autonomy/x_social_state.json")));
+        assert!(workspace.is_permitted_data_rel(Path::new("data/eval/golden_fixture.json")));
+        assert!(workspace.is_permitted_data_rel(Path::new("config/schema.json")));
+        assert!(!workspace.is_gitignored_entry(Path::new("workspaces"), false));
+        assert!(workspace.is_gitignored_entry(Path::new("workspaces"), true));
+        assert!(workspace.is_gitignored_entry(Path::new("workspaces/wt1/a.py"), false));
+
+        // Verify deep negation (`/*` + `!/src/nested/keep.py`) is not prematurely pruned at `src/`.
+        let root2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root2.path().join(".gitignore"),
+            "/*\n!/src/nested/keep.py\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root2.path().join("src/nested")).unwrap();
+        std::fs::write(root2.path().join("src/nested/keep.py"), "def ok(): pass\n").unwrap();
+        std::fs::write(root2.path().join("src/ignored.py"), "def no(): pass\n").unwrap();
+        let ws2 = Workspace::new(root2.path(), Vec::new(), Vec::new()).unwrap();
+        let inv2 = ws2.files_limited(&MemoryPolicy::default()).unwrap();
+        assert_eq!(inv2.files, vec![PathBuf::from("src/nested/keep.py")]);
     }
 }

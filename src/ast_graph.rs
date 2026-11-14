@@ -8,6 +8,7 @@ use crate::{Result, invalid};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
@@ -76,11 +77,143 @@ pub struct FileNode {
     pub sha256: String,
     #[serde(default)]
     pub semantic_sha256: String,
+    #[serde(default)]
+    pub api_semantic_sha256: String,
     pub stamp: Option<FileStamp>,
     pub is_test: bool,
     pub is_conftest: bool,
     pub is_config: bool,
     pub parsed: ParsedPythonFile,
+}
+
+const AST_SNAPSHOT_SCHEMA: u32 = 4;
+const MAX_AST_SNAPSHOT_BYTES: usize = 48 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct PersistedEdgeGraph {
+    file_count: usize,
+    forward_adj: Vec<Vec<u32>>,
+    reverse_adj: Vec<Vec<u32>>,
+    conftest_for_test: BTreeMap<String, Vec<String>>,
+    transitive_dep_ids_for_test: BTreeMap<String, Vec<u32>>,
+    local_python_roots: BTreeSet<String>,
+    runtime_deps_for_test: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedAstSnapshot {
+    schema: u32,
+    root: String,
+    test_file_patterns: Vec<String>,
+    testpaths: Vec<String>,
+    nodes: Vec<FileNode>,
+    edges: Option<PersistedEdgeGraph>,
+}
+
+type LoadedAstSnapshot = (BTreeMap<String, FileNode>, Option<PersistedEdgeGraph>);
+
+fn ast_snapshot_path(root: &Path) -> Result<std::path::PathBuf> {
+    let root_hash = sha256_hex(root.to_string_lossy().as_bytes());
+    Ok(crate::catalog::cache_dir()?.join(format!("{root_hash}.v{AST_SNAPSHOT_SCHEMA}.ast.bin")))
+}
+
+fn load_persisted_ast_nodes(
+    root: &Path,
+    patterns: &[String],
+    testpaths: &[String],
+) -> LoadedAstSnapshot {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Ok(path) = ast_snapshot_path(root) else {
+        return (BTreeMap::new(), None);
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return (BTreeMap::new(), None);
+    };
+    let mut bytes = Vec::new();
+    if std::io::Read::take(file, 64 * 1024 * 1024)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return (BTreeMap::new(), None);
+    }
+    let Ok(snap) = bincode::deserialize::<PersistedAstSnapshot>(&bytes) else {
+        return (BTreeMap::new(), None);
+    };
+    if snap.schema != AST_SNAPSHOT_SCHEMA
+        || snap.root != root.to_string_lossy()
+        || snap.test_file_patterns != patterns
+        || snap.testpaths != testpaths
+    {
+        return (BTreeMap::new(), None);
+    }
+    let map = snap
+        .nodes
+        .into_iter()
+        .map(|node| (node.path.clone(), node))
+        .collect();
+    (map, snap.edges)
+}
+
+pub fn save_persisted_ast_snapshot(root: &Path, graph: &DependencyGraph) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Ok(path) = ast_snapshot_path(root) else {
+        return;
+    };
+    let edges = if !graph.file_index_to_path.is_empty()
+        && graph.file_index_to_path.len() == graph.files.len()
+        && graph.forward_adj.len() == graph.files.len()
+    {
+        Some(PersistedEdgeGraph {
+            file_count: graph.files.len(),
+            forward_adj: graph.forward_adj.clone(),
+            reverse_adj: graph.reverse_adj.clone(),
+            conftest_for_test: graph.conftest_for_test.clone(),
+            transitive_dep_ids_for_test: graph.transitive_dep_ids_for_test.clone(),
+            local_python_roots: graph.local_python_roots.clone(),
+            runtime_deps_for_test: graph.runtime_deps_for_test.clone(),
+        })
+    } else {
+        None
+    };
+    let snap = PersistedAstSnapshot {
+        schema: AST_SNAPSHOT_SCHEMA,
+        root: root.to_string_lossy().into_owned(),
+        test_file_patterns: graph.test_file_patterns.clone(),
+        testpaths: graph.testpaths.clone(),
+        nodes: graph.files.values().cloned().collect(),
+        edges,
+    };
+    let Ok(bytes) = bincode::serialize(&snap) else {
+        return;
+    };
+    if bytes.len() > MAX_AST_SNAPSHOT_BYTES {
+        return;
+    }
+    let tmp = path.with_extension(format!("bin.tmp.{}", std::process::id()));
+    let write_ok = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)
+        .and_then(|mut f| {
+            f.write_all(&bytes)?;
+            f.flush()
+        })
+        .is_ok();
+    if write_ok {
+        let _ = std::fs::rename(&tmp, &path);
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +268,8 @@ pub struct DependencyGraph {
     pub last_env_ref_digest: String,
     pub local_python_roots: BTreeSet<String>,
     pub cached_conventions: Option<serde_json::Value>,
+    persisted_edges_valid: bool,
+    persisted_runtime_deps: Option<BTreeMap<String, BTreeSet<String>>>,
 }
 
 impl Default for DependencyGraph {
@@ -166,6 +301,8 @@ impl DependencyGraph {
             last_env_ref_digest: String::new(),
             local_python_roots: BTreeSet::new(),
             cached_conventions: None,
+            persisted_edges_valid: false,
+            persisted_runtime_deps: None,
         }
     }
 
@@ -174,14 +311,161 @@ impl DependencyGraph {
         hasher.update(b"tctx:merkle:v1\nenv:");
         hasher.update(self.environment_hash.as_bytes());
         hasher.update(b"\n");
+        hasher
+    }
+
+    pub fn is_config_relevant_to_test_ids(
+        &self,
+        cfg_path: &str,
+        test_path: &str,
+        reachable_ids: &[u32],
+    ) -> bool {
+        let file_name = Path::new(cfg_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let is_cargo_dot_cfg =
+            cfg_path == ".cargo/config.toml" || cfg_path == ".cargo/config" || cfg_path.ends_with("/.cargo/config.toml") || cfg_path.ends_with("/.cargo/config");
+        let is_rust_only_cfg = RUST_CONFIG_FILES.contains(&file_name) || is_cargo_dot_cfg;
+        let is_fe_only_cfg = FRONTEND_CONFIG_FILES.contains(&file_name);
+        let is_py_only_cfg =
+            PYTEST_CONFIG_FILES.contains(&file_name) && file_name != "pyproject.toml";
+        let is_go_only_cfg = matches!(file_name, "go.mod" | "go.sum");
+
+        let is_rs_test = test_path.ends_with(".rs");
+        let is_fe_test = is_frontend_source_path(test_path);
+        let is_go_test = test_path.ends_with("_test.go");
+
+        if is_py_only_cfg && (is_rs_test || is_fe_test || is_go_test) {
+            return false;
+        }
+        if is_fe_only_cfg && !is_fe_test {
+            return false;
+        }
+        if is_go_only_cfg && !is_go_test {
+            return false;
+        }
+        if is_rust_only_cfg && !is_rs_test {
+            let depends_on_rs = reachable_ids.iter().any(|&id| {
+                self.file_index_to_path
+                    .get(id as usize)
+                    .is_some_and(|p| p.ends_with(".rs"))
+            });
+            if !depends_on_rs {
+                return false;
+            }
+        }
+
+        let raw_parent = Path::new(cfg_path)
+            .parent()
+            .map(normalize_rel_str)
+            .unwrap_or_default();
+        let scope_dir = if raw_parent == ".cargo" {
+            ""
+        } else if let Some(stripped) = raw_parent.strip_suffix("/.cargo") {
+            stripped
+        } else {
+            raw_parent.as_str()
+        };
+        if scope_dir.is_empty() {
+            return true;
+        }
+        let prefix = format!("{scope_dir}/");
+        if test_path.starts_with(&prefix) {
+            return true;
+        }
+        reachable_ids.iter().any(|&id| {
+            self.file_index_to_path
+                .get(id as usize)
+                .is_some_and(|p| p.starts_with(&prefix))
+        })
+    }
+
+    fn update_relevant_config_hashes(
+        &self,
+        hasher: &mut Sha256,
+        test_path: &str,
+        reachable_ids: &[u32],
+    ) {
+        if self.config_hashes.is_empty() {
+            return;
+        }
+        let mut reachable_dirs = BTreeSet::new();
+        let mut curr = Path::new(test_path).parent();
+        while let Some(dir) = curr {
+            let s = normalize_rel_str(dir);
+            if s.is_empty() || !reachable_dirs.insert(s) {
+                break;
+            }
+            curr = dir.parent();
+        }
+        let mut depends_on_rs = test_path.ends_with(".rs");
+        for &id in reachable_ids {
+            if let Some(p) = self.file_index_to_path.get(id as usize) {
+                if p.ends_with(".rs") {
+                    depends_on_rs = true;
+                }
+                let mut d = Path::new(p.as_str()).parent();
+                while let Some(dir) = d {
+                    let s = normalize_rel_str(dir);
+                    if s.is_empty() || !reachable_dirs.insert(s) {
+                        break;
+                    }
+                    d = dir.parent();
+                }
+            }
+        }
+        let is_rs_test = test_path.ends_with(".rs");
+        let is_fe_test = is_frontend_source_path(test_path);
+        let is_go_test = test_path.ends_with("_test.go");
+
         for (cfg_path, cfg_sha) in &self.config_hashes {
+            let file_name = Path::new(cfg_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let is_cargo_dot_cfg = cfg_path == ".cargo/config.toml"
+                || cfg_path == ".cargo/config"
+                || cfg_path.ends_with("/.cargo/config.toml")
+                || cfg_path.ends_with("/.cargo/config");
+            let is_rust_only_cfg = RUST_CONFIG_FILES.contains(&file_name) || is_cargo_dot_cfg;
+            let is_fe_only_cfg = FRONTEND_CONFIG_FILES.contains(&file_name);
+            let is_py_only_cfg =
+                PYTEST_CONFIG_FILES.contains(&file_name) && file_name != "pyproject.toml";
+            let is_go_only_cfg = matches!(file_name, "go.mod" | "go.sum");
+
+            if is_py_only_cfg && (is_rs_test || is_fe_test || is_go_test) {
+                continue;
+            }
+            if is_fe_only_cfg && !is_fe_test {
+                continue;
+            }
+            if is_go_only_cfg && !is_go_test {
+                continue;
+            }
+            if is_rust_only_cfg && !is_rs_test && !depends_on_rs {
+                continue;
+            }
+            let raw_parent = Path::new(cfg_path)
+                .parent()
+                .map(normalize_rel_str)
+                .unwrap_or_default();
+            let scope_dir = if raw_parent == ".cargo" {
+                ""
+            } else if let Some(stripped) = raw_parent.strip_suffix("/.cargo") {
+                stripped
+            } else {
+                raw_parent.as_str()
+            };
+            if !scope_dir.is_empty() && !reachable_dirs.contains(scope_dir) {
+                continue;
+            }
             hasher.update(b"cfg:");
             hasher.update(cfg_path.as_bytes());
             hasher.update(b":");
             hasher.update(cfg_sha.as_bytes());
             hasher.update(b"\n");
         }
-        hasher
     }
 
     fn compute_env_ref_digest(&self) -> String {
@@ -218,13 +502,18 @@ impl DependencyGraph {
         }
     }
 
-    fn build_all_node_hash_bytes(&self) -> Vec<Vec<u8>> {
+    fn build_all_node_hash_bytes(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.file_index_to_path
             .iter()
             .map(|dep_path| {
                 self.files
                     .get(dep_path)
-                    .map(|dep_node| build_node_hash_bytes(dep_path, dep_node))
+                    .map(|dep_node| {
+                        (
+                            build_node_hash_bytes(dep_path, dep_node, true),
+                            build_node_hash_bytes(dep_path, dep_node, false),
+                        )
+                    })
                     .unwrap_or_default()
             })
             .collect()
@@ -234,10 +523,16 @@ impl DependencyGraph {
         let base_hasher = self.build_base_hasher();
         let node_digests = self.build_all_node_hash_bytes();
         for (test_path, reachable_ids) in &self.transitive_dep_ids_for_test {
+            let self_id = self.path_to_id.get(test_path).copied();
             let mut hasher = base_hasher.clone();
+            self.update_relevant_config_hashes(&mut hasher, test_path, reachable_ids);
             for &dep_id in reachable_ids {
-                if let Some(bytes) = node_digests.get(dep_id as usize) {
-                    hasher.update(bytes);
+                if let Some((self_bytes, api_bytes)) = node_digests.get(dep_id as usize) {
+                    if Some(dep_id) == self_id {
+                        hasher.update(self_bytes);
+                    } else {
+                        hasher.update(api_bytes);
+                    }
                 }
             }
             let dep_hash = hex_encode(&hasher.finalize());
@@ -292,8 +587,31 @@ impl DependencyGraph {
 
     pub fn build(workspace: &Workspace, policy: &MemoryPolicy) -> Result<Self> {
         let mut graph = Self::build_unindexed(workspace, policy)?;
-        graph.recompute_edges();
+        let need_save = !graph.has_persisted_edges();
+        graph.recompute_edges_or_reuse_persisted();
+        if need_save {
+            save_persisted_ast_snapshot(&workspace.root, &graph);
+        }
         Ok(graph)
+    }
+
+    pub fn has_persisted_edges(&self) -> bool {
+        self.persisted_edges_valid
+            && !self.file_index_to_path.is_empty()
+            && self.file_index_to_path.len() == self.files.len()
+            && self.persisted_runtime_deps.as_ref() == Some(&self.runtime_deps_for_test)
+    }
+
+    pub fn recompute_edges_or_reuse_persisted(&mut self) {
+        if self.has_persisted_edges() {
+            self.last_env_ref_digest = self.compute_env_ref_digest();
+            self.recompute_all_test_hashes();
+            if self.cached_conventions.is_none() {
+                self.cached_conventions = Some(self.compute_test_conventions_summary());
+            }
+        } else {
+            self.recompute_edges();
+        }
     }
 
     pub fn build_unindexed(workspace: &Workspace, policy: &MemoryPolicy) -> Result<Self> {
@@ -303,6 +621,11 @@ impl DependencyGraph {
         graph.testpaths = workspace.pytest_testpaths();
         let mut total_bytes = 0usize;
 
+        let (persisted, persisted_edges) =
+            load_persisted_ast_nodes(&workspace.root, &graph.test_file_patterns, &graph.testpaths);
+        let mut cache_reused = 0usize;
+        let mut parsed_fresh = 0usize;
+
         if inventory.files.len() >= 64 {
             let workers = std::thread::available_parallelism()
                 .map(usize::from)
@@ -311,8 +634,10 @@ impl DependencyGraph {
             let chunk_size = inventory.files.len().div_ceil(workers);
             let patterns = &graph.test_file_patterns;
             let testpaths = &graph.testpaths;
+            let persisted_ref = &persisted;
+            let stamps_ref = &inventory.file_stamps;
             let max_file_bytes = policy.max_file_bytes;
-            let chunk_results: Vec<Vec<(FileNode, usize)>> = std::thread::scope(|scope| {
+            let chunk_results: Vec<Vec<(FileNode, usize, bool)>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = inventory
                     .files
                     .chunks(chunk_size)
@@ -320,22 +645,39 @@ impl DependencyGraph {
                         scope.spawn(move || {
                             let mut out = Vec::with_capacity(chunk.len());
                             for rel_path in chunk {
-                                let full_path = workspace.root.join(rel_path);
-                                let stamp = file_stamp(&full_path);
+                                let stamp_opt = stamps_ref
+                                    .get(rel_path)
+                                    .copied()
+                                    .or_else(|| file_stamp(&workspace.root.join(rel_path)));
+                                let Some(stamp) = stamp_opt else {
+                                    continue;
+                                };
+                                let rel_str = normalize_rel_str(rel_path);
+                                if let Some(cached_node) = persisted_ref.get(&rel_str)
+                                    && cached_node.stamp == Some(stamp)
+                                    && usize::try_from(stamp.size).unwrap_or(usize::MAX)
+                                        <= max_file_bytes
+                                {
+                                    out.push((
+                                        cached_node.clone(),
+                                        usize::try_from(stamp.size).unwrap_or(0),
+                                        true,
+                                    ));
+                                    continue;
+                                }
                                 let Ok(bytes) =
                                     workspace.read_known_with_limit(rel_path, max_file_bytes)
                                 else {
                                     continue;
                                 };
-                                let rel_str = normalize_rel_str(rel_path);
                                 let node = build_file_node_from_bytes(
                                     &rel_str,
                                     &bytes,
-                                    stamp,
+                                    Some(stamp),
                                     patterns,
                                     testpaths,
                                 );
-                                out.push((node, bytes.len()));
+                                out.push((node, bytes.len(), false));
                             }
                             out
                         })
@@ -347,12 +689,17 @@ impl DependencyGraph {
                     .collect()
             });
             for chunk in chunk_results {
-                for (node, byte_len) in chunk {
+                for (node, byte_len, was_cached) in chunk {
                     total_bytes = total_bytes.saturating_add(byte_len);
                     if total_bytes > policy.max_source_bytes {
                         return Err(
                             invalid("workspace exceeds max_source_bytes policy limit").into()
                         );
+                    }
+                    if was_cached {
+                        cache_reused += 1;
+                    } else {
+                        parsed_fresh += 1;
                     }
                     if node.is_config {
                         graph
@@ -364,8 +711,33 @@ impl DependencyGraph {
             }
         } else {
             for rel_path in &inventory.files {
-                let full_path = workspace.root.join(rel_path);
-                let stamp = file_stamp(&full_path);
+                let stamp = inventory
+                    .file_stamps
+                    .get(rel_path)
+                    .copied()
+                    .or_else(|| file_stamp(&workspace.root.join(rel_path)));
+                let rel_str = normalize_rel_str(rel_path);
+                if let Some(st) = stamp
+                    && let Some(cached_node) = persisted.get(&rel_str)
+                    && cached_node.stamp == Some(st)
+                    && usize::try_from(st.size).unwrap_or(usize::MAX) <= policy.max_file_bytes
+                {
+                    let byte_len = usize::try_from(st.size).unwrap_or(0);
+                    total_bytes = total_bytes.saturating_add(byte_len);
+                    if total_bytes > policy.max_source_bytes {
+                        return Err(
+                            invalid("workspace exceeds max_source_bytes policy limit").into()
+                        );
+                    }
+                    if cached_node.is_config {
+                        graph
+                            .config_hashes
+                            .insert(cached_node.path.clone(), cached_node.sha256.clone());
+                    }
+                    graph.files.insert(rel_str, cached_node.clone());
+                    cache_reused += 1;
+                    continue;
+                }
                 let bytes = match workspace.read_known_with_limit(rel_path, policy.max_file_bytes) {
                     Ok(b) => b,
                     Err(_) => continue,
@@ -374,15 +746,146 @@ impl DependencyGraph {
                 if total_bytes > policy.max_source_bytes {
                     return Err(invalid("workspace exceeds max_source_bytes policy limit").into());
                 }
-                let rel_str = normalize_rel_str(rel_path);
                 graph.insert_file_bytes_with_stamp(&rel_str, &bytes, stamp);
+                parsed_fresh += 1;
             }
         }
-        graph.discover_referenced_data_files(workspace, policy);
+        let data_fresh = graph.discover_referenced_data_files_with_cache(workspace, policy, &persisted);
+        if data_fresh == 0
+            && let Some(edges) = persisted_edges
+            && edges.file_count == persisted.len()
+        {
+            if parsed_fresh == 0
+                && graph.files.len() == persisted.len()
+                && edges.forward_adj.len() == graph.files.len()
+                && edges.reverse_adj.len() == graph.files.len()
+            {
+                for (idx, (path, node)) in graph.files.iter().enumerate() {
+                    let id = u32::try_from(idx).unwrap_or(u32::MAX);
+                    graph.file_index_to_path.push(path.clone());
+                    graph.path_to_id.insert(path.clone(), id);
+                    if node.is_conftest {
+                        graph.conftest_paths.insert(path.clone());
+                    }
+                    if node.is_test {
+                        for sym in &node.parsed.test_symbols {
+                            graph
+                                .symbol_to_test_files
+                                .entry(sym.clone())
+                                .or_default()
+                                .push(path.clone());
+                        }
+                    }
+                }
+                for (src_idx, row) in edges.forward_adj.iter().enumerate() {
+                    if row.is_empty() {
+                        continue;
+                    }
+                    let src_path = &graph.file_index_to_path[src_idx];
+                    let mut set = BTreeSet::new();
+                    for &dst_id in row {
+                        if let Some(dst_path) = graph.file_index_to_path.get(dst_id as usize) {
+                            set.insert(dst_path.clone());
+                            graph
+                                .reverse_imports
+                                .entry(dst_path.clone())
+                                .or_default()
+                                .insert(src_path.clone());
+                        }
+                    }
+                    graph.direct_imports.insert(src_path.clone(), set);
+                }
+                graph.forward_adj = edges.forward_adj;
+                graph.reverse_adj = edges.reverse_adj;
+                graph.conftest_for_test = edges.conftest_for_test;
+                graph.transitive_dep_ids_for_test = edges.transitive_dep_ids_for_test;
+                graph.local_python_roots = edges.local_python_roots;
+                graph.persisted_runtime_deps = Some(edges.runtime_deps_for_test);
+                graph.persisted_edges_valid = true;
+            } else if parsed_fresh <= 16 && graph.files.len() == persisted.len() {
+                let mut same_structure = true;
+                let mut changed_paths = Vec::new();
+                for (path, node) in &graph.files {
+                    let Some(old) = persisted.get(path) else {
+                        same_structure = false;
+                        break;
+                    };
+                    if old.is_test != node.is_test
+                        || old.is_conftest != node.is_conftest
+                        || old.is_config != node.is_config
+                        || old.parsed != node.parsed
+                    {
+                        same_structure = false;
+                        break;
+                    }
+                    if old.sha256 != node.sha256 {
+                        changed_paths.push(path.clone());
+                    }
+                }
+                if same_structure
+                    && edges.forward_adj.len() == graph.files.len()
+                    && edges.reverse_adj.len() == graph.files.len()
+                {
+                    for (idx, (path, node)) in graph.files.iter().enumerate() {
+                        let id = u32::try_from(idx).unwrap_or(u32::MAX);
+                        graph.file_index_to_path.push(path.clone());
+                        graph.path_to_id.insert(path.clone(), id);
+                        if node.is_conftest {
+                            graph.conftest_paths.insert(path.clone());
+                        }
+                        if node.is_test {
+                            for sym in &node.parsed.test_symbols {
+                                graph
+                                    .symbol_to_test_files
+                                    .entry(sym.clone())
+                                    .or_default()
+                                    .push(path.clone());
+                            }
+                        }
+                    }
+                    for (src_idx, row) in edges.forward_adj.iter().enumerate() {
+                        if row.is_empty() {
+                            continue;
+                        }
+                        let src_path = &graph.file_index_to_path[src_idx];
+                        let mut set = BTreeSet::new();
+                        for &dst_id in row {
+                            if let Some(dst_path) = graph.file_index_to_path.get(dst_id as usize) {
+                                set.insert(dst_path.clone());
+                                graph
+                                    .reverse_imports
+                                    .entry(dst_path.clone())
+                                    .or_default()
+                                    .insert(src_path.clone());
+                            }
+                        }
+                        graph.direct_imports.insert(src_path.clone(), set);
+                    }
+                    graph.forward_adj = edges.forward_adj;
+                    graph.reverse_adj = edges.reverse_adj;
+                    graph.conftest_for_test = edges.conftest_for_test;
+                    graph.transitive_dep_ids_for_test = edges.transitive_dep_ids_for_test;
+                    graph.local_python_roots = edges.local_python_roots;
+                    graph.persisted_runtime_deps = Some(edges.runtime_deps_for_test);
+                    graph.persisted_edges_valid = true;
+                    let _ = changed_paths;
+                }
+            }
+        }
+        let _ = cache_reused;
         Ok(graph)
     }
 
     pub fn discover_referenced_data_files(&mut self, workspace: &Workspace, policy: &MemoryPolicy) {
+        let _ = self.discover_referenced_data_files_with_cache(workspace, policy, &BTreeMap::new());
+    }
+
+    fn discover_referenced_data_files_with_cache(
+        &mut self,
+        workspace: &Workspace,
+        policy: &MemoryPolicy,
+        persisted: &BTreeMap<String, FileNode>,
+    ) -> usize {
         let mut candidates = BTreeSet::new();
         for (py_path, node) in &self.files {
             if node.parsed.data_refs.is_empty() {
@@ -410,18 +913,33 @@ impl DependencyGraph {
                 }
             }
         }
+        let mut fresh_count = 0usize;
         for rel_str in candidates {
             if self.files.contains_key(&rel_str) {
                 continue;
             }
             let rel_path = Path::new(&rel_str);
             let full_path = workspace.root.join(rel_path);
-            if let Some(stamp) = file_stamp(&full_path)
-                && let Ok(bytes) = workspace.read_known_with_limit(rel_path, policy.max_file_bytes)
-            {
-                self.insert_file_bytes_with_stamp(&rel_str, &bytes, Some(stamp));
+            if let Some(stamp) = file_stamp(&full_path) {
+                if let Some(cached_node) = persisted.get(&rel_str)
+                    && cached_node.stamp == Some(stamp)
+                    && usize::try_from(stamp.size).unwrap_or(usize::MAX) <= policy.max_file_bytes
+                {
+                    if cached_node.is_config {
+                        self.config_hashes
+                            .insert(cached_node.path.clone(), cached_node.sha256.clone());
+                    }
+                    self.files.insert(rel_str, cached_node.clone());
+                    continue;
+                }
+                if let Ok(bytes) = workspace.read_known_with_limit(rel_path, policy.max_file_bytes)
+                {
+                    self.insert_file_bytes_with_stamp(&rel_str, &bytes, Some(stamp));
+                    fresh_count += 1;
+                }
             }
         }
+        fresh_count
     }
 
     pub fn insert_file_bytes(&mut self, rel_str: &str, bytes: &[u8]) -> bool {
@@ -443,6 +961,7 @@ impl DependencyGraph {
             &self.test_file_patterns,
             &self.testpaths,
         );
+        self.persisted_edges_valid = false;
         if node.is_config {
             let is_new = !self.config_hashes.contains_key(rel_str);
             self.config_hashes
@@ -480,20 +999,23 @@ impl DependencyGraph {
             .map(|a| a.test_file)
             .collect();
 
-        let mut digest_cache: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        let mut digest_cache: BTreeMap<(u32, bool), Vec<u8>> = BTreeMap::new();
         for test_path in affected {
             let Some(reachable_ids) = self.transitive_dep_ids_for_test.get(&test_path) else {
                 continue;
             };
+            let self_id = self.path_to_id.get(&test_path).copied();
             let mut hasher = base_hasher.clone();
+            self.update_relevant_config_hashes(&mut hasher, &test_path, reachable_ids);
             for &dep_id in reachable_ids {
-                let bytes = digest_cache.entry(dep_id).or_insert_with(|| {
+                let is_self = Some(dep_id) == self_id;
+                let bytes = digest_cache.entry((dep_id, is_self)).or_insert_with(|| {
                     self.file_index_to_path
                         .get(dep_id as usize)
                         .and_then(|dep_path| {
                             self.files
                                 .get(dep_path)
-                                .map(|dep_node| build_node_hash_bytes(dep_path, dep_node))
+                                .map(|dep_node| build_node_hash_bytes(dep_path, dep_node, is_self))
                         })
                         .unwrap_or_default()
                 });
@@ -522,6 +1044,7 @@ impl DependencyGraph {
     }
 
     pub fn remove_file(&mut self, rel_str: &str) -> bool {
+        self.persisted_edges_valid = false;
         let removed_cfg = self.config_hashes.remove(rel_str).is_some();
         let removed_file = self.files.remove(rel_str).is_some();
         removed_cfg || removed_file
@@ -765,10 +1288,22 @@ impl DependencyGraph {
                                     }
                                 }
                                 reachable_ids.sort_unstable();
+                                let self_id = this_ref.path_to_id.get(test_path).copied();
                                 let mut hasher = base_ref.clone();
+                                this_ref.update_relevant_config_hashes(
+                                    &mut hasher,
+                                    test_path,
+                                    &reachable_ids,
+                                );
                                 for &dep_id in &reachable_ids {
-                                    if let Some(bytes) = digests_ref.get(dep_id as usize) {
-                                        hasher.update(bytes);
+                                    if let Some((self_bytes, api_bytes)) =
+                                        digests_ref.get(dep_id as usize)
+                                    {
+                                        if Some(dep_id) == self_id {
+                                            hasher.update(self_bytes);
+                                        } else {
+                                            hasher.update(api_bytes);
+                                        }
                                     }
                                 }
                                 let dep_hash = hex_encode(&hasher.finalize());
@@ -840,10 +1375,16 @@ impl DependencyGraph {
 
                 reachable_ids.sort_unstable();
 
+                let self_id = self.path_to_id.get(&test_path).copied();
                 let mut hasher = base_hasher.clone();
+                self.update_relevant_config_hashes(&mut hasher, &test_path, &reachable_ids);
                 for &dep_id in &reachable_ids {
-                    if let Some(bytes) = node_digests.get(dep_id as usize) {
-                        hasher.update(bytes);
+                    if let Some((self_bytes, api_bytes)) = node_digests.get(dep_id as usize) {
+                        if Some(dep_id) == self_id {
+                            hasher.update(self_bytes);
+                        } else {
+                            hasher.update(api_bytes);
+                        }
                     }
                 }
                 let dep_hash = hex_encode(&hasher.finalize());
@@ -998,7 +1539,7 @@ impl DependencyGraph {
         }
         let conftests = self.conftest_paths.clone();
         let base_hasher = self.build_base_hasher();
-        let mut digest_cache: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        let mut digest_cache: BTreeMap<(u32, bool), Vec<u8>> = BTreeMap::new();
         let mut visited_stamp = vec![0u32; self.file_index_to_path.len()];
         let mut epoch = 0u32;
         let mut queue = VecDeque::new();
@@ -1037,12 +1578,14 @@ impl DependencyGraph {
             }
             reachable.sort_unstable();
             let mut hasher = base_hasher.clone();
+            self.update_relevant_config_hashes(&mut hasher, test_path, &reachable);
             for &id in &reachable {
-                let bytes = digest_cache.entry(id).or_insert_with(|| {
+                let is_self = id == test_id;
+                let bytes = digest_cache.entry((id, is_self)).or_insert_with(|| {
                     let path = &self.file_index_to_path[id as usize];
                     self.files
                         .get(path)
-                        .map(|node| build_node_hash_bytes(path, node))
+                        .map(|node| build_node_hash_bytes(path, node, is_self))
                         .unwrap_or_default()
                 });
                 hasher.update(bytes);
@@ -1252,38 +1795,25 @@ impl DependencyGraph {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
 
-            // 1. Global config change affects matching language tests
+            // 1. Scoped config change affects matching language tests within its scope or downstream importers
             if PYTEST_CONFIG_FILES.contains(&file_name)
                 || RUST_CONFIG_FILES.contains(&file_name)
                 || FRONTEND_CONFIG_FILES.contains(&file_name)
+                || matches!(file_name, "go.mod" | "go.sum")
                 || self.config_hashes.contains_key(&norm)
             {
-                let is_rust_only_cfg = RUST_CONFIG_FILES.contains(&file_name);
-                let is_fe_only_cfg = FRONTEND_CONFIG_FILES.contains(&file_name);
-                let is_py_only_cfg =
-                    PYTEST_CONFIG_FILES.contains(&file_name) && file_name != "pyproject.toml";
-                for (test_path, dep_hash) in &self.dep_hash_for_test {
-                    let is_rs_test = test_path.ends_with(".rs");
-                    let is_fe_test = is_frontend_source_path(test_path);
-                    if is_py_only_cfg && (is_rs_test || is_fe_test) {
+                let empty_ids: &[u32] = &[];
+                for test_path in self.dep_hash_for_test.keys() {
+                    let ids = self
+                        .transitive_dep_ids_for_test
+                        .get(test_path)
+                        .map_or(empty_ids, Vec::as_slice);
+                    if !self.is_config_relevant_to_test_ids(&norm, test_path, ids) {
                         continue;
-                    }
-                    if is_fe_only_cfg && !is_fe_test {
-                        continue;
-                    }
-                    if is_rust_only_cfg && !is_rs_test {
-                        let depends_on_rs = self
-                            .transitive_deps_for(test_path)
-                            .iter()
-                            .any(|d| d.ends_with(".rs"));
-                        if !depends_on_rs {
-                            continue;
-                        }
                     }
                     reasons
                         .entry(test_path.clone())
                         .or_insert_with(|| vec![norm.clone(), test_path.clone()]);
-                    let _ = dep_hash;
                 }
                 continue;
             }
@@ -1855,8 +2385,38 @@ impl DependencyGraph {
             }
             // Also check if `norm` is a source file (or source directory) and expand affected tests via AST graph
             if self.files.contains_key(&norm) {
-                for affected in self.affected_tests(std::slice::from_ref(&norm)) {
-                    selected.insert(affected.test_file);
+                let affected = self.affected_tests(std::slice::from_ref(&norm));
+                let crate_dir = if norm.ends_with(".rs") || norm.ends_with("/Cargo.toml") {
+                    rust_crate_dir(&norm)
+                } else {
+                    String::new()
+                };
+                if !crate_dir.is_empty() {
+                    let crate_prefix = format!("{crate_dir}/");
+                    let same_crate: Vec<String> = affected
+                        .iter()
+                        .filter(|a| a.test_file.starts_with(&crate_prefix))
+                        .map(|a| a.test_file.clone())
+                        .collect();
+                    if !same_crate.is_empty() {
+                        selected.extend(same_crate);
+                    } else if affected.is_empty() {
+                        for (test_path, _) in self
+                            .dep_hash_for_test
+                            .range(crate_prefix.clone()..)
+                            .take_while(|(p, _)| p.starts_with(&crate_prefix))
+                        {
+                            selected.insert(test_path.clone());
+                        }
+                    } else {
+                        for a in affected {
+                            selected.insert(a.test_file);
+                        }
+                    }
+                } else {
+                    for a in affected {
+                        selected.insert(a.test_file);
+                    }
                 }
             } else if !matched_dir {
                 // Source directory prefix
@@ -1867,8 +2427,25 @@ impl DependencyGraph {
                     .map(|(p, _)| p.clone())
                     .collect();
                 if !source_files.is_empty() {
-                    for affected in self.affected_tests(&source_files) {
-                        selected.insert(affected.test_file);
+                    let affected = self.affected_tests(&source_files);
+                    let has_nested_cargo = self.files.contains_key(&format!("{norm}/Cargo.toml"));
+                    if has_nested_cargo {
+                        let same_crate: Vec<String> = affected
+                            .iter()
+                            .filter(|a| a.test_file.starts_with(&dir_prefix))
+                            .map(|a| a.test_file.clone())
+                            .collect();
+                        if !same_crate.is_empty() {
+                            selected.extend(same_crate);
+                        } else {
+                            for a in affected {
+                                selected.insert(a.test_file);
+                            }
+                        }
+                    } else {
+                        for a in affected {
+                            selected.insert(a.test_file);
+                        }
                     }
                 } else if !norm.contains('/')
                     && !norm.ends_with(".py")
@@ -2498,8 +3075,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(&hasher.finalize())
 }
 
-fn build_node_hash_bytes(dep_path: &str, dep_node: &FileNode) -> Vec<u8> {
-    let effective_sha = if dep_node.semantic_sha256.is_empty() {
+fn build_node_hash_bytes(dep_path: &str, dep_node: &FileNode, is_self_test: bool) -> Vec<u8> {
+    let effective_sha = if !is_self_test && !dep_node.api_semantic_sha256.is_empty() {
+        &dep_node.api_semantic_sha256
+    } else if dep_node.semantic_sha256.is_empty() {
         &dep_node.sha256
     } else {
         &dep_node.semantic_sha256
@@ -2524,6 +3103,247 @@ fn build_node_hash_bytes(dep_path: &str, dep_node: &FileNode) -> Vec<u8> {
         out.push(b'\n');
     }
     out
+}
+
+pub fn rust_api_semantic_sha256(source: &str, fallback_semantic_sha: &str) -> String {
+    let stripped = strip_rust_cfg_test_items(source);
+    if stripped.len() == source.len() {
+        return fallback_semantic_sha.to_string();
+    }
+    let normalized = normalize_c_style_semantic(&stripped);
+    sha256_hex(normalized.as_bytes())
+}
+
+fn strip_rust_cfg_test_items(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0usize;
+    let mut pending_test_item = false;
+
+    while i < len {
+        let b = bytes[i];
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            let end = memchr::memchr(b'\n', &bytes[i + 2..])
+                .map(|off| i + 2 + off + 1)
+                .unwrap_or(len);
+            if !pending_test_item {
+                out.push_str(&source[i..end]);
+            }
+            i = end;
+            continue;
+        }
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            let mut depth = 1usize;
+            while i < len && depth > 0 {
+                if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                } else if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if !pending_test_item {
+                out.push_str(&source[start..i]);
+            }
+            continue;
+        }
+        if b == b'"' {
+            let (_, next_i) = scan_rust_string(source, i);
+            if !pending_test_item {
+                out.push_str(&source[i..next_i]);
+            }
+            i = next_i;
+            continue;
+        }
+        if b == b'\'' {
+            let start = i;
+            if i + 1 < len && bytes[i + 1] == b'\\' {
+                i += 2;
+                while i < len && bytes[i] != b'\'' && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                if i < len && bytes[i] == b'\'' {
+                    i += 1;
+                }
+            } else if i + 1 < len
+                && let Some(ch) = source[i + 1..].chars().next()
+                && i + 1 + ch.len_utf8() < len
+                && bytes[i + 1 + ch.len_utf8()] == b'\''
+            {
+                i += 1 + ch.len_utf8() + 1;
+            } else {
+                i += 1;
+                while i < len && is_ident_continue(bytes[i]) {
+                    i += 1;
+                }
+            }
+            if !pending_test_item {
+                out.push_str(&source[start..i]);
+            }
+            continue;
+        }
+        if is_ident_start(b)
+            && let Some((_, next_i)) = try_scan_rust_raw_or_byte_string(source, i)
+        {
+            if !pending_test_item {
+                out.push_str(&source[i..next_i]);
+            }
+            i = next_i;
+            continue;
+        }
+        if b == b'#' {
+            let mut k = i + 1;
+            while k < len && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let is_inner = k < len && bytes[k] == b'!';
+            if is_inner {
+                k += 1;
+                while k < len && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+            }
+            if k < len && bytes[k] == b'[' {
+                let mut depth = 1usize;
+                let mut j = k + 1;
+                while j < len && depth > 0 {
+                    match bytes[j] {
+                        b'"' => {
+                            let (_, next_j) = scan_rust_string(source, j);
+                            j = next_j;
+                        }
+                        b'[' => {
+                            depth += 1;
+                            j += 1;
+                        }
+                        b']' => {
+                            depth -= 1;
+                            j += 1;
+                        }
+                        _ => j += 1,
+                    }
+                }
+                let attr_slice = &source[k + 1..j.saturating_sub(1)];
+                let attr_toks = tokenize_rust(attr_slice);
+                let attr_idents: Vec<&str> = attr_toks
+                    .iter()
+                    .filter_map(|t| match t {
+                        RsToken::Ident(id) => Some(id.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let last_id = attr_idents.last().copied().unwrap_or("");
+                let is_cfg_test = !is_inner
+                    && attr_idents.contains(&"cfg")
+                    && attr_idents.contains(&"test")
+                    && !attr_idents.contains(&"not");
+                let is_test_fn = !is_inner
+                    && (matches!(last_id, "test" | "rstest" | "test_case")
+                        || (attr_idents.len() >= 2 && last_id == "test"));
+                if is_cfg_test || is_test_fn {
+                    pending_test_item = true;
+                    i = j;
+                    continue;
+                }
+                if !pending_test_item {
+                    out.push_str(&source[i..j]);
+                }
+                i = j;
+                continue;
+            }
+        }
+        if pending_test_item {
+            if b == b';' {
+                pending_test_item = false;
+                i += 1;
+                continue;
+            }
+            if b == b'{' {
+                let next_i = skip_rust_balanced_braces(source, i);
+                pending_test_item = false;
+                i = next_i;
+                continue;
+            }
+            i += source[i..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+        let ch = source[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn skip_rust_balanced_braces(source: &str, open_brace_idx: usize) -> usize {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut i = open_brace_idx + 1;
+    let mut depth = 1usize;
+    while i < len && depth > 0 {
+        let b = bytes[i];
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            i = memchr::memchr(b'\n', &bytes[i + 2..])
+                .map(|off| i + 2 + off + 1)
+                .unwrap_or(len);
+        } else if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            let mut cdepth = 1usize;
+            while i < len && cdepth > 0 {
+                if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    cdepth += 1;
+                    i += 2;
+                } else if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    cdepth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else if b == b'"' {
+            let (_, next_i) = scan_rust_string(source, i);
+            i = next_i;
+        } else if b == b'\'' {
+            if i + 1 < len && bytes[i + 1] == b'\\' {
+                i += 2;
+                while i < len && bytes[i] != b'\'' && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                if i < len && bytes[i] == b'\'' {
+                    i += 1;
+                }
+            } else if i + 1 < len
+                && let Some(ch) = source[i + 1..].chars().next()
+                && i + 1 + ch.len_utf8() < len
+                && bytes[i + 1 + ch.len_utf8()] == b'\''
+            {
+                i += 1 + ch.len_utf8() + 1;
+            } else {
+                i += 1;
+                while i < len && is_ident_continue(bytes[i]) {
+                    i += 1;
+                }
+            }
+        } else if is_ident_start(b)
+            && let Some((_, next_i)) = try_scan_rust_raw_or_byte_string(source, i)
+        {
+            i = next_i;
+        } else if b == b'{' {
+            depth += 1;
+            i += 1;
+        } else if b == b'}' {
+            depth -= 1;
+            i += 1;
+        } else {
+            i += source[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    i
 }
 
 fn build_file_node_from_bytes(
@@ -2566,7 +3386,8 @@ fn build_file_node_from_bytes(
         return FileNode {
             path: rel_str.to_string(),
             sha256: sha.clone(),
-            semantic_sha256: sha,
+            semantic_sha256: sha.clone(),
+            api_semantic_sha256: sha,
             stamp,
             is_test: false,
             is_conftest: false,
@@ -2576,14 +3397,20 @@ fn build_file_node_from_bytes(
     }
     if file_name.ends_with(".rs") {
         let source = String::from_utf8_lossy(bytes);
-        let parsed = parse_rust_source(&source);
+        let parsed = parse_rust_source_for_path(rel_str, &source);
         let is_conftest = is_rust_common_test_helper(rel_str);
         let is_test = !is_conftest
             && (!parsed.test_symbols.is_empty() || is_rust_integration_test_path(rel_str));
+        let api_sha = if is_test && !is_rust_integration_test_path(rel_str) {
+            rust_api_semantic_sha256(&source, &semantic_sha)
+        } else {
+            semantic_sha.clone()
+        };
         return FileNode {
             path: rel_str.to_string(),
             sha256: sha,
             semantic_sha256: semantic_sha,
+            api_semantic_sha256: api_sha,
             stamp,
             is_test,
             is_conftest,
@@ -2618,7 +3445,8 @@ fn build_file_node_from_bytes(
         return FileNode {
             path: rel_str.to_string(),
             sha256: sha,
-            semantic_sha256: semantic_sha,
+            semantic_sha256: semantic_sha.clone(),
+            api_semantic_sha256: semantic_sha,
             stamp,
             is_test,
             is_conftest,
@@ -2632,7 +3460,8 @@ fn build_file_node_from_bytes(
         return FileNode {
             path: rel_str.to_string(),
             sha256: sha,
-            semantic_sha256: semantic_sha,
+            semantic_sha256: semantic_sha.clone(),
+            api_semantic_sha256: semantic_sha,
             stamp,
             is_test: false,
             is_conftest: false,
@@ -2647,7 +3476,8 @@ fn build_file_node_from_bytes(
         return FileNode {
             path: rel_str.to_string(),
             sha256: sha,
-            semantic_sha256: semantic_sha,
+            semantic_sha256: semantic_sha.clone(),
+            api_semantic_sha256: semantic_sha,
             stamp,
             is_test,
             is_conftest: false,
@@ -2659,7 +3489,8 @@ fn build_file_node_from_bytes(
         return FileNode {
             path: rel_str.to_string(),
             sha256: sha.clone(),
-            semantic_sha256: sha,
+            semantic_sha256: sha.clone(),
+            api_semantic_sha256: sha,
             stamp,
             is_test: false,
             is_conftest: false,
@@ -2676,7 +3507,8 @@ fn build_file_node_from_bytes(
     FileNode {
         path: rel_str.to_string(),
         sha256: sha,
-        semantic_sha256: semantic_sha,
+        semantic_sha256: semantic_sha.clone(),
+        api_semantic_sha256: semantic_sha,
         stamp,
         is_test,
         is_conftest,
@@ -5666,7 +6498,31 @@ pub fn is_valid_env_var_name(name: &str) -> bool {
 
 /// Parses a Rust source file (`.rs`) to extract `mod` declarations, `use` imports, `#[test]` / `#[tokio::test]` symbols,
 /// `#[ignore]` / `#[serial]` markers, `include_str!` / `include_bytes!` / `include!` data refs, and `env!` / `env::var` keys.
+fn is_explicit_static_fixture_data_ref(clean_ref: &str) -> bool {
+    clean_ref.ends_with(".snap")
+        || clean_ref.ends_with(".golden")
+        || clean_ref.ends_with(".proto")
+        || clean_ref.ends_with(".graphql")
+        || clean_ref.ends_with(".gql")
+        || clean_ref.ends_with(".sql")
+        || clean_ref
+            .split('/')
+            .any(|seg| matches!(seg, "testdata" | "fixtures" | "fixture" | "snapshots" | "__snapshots__"))
+}
+
 pub fn parse_rust_source(source: &str) -> ParsedPythonFile {
+    parse_rust_source_with_mode(source, true)
+}
+
+pub fn parse_rust_source_for_path(rel_path: &str, source: &str) -> ParsedPythonFile {
+    let is_dedicated_test_or_build = is_rust_integration_test_path(rel_path)
+        || is_rust_common_test_helper(rel_path)
+        || rel_path == "build.rs"
+        || rel_path.ends_with("/build.rs");
+    parse_rust_source_with_mode(source, is_dedicated_test_or_build)
+}
+
+fn parse_rust_source_with_mode(source: &str, capture_all_string_data_refs: bool) -> ParsedPythonFile {
     let tokens = tokenize_rust(source);
     let mut imports = BTreeSet::new();
     let mut test_symbols = BTreeSet::new();
@@ -5686,7 +6542,9 @@ pub fn parse_rust_source(source: &str) -> ParsedPythonFile {
                 }
             } else if lit.starts_with("/api/") {
                 defined_symbols.insert(format!("api_route:{}", lit.trim()));
-            } else if let Some(clean_ref) = normalize_data_ref(lit) {
+            } else if let Some(clean_ref) = normalize_data_ref(lit)
+                && (capture_all_string_data_refs || is_explicit_static_fixture_data_ref(&clean_ref))
+            {
                 data_refs.insert(clean_ref);
             }
         }
@@ -8596,6 +9454,192 @@ mod tests {
         assert_eq!(
             affected_lib,
             vec!["src/alpha.rs".to_string(), "src/beta.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn monorepo_subcrate_cargo_toml_and_target_resolution_stay_isolated() {
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "crates/alpha/Cargo.toml",
+            b"[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+        );
+        graph.insert_file_bytes(
+            "crates/alpha/src/helper.rs",
+            b"pub fn base_val() -> i32 { 7 }\n",
+        );
+        graph.insert_file_bytes(
+            "crates/alpha/src/lib.rs",
+            b"pub mod helper;\nuse crate::helper::base_val;\npub fn alpha_val() -> i32 { base_val() }\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn test_alpha() { assert_eq!(alpha_val(), 7); }\n}\n",
+        );
+        graph.insert_file_bytes(
+            "crates/beta/Cargo.toml",
+            b"[package]\nname = \"beta\"\nversion = \"0.1.0\"\n",
+        );
+        graph.insert_file_bytes(
+            "crates/beta/src/lib.rs",
+            b"use alpha::alpha_val;\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn test_beta() { assert_eq!(alpha_val(), 7); }\n}\n",
+        );
+        graph.recompute_edges();
+
+        let alpha_hash_before = graph.dep_hash_for_test["crates/alpha/src/lib.rs"].clone();
+        let beta_hash_before = graph.dep_hash_for_test["crates/beta/src/lib.rs"].clone();
+
+        // Editing crates/beta/Cargo.toml must NOT invalidate or mark crates/alpha affected!
+        graph.insert_file_bytes(
+            "crates/beta/Cargo.toml",
+            b"[package]\nname = \"beta\"\nversion = \"0.2.0\"\n",
+        );
+        graph.recompute_hashes_for_changed(&["crates/beta/Cargo.toml".to_string()]);
+        assert_eq!(
+            graph.dep_hash_for_test["crates/alpha/src/lib.rs"],
+            alpha_hash_before
+        );
+        assert_ne!(
+            graph.dep_hash_for_test["crates/beta/src/lib.rs"],
+            beta_hash_before
+        );
+        let affected_by_beta_toml: Vec<String> = graph
+            .affected_tests(&["crates/beta/Cargo.toml".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            affected_by_beta_toml,
+            vec!["crates/beta/src/lib.rs".to_string()]
+        );
+
+        // Resolving a source file inside crates/alpha stays inside crates/alpha when same-crate tests exist,
+        // while `affected_tests` still reports full cross-crate impact.
+        assert_eq!(
+            graph.resolve_target_test_files(&["crates/alpha/src/helper.rs".to_string()]),
+            vec!["crates/alpha/src/lib.rs".to_string()]
+        );
+        let full_affected: Vec<String> = graph
+            .affected_tests(&["crates/alpha/src/helper.rs".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            full_affected,
+            vec![
+                "crates/alpha/src/lib.rs".to_string(),
+                "crates/beta/src/lib.rs".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_inline_cfg_test_edits_and_runtime_json_strings_do_not_invalidate_downstream() {
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "Cargo.toml",
+            b"[package]\nname = \"engine\"\nversion = \"0.1.0\"\n",
+        );
+        graph.insert_file_bytes(
+            "src/lib.rs",
+            b"pub mod core;\npub mod consumer;\n",
+        );
+        graph.insert_file_bytes(
+            "src/core.rs",
+            concat!(
+                "pub fn compute() -> i32 {\n",
+                "    let _state_path = \"data/autonomy/live_state.json\";\n",
+                "    let _fixture = include_str!(\"../testdata/seed.json\");\n",
+                "    42\n",
+                "}\n",
+                "#[cfg(test)]\n",
+                "mod tests {\n",
+                "    use super::*;\n",
+                "    #[test]\n",
+                "    fn test_core() { assert_eq!(compute(), 42); }\n",
+                "}\n",
+            )
+            .as_bytes(),
+        );
+        graph.insert_file_bytes(
+            "src/consumer.rs",
+            concat!(
+                "use crate::core::compute;\n",
+                "#[cfg(test)]\n",
+                "mod tests {\n",
+                "    use super::*;\n",
+                "    #[test]\n",
+                "    fn test_consumer() { assert_eq!(compute(), 42); }\n",
+                "}\n",
+            )
+            .as_bytes(),
+        );
+        graph.recompute_edges();
+
+        // 1. Production string literal `"data/autonomy/live_state.json"` is ignored while `include_str!` is captured!
+        let core_refs = &graph.files["src/core.rs"].parsed.data_refs;
+        assert!(!core_refs.iter().any(|r| r.contains("live_state.json")));
+        assert!(core_refs.iter().any(|r| r.contains("testdata/seed.json")));
+
+        let core_hash_before = graph.dep_hash_for_test["src/core.rs"].clone();
+        let consumer_hash_before = graph.dep_hash_for_test["src/consumer.rs"].clone();
+
+        // 2. Editing only inside `#[cfg(test)] mod tests` updates `src/core.rs`'s own dep_hash
+        //    WITHOUT invalidating `src/consumer.rs` or marking `src/consumer.rs` affected!
+        let structure_changed = graph.insert_file_bytes(
+            "src/core.rs",
+            concat!(
+                "pub fn compute() -> i32 {\n",
+                "    let _state_path = \"data/autonomy/live_state.json\";\n",
+                "    let _fixture = include_str!(\"../testdata/seed.json\");\n",
+                "    42\n",
+                "}\n",
+                "#[cfg(test)]\n",
+                "mod tests {\n",
+                "    use super::*;\n",
+                "    #[test]\n",
+                "    fn test_core() { assert_eq!(compute() + 0, 42); }\n",
+                "}\n",
+            )
+            .as_bytes(),
+        );
+        assert!(!structure_changed);
+        graph.recompute_hashes_for_changed(&["src/core.rs".to_string()]);
+        assert_ne!(graph.dep_hash_for_test["src/core.rs"], core_hash_before);
+        assert_eq!(
+            graph.dep_hash_for_test["src/consumer.rs"],
+            consumer_hash_before,
+            "downstream importer dep_hash must remain unchanged when only #[cfg(test)] body changed"
+        );
+        // Stateless `affected_tests` remains complete for git-diff queries while `dep_hash` keeps `src/consumer.rs` cached!
+        let affected_inline: Vec<String> = graph
+            .affected_tests(&["src/core.rs".to_string()])
+            .into_iter()
+            .map(|a| a.test_file)
+            .collect();
+        assert_eq!(
+            affected_inline,
+            vec!["src/consumer.rs".to_string(), "src/core.rs".to_string()]
+        );
+
+        // 3. Editing non-test public implementation DOES invalidate `src/consumer.rs`!
+        graph.insert_file_bytes(
+            "src/core.rs",
+            concat!(
+                "pub fn compute() -> i32 {\n",
+                "    let _state_path = \"data/autonomy/live_state.json\";\n",
+                "    let _fixture = include_str!(\"../testdata/seed.json\");\n",
+                "    43 - 1\n",
+                "}\n",
+                "#[cfg(test)]\n",
+                "mod tests {\n",
+                "    use super::*;\n",
+                "    #[test]\n",
+                "    fn test_core() { assert_eq!(compute() + 0, 42); }\n",
+                "}\n",
+            )
+            .as_bytes(),
+        );
+        graph.recompute_hashes_for_changed(&["src/core.rs".to_string()]);
+        assert_ne!(
+            graph.dep_hash_for_test["src/consumer.rs"],
+            consumer_hash_before
         );
     }
 }

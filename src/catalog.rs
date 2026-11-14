@@ -624,9 +624,20 @@ pub fn register(spec: Spec) -> Result<Spec> {
     Ok(ret)
 }
 
+pub fn is_ephemeral_worktree_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    text.contains(".worktrees/")
+        || text.contains("/worktrees/")
+        || text.contains("\\.worktrees\\")
+        || text.contains("\\worktrees\\")
+}
+
 pub(crate) fn missing_managed_roots(specs: &[Spec]) -> Result<Vec<PathBuf>> {
     let mut missing = Vec::new();
-    for spec in specs.iter().filter(|spec| spec.managed_parent.is_some()) {
+    for spec in specs
+        .iter()
+        .filter(|spec| spec.managed_parent.is_some() || is_ephemeral_worktree_path(&spec.root))
+    {
         match std::fs::symlink_metadata(&spec.root) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 missing.push(spec.root.clone());

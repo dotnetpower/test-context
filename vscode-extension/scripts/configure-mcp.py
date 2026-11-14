@@ -32,12 +32,17 @@ def configure_mcp(
             "args": ["--distribution", distribution, "--exec", executable, "shared-mcp"],
         }
     current = servers.get("test-context")
+    alt_wsl_args = (
+        ["-d", distribution, "--", executable, "shared-mcp"]
+        if distribution is not None
+        else None
+    )
     managed = isinstance(current, dict) and (
         (current.get("command") == executable and current.get("args") == ["shared-mcp"])
         or (
             distribution is not None
             and current.get("command") == desired["command"]
-            and current.get("args") == desired["args"]
+            and current.get("args") in (desired["args"], alt_wsl_args)
         )
     )
     if enable:

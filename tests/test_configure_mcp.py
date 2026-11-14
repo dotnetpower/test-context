@@ -55,6 +55,24 @@ class ConfigureMcpTests(unittest.TestCase):
             self.assertFalse(configure_mcp.configure_mcp(path, EXECUTABLE, "Ubuntu", True))
             self.assertTrue(configure_mcp.configure_mcp(path, EXECUTABLE, "Ubuntu", False))
 
+    def test_windows_short_flag_wsl_entry_is_recognized_as_managed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "mcp.json"
+            path.write_text(json.dumps({
+                "servers": {
+                    "test-context": {
+                        "type": "stdio",
+                        "command": "wsl.exe",
+                        "args": ["-d", "Ubuntu", "--", EXECUTABLE, "shared-mcp"],
+                    }
+                }
+            }))
+            self.assertTrue(configure_mcp.configure_mcp(path, EXECUTABLE, "Ubuntu", True))
+            server = json.loads(path.read_text())["servers"]["test-context"]
+            self.assertEqual(server["args"], [
+                "--distribution", "Ubuntu", "--exec", EXECUTABLE, "shared-mcp"
+            ])
+
     def test_remote_opt_in_creates_config_and_native_default_does_not(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "User/mcp.json"

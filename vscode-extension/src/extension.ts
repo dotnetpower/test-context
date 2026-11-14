@@ -59,6 +59,13 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   let probing: Promise<void> | undefined;
+  let folderProbeTimer: NodeJS.Timeout | undefined;
+  const currentFoldersFingerprint = (): string =>
+    (vscode.workspace.workspaceFolders ?? [])
+      .map((folder) => folder.uri.toString())
+      .sort()
+      .join('\n');
+  let lastFoldersFingerprint = currentFoldersFingerprint();
   const probe = (): Promise<void> => {
     probing ??= runStartupProbe(bridge, status, output).finally(() => {
       probing = undefined;
@@ -139,11 +146,30 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.workspace.onDidGrantWorkspaceTrust(() => {
       void probe();
     }),
+    {
+      dispose: (): void => {
+        if (folderProbeTimer) {
+          clearTimeout(folderProbeTimer);
+          folderProbeTimer = undefined;
+        }
+      },
+    },
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
-      bridge.invalidateRegistry();
-      if (vscode.workspace.isTrusted) {
-        void probe();
+      const nextFingerprint = currentFoldersFingerprint();
+      if (nextFingerprint === lastFoldersFingerprint) {
+        return;
       }
+      lastFoldersFingerprint = nextFingerprint;
+      bridge.invalidateRegistry();
+      if (folderProbeTimer) {
+        clearTimeout(folderProbeTimer);
+      }
+      folderProbeTimer = setTimeout(() => {
+        folderProbeTimer = undefined;
+        if (vscode.workspace.isTrusted) {
+          void probe();
+        }
+      }, 750);
     }),
   );
 
@@ -314,7 +340,7 @@ function readSettings(): ClientSettings {
   return {
     socketPath: config.get<string>('socketPath', ''),
     autoStartService: config.get<boolean>('autoStartService', true),
-    requestTimeoutMs: config.get<number>('requestTimeoutMs', 180_000),
+    requestTimeoutMs: config.get<number>('requestTimeoutMs', 600_000),
     ...(wslDistribution ? { wslDistribution } : {}),
     ...(wslExecutablePath ? { wslExecutablePath } : {}),
   };

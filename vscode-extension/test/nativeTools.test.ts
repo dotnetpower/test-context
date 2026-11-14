@@ -41,6 +41,23 @@ void test('formatToolResult formats instant_cache_hit test_run output', () => {
   assert.match(text, /suspected_culprit_files=src\/pkg\/service\.py/);
   assert.match(text, /untested_modified_files=src\/pkg\/orphan\.py/);
   assert.match(text, /flaky_tests=tests\/test_flaky\.py/);
+
+  const compileErrText = formatToolResult('test_run', {
+    status: 'failed',
+    mode: 'full_run',
+    total_test_files: 1,
+    cached_files_count: 0,
+    executed_files_count: 1,
+    passed: 0,
+    failed: 0,
+    errors: 1,
+    skipped: 0,
+    duration_ms: 420,
+    saved_ms: 0,
+    failed_nodeids: ['crates/sub/src/lib.rs'],
+    stdout_summary: '=== FAILED (0 passed, 0 failed, 1 errors, 0 skipped) in 0.420s ===',
+  });
+  assert.match(compileErrText, /passed=0 failed=0 errors=1 skipped=0/);
 });
 
 void test('formatToolResult formats test_affected output', () => {

@@ -13,14 +13,16 @@ export function formatToolResult(operation: string, value: JsonValue): string {
       const passed = integerValue(result.passed, 'passed');
       const failed = integerValue(result.failed, 'failed');
       const skipped = integerValue(result.skipped, 'skipped');
+      const errors = typeof result.errors === 'number' ? integerValue(result.errors, 'errors') : 0;
       const durationMs = integerValue(result.duration_ms, 'duration_ms');
       const savedMs = integerValue(result.saved_ms, 'saved_ms');
       const summary = stringValue(result.stdout_summary, 'stdout_summary');
       const failedNodeids = arrayValue(result.failed_nodeids, 'failed_nodeids').map((x) =>
         stringValue(x, 'failed nodeid'),
       );
+      const errorsField = errors > 0 ? ` errors=${errors}` : '';
       const lines = [
-        `status=${status} mode=${mode} total_files=${totalFiles} cached_files=${cachedFiles} executed_files=${executedFiles} passed=${passed} failed=${failed} skipped=${skipped} duration_ms=${durationMs} saved_ms=${savedMs}`,
+        `status=${status} mode=${mode} total_files=${totalFiles} cached_files=${cachedFiles} executed_files=${executedFiles} passed=${passed} failed=${failed}${errorsField} skipped=${skipped} duration_ms=${durationMs} saved_ms=${savedMs}`,
       ];
       if (failedNodeids.length > 0) {
         lines.push(`failed_nodeids=${failedNodeids.join(', ')}`);

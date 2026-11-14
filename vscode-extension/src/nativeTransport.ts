@@ -74,7 +74,8 @@ export function wslLaunch(
 
 export function nativeEndpoint(settings: ClientSettings, platform = process.platform): string {
   if (platform === 'win32') {
-    return `wsl:${settings.wslDistribution ?? ''}:${settings.wslExecutablePath ?? ''}:${settings.socketPath}`;
+    const base = `wsl:${settings.wslDistribution ?? ''}:${settings.wslExecutablePath ?? ''}`;
+    return settings.socketPath ? `${base}:${settings.socketPath}` : base;
   }
   return normalizeSocketPath(settings.socketPath);
 }

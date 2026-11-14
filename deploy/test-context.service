@@ -7,18 +7,20 @@ StartLimitBurst=3
 Type=simple
 ExecStart=%h/.local/bin/tctx daemon
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CARGO_BUILD_JOBS=4
+Environment=RUST_TEST_THREADS=4
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10
 KillMode=mixed
 NoNewPrivileges=yes
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 UMask=0077
-TasksMax=96
+TasksMax=2048
 LimitNOFILE=16384
 MemoryAccounting=yes
-MemoryHigh=512M
-MemoryMax=1G
+MemoryHigh=3G
+MemoryMax=6G
 CPUWeight=30
 IOAccounting=yes
 IOWeight=20
