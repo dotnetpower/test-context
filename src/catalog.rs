@@ -305,7 +305,7 @@ pub fn detect_tsc_cmd_for_dir(root: &Path, pkg_dir: &str) -> Option<(PathBuf, Pa
     None
 }
 
-pub fn detect_nextest_cmd(_root: &Path) -> Option<Vec<String>> {
+pub fn detect_nextest_cmd(root: &Path) -> Option<Vec<String>> {
     if let Some(env_bin) = std::env::var_os("TCTX_NEXTEST_BIN") {
         if env_bin == "none" || env_bin == "0" {
             return None;
@@ -315,12 +315,21 @@ pub fn detect_nextest_cmd(_root: &Path) -> Option<Vec<String>> {
             return Some(vec![p.to_string_lossy().into_owned(), "nextest".to_string()]);
         }
     }
+    let cargo_bin = detect_cargo_cmd(root)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "cargo".to_string());
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             if dir.join("cargo-nextest").is_file() {
-                return Some(vec!["cargo".to_string(), "nextest".to_string()]);
+                return Some(vec![cargo_bin, "nextest".to_string()]);
             }
         }
+    }
+    if let Some(home) = std::env::var_os("HOME")
+        && PathBuf::from(home).join(".cargo/bin/cargo-nextest").is_file()
+    {
+        return Some(vec![cargo_bin, "nextest".to_string()]);
     }
     None
 }
@@ -540,7 +549,13 @@ pub fn load() -> Result<Vec<Spec>> {
             if bytes.len() > 1024 * 1024 {
                 return Err(invalid("registry exceeds 1 MiB").into());
             }
-            let specs: Vec<Spec> = serde_json::from_slice(&bytes)?;
+            let mut specs: Vec<Spec> = serde_json::from_slice(&bytes)?;
+            let default_timeout = MemoryPolicy::default().pytest_timeout_secs;
+            for spec in &mut specs {
+                if spec.policy.pytest_timeout_secs == 180 {
+                    spec.policy.pytest_timeout_secs = default_timeout;
+                }
+            }
             if specs.len() > MAX_REGISTERED_ROOTS {
                 return Err(invalid(format!(
                     "at most {MAX_REGISTERED_ROOTS} roots can be registered"

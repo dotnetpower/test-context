@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use test_context::policy::MemoryPolicy;
 use test_context::{Result, catalog, daemon, diagnostics, invalid, registration, shared_mcp};
 
@@ -527,70 +527,196 @@ fn run_frontend_dropin(root: PathBuf, raw_args: &[String]) -> Result<i32> {
     Ok(if failed { 1 } else { 0 })
 }
 
-fn run_cargo_test_dropin(root: PathBuf, raw_args: &[String]) -> Result<i32> {
-    let root = root.canonicalize()?;
-    let mut targets = Vec::new();
-    let mut k: Option<String> = None;
-    let mut mark: Option<String> = None;
-    let mut no_cache = false;
-    let mut extra_args = Vec::new();
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CargoDropinParsed {
+    targets: Vec<String>,
+    k: Option<String>,
+    mark: Option<String>,
+    no_cache: bool,
+    extra_args: Vec<String>,
+}
 
+fn resolve_package_dir_target(root: &Path, pkg: &str) -> Option<String> {
+    let alt = pkg.replace('-', "_");
+    let alt_dash = pkg.replace('_', "-");
+    for prefix in ["", "crates/", "packages/", "lib_rs/", "apps/", "services/", "tools/"] {
+        for cand in [pkg, alt.as_str(), alt_dash.as_str()] {
+            let rel = if prefix.is_empty() {
+                cand.to_string()
+            } else {
+                format!("{prefix}{cand}")
+            };
+            if !rel.is_empty() && root.join(&rel).join("Cargo.toml").is_file() {
+                return Some(rel);
+            }
+        }
+    }
+    if root.join("Cargo.toml").is_file()
+        && let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml"))
+        && text.lines().any(|l| {
+            let t = l.trim();
+            t.starts_with("name")
+                && t.split_once('=').is_some_and(|(_, v)| {
+                    v.trim().trim_matches('"').trim_matches('\'') == pkg
+                })
+        })
+    {
+        return Some(".".to_string());
+    }
+    None
+}
+
+fn parse_cargo_test_dropin_args(root: &Path, raw_args: &[String]) -> CargoDropinParsed {
+    let mut parsed = CargoDropinParsed::default();
     let mut i = 0usize;
     if raw_args.first().map(String::as_str) == Some("test") {
         i = 1;
     }
+    let mut after_double_dash = false;
     while i < raw_args.len() {
         let arg = &raw_args[i];
+        if after_double_dash {
+            match arg.as_str() {
+                "--ignored" => {
+                    parsed.mark = Some("ignore".to_string());
+                }
+                "-q" | "--quiet" => {}
+                "--skip" | "--test-threads" | "--logfile" | "--format" | "--color" => {
+                    parsed.extra_args.push(arg.clone());
+                    if i + 1 < raw_args.len() {
+                        parsed.extra_args.push(raw_args[i + 1].clone());
+                        i += 2;
+                        continue;
+                    }
+                }
+                _ if arg.starts_with('-') => {
+                    parsed.extra_args.push(arg.clone());
+                }
+                _ => {
+                    if parsed.k.is_none() {
+                        parsed.k = Some(arg.clone());
+                    } else {
+                        parsed.extra_args.push(arg.clone());
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
         match arg.as_str() {
+            "--" => {
+                after_double_dash = true;
+                parsed.extra_args.push("--".to_string());
+            }
             "--test" => {
                 if i + 1 < raw_args.len() {
                     let name = &raw_args[i + 1];
                     if name.ends_with(".rs") {
-                        targets.push(name.clone());
+                        parsed.targets.push(name.clone());
                     } else {
-                        targets.push(format!("tests/{name}.rs"));
+                        parsed.targets.push(format!("tests/{name}.rs"));
                     }
                     i += 2;
                     continue;
                 }
             }
+            "--bin" => {
+                if i + 1 < raw_args.len() {
+                    let name = &raw_args[i + 1];
+                    let cand_rs = format!("src/bin/{name}.rs");
+                    let cand_dir = format!("src/bin/{name}/main.rs");
+                    if root.join(&cand_rs).is_file() {
+                        parsed.targets.push(cand_rs);
+                    } else if root.join(&cand_dir).is_file() {
+                        parsed.targets.push(cand_dir);
+                    } else if root.join("src/main.rs").is_file() {
+                        parsed.targets.push("src/main.rs".to_string());
+                    } else {
+                        parsed.extra_args.push(arg.clone());
+                        parsed.extra_args.push(name.clone());
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            "-p" | "--package" => {
+                if i + 1 < raw_args.len() {
+                    let pkg = &raw_args[i + 1];
+                    if let Some(pkg_dir) = resolve_package_dir_target(root, pkg) {
+                        if pkg_dir != "." {
+                            parsed.targets.push(pkg_dir);
+                        }
+                    } else {
+                        parsed.extra_args.push(arg.clone());
+                        parsed.extra_args.push(pkg.clone());
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            "--features" | "--manifest-path" | "--target" | "--target-dir" | "--profile"
+            | "-j" | "--jobs" | "--color" | "--bench" | "--example" => {
+                parsed.extra_args.push(arg.clone());
+                if i + 1 < raw_args.len() {
+                    parsed.extra_args.push(raw_args[i + 1].clone());
+                    i += 2;
+                    continue;
+                }
+            }
             "--lib" => {
-                targets.push("src".to_string());
+                parsed.targets.push("src".to_string());
+            }
+            "--bins" => {
+                if root.join("src/main.rs").is_file() {
+                    parsed.targets.push("src/main.rs".to_string());
+                }
+                if root.join("src/bin").is_dir() {
+                    parsed.targets.push("src/bin".to_string());
+                }
             }
             "--no-cache" => {
-                no_cache = true;
+                parsed.no_cache = true;
             }
             "--ignored" => {
-                mark = Some("ignore".to_string());
+                parsed.mark = Some("ignore".to_string());
             }
-            "-q" | "--quiet" | "--" => {}
+            "-q" | "--quiet" => {}
             _ if arg.starts_with('-') => {
-                extra_args.push(arg.clone());
+                parsed.extra_args.push(arg.clone());
             }
             _ => {
                 if arg.ends_with(".rs") || arg.contains('/') || arg.contains("::") {
-                    targets.push(arg.clone());
+                    parsed.targets.push(arg.clone());
                 } else {
-                    targets.push(arg.clone());
-                    if k.is_none() {
-                        k = Some(arg.clone());
+                    parsed.targets.push(arg.clone());
+                    if parsed.k.is_none() {
+                        parsed.k = Some(arg.clone());
                     }
                 }
             }
         }
         i += 1;
     }
+    if parsed.extra_args.last().map(String::as_str) == Some("--") {
+        parsed.extra_args.pop();
+    }
+    parsed
+}
+
+fn run_cargo_test_dropin(root: PathBuf, raw_args: &[String]) -> Result<i32> {
+    let root = root.canonicalize()?;
+    let parsed = parse_cargo_test_dropin_args(&root, raw_args);
 
     let res = daemon::request_or_local(&daemon::Request {
         root: Some(root),
         name: "test_run".to_string(),
         arguments: json!({
-            "targets": targets,
-            "k": k,
-            "mark": mark,
-            "no_cache": no_cache,
+            "targets": parsed.targets,
+            "k": parsed.k,
+            "mark": parsed.mark,
+            "no_cache": parsed.no_cache,
             "rerun_failed": true,
-            "pytest_args": extra_args,
+            "pytest_args": parsed.extra_args,
         }),
         compact: false,
     })?;
@@ -696,4 +822,63 @@ fn print_json(value: &Value) -> Result<()> {
         return Err(err.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cargo_dropin_handles_two_token_flags_without_polluting_targets_or_k() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("crates/alpha/src")).unwrap();
+        std::fs::write(
+            tmp.path().join("crates/alpha/Cargo.toml"),
+            "[package]\nname = \"alpha\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(tmp.path().join("src/bin")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(tmp.path().join("src/bin/helper.rs"), "fn main() {}\n").unwrap();
+
+        let args: Vec<String> = [
+            "test",
+            "-p",
+            "alpha",
+            "--features",
+            "local-coordinator",
+            "-j",
+            "8",
+            "--",
+            "--skip",
+            "slow_case",
+            "fast_filter",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = parse_cargo_test_dropin_args(tmp.path(), &args);
+        assert_eq!(parsed.targets, vec!["crates/alpha".to_string()]);
+        assert_eq!(parsed.k, Some("fast_filter".to_string()));
+        assert_eq!(
+            parsed.extra_args,
+            vec![
+                "--features",
+                "local-coordinator",
+                "-j",
+                "8",
+                "--",
+                "--skip",
+                "slow_case",
+            ]
+        );
+
+        let bin_args: Vec<String> = ["test", "--bin", "helper"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let parsed_bin = parse_cargo_test_dropin_args(tmp.path(), &bin_args);
+        assert_eq!(parsed_bin.targets, vec!["src/bin/helper.rs".to_string()]);
+        assert_eq!(parsed_bin.k, None);
+    }
 }

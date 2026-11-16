@@ -264,6 +264,7 @@ pub struct DependencyGraph {
     pub test_file_patterns: Vec<String>,
     pub testpaths: Vec<String>,
     pub environment_hash: String,
+    pub non_python_environment_hash: String,
     pub runtime_deps_for_test: BTreeMap<String, BTreeSet<String>>,
     pub last_env_ref_digest: String,
     pub local_python_roots: BTreeSet<String>,
@@ -297,6 +298,7 @@ impl DependencyGraph {
             test_file_patterns: vec!["test_*.py".to_string(), "*_test.py".to_string()],
             testpaths: Vec::new(),
             environment_hash: String::new(),
+            non_python_environment_hash: String::new(),
             runtime_deps_for_test: BTreeMap::new(),
             last_env_ref_digest: String::new(),
             local_python_roots: BTreeSet::new(),
@@ -312,6 +314,74 @@ impl DependencyGraph {
         hasher.update(self.environment_hash.as_bytes());
         hasher.update(b"\n");
         hasher
+    }
+
+    fn build_non_python_base_hasher(&self) -> Sha256 {
+        if self.non_python_environment_hash.is_empty() {
+            return self.build_base_hasher();
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"tctx:merkle:v1\nenv:");
+        hasher.update(self.non_python_environment_hash.as_bytes());
+        hasher.update(b"\n");
+        hasher
+    }
+
+    fn base_hasher_for_test(
+        &self,
+        test_path: &str,
+        reachable_ids: &[u32],
+        default_base: &Sha256,
+        non_py_base: &Sha256,
+    ) -> Sha256 {
+        if (test_path.ends_with(".rs")
+            || test_path.ends_with("_test.go")
+            || is_frontend_source_path(test_path))
+            && !self.non_python_environment_hash.is_empty()
+            && !reachable_ids.iter().any(|&id| {
+                self.file_index_to_path
+                    .get(id as usize)
+                    .is_some_and(|p| p.ends_with(".py"))
+            })
+        {
+            non_py_base.clone()
+        } else {
+            default_base.clone()
+        }
+    }
+
+    fn is_pyproject_relevant_to_non_py(
+        &self,
+        cfg_path: &str,
+        is_rs_test: bool,
+        reachable_ids: &[u32],
+    ) -> bool {
+        if !is_rs_test {
+            return false;
+        }
+        let cfg_is_maturin_or_pyo3 = self.files.get(cfg_path).is_some_and(|node| {
+            node.parsed.module_markers.iter().any(|m| m == "maturin")
+                || node
+                    .parsed
+                    .defined_symbols
+                    .iter()
+                    .any(|s| s.starts_with("pyo3:"))
+        });
+        if !cfg_is_maturin_or_pyo3 {
+            return false;
+        }
+        reachable_ids.iter().any(|&id| {
+            self.file_index_to_path
+                .get(id as usize)
+                .and_then(|p| self.files.get(p))
+                .is_some_and(|n| {
+                    n.path.ends_with(".py")
+                        || n.parsed
+                            .defined_symbols
+                            .iter()
+                            .any(|s| s.starts_with("pyo3:"))
+                })
+        })
     }
 
     pub fn is_config_relevant_to_test_ids(
@@ -337,6 +407,12 @@ impl DependencyGraph {
         let is_go_test = test_path.ends_with("_test.go");
 
         if is_py_only_cfg && (is_rs_test || is_fe_test || is_go_test) {
+            return false;
+        }
+        if file_name == "pyproject.toml"
+            && (is_rs_test || is_fe_test || is_go_test)
+            && !self.is_pyproject_relevant_to_non_py(cfg_path, is_rs_test, reachable_ids)
+        {
             return false;
         }
         if is_fe_only_cfg && !is_fe_test {
@@ -437,6 +513,12 @@ impl DependencyGraph {
             if is_py_only_cfg && (is_rs_test || is_fe_test || is_go_test) {
                 continue;
             }
+            if file_name == "pyproject.toml"
+                && (is_rs_test || is_fe_test || is_go_test)
+                && !self.is_pyproject_relevant_to_non_py(cfg_path, is_rs_test, reachable_ids)
+            {
+                continue;
+            }
             if is_fe_only_cfg && !is_fe_test {
                 continue;
             }
@@ -491,10 +573,22 @@ impl DependencyGraph {
     }
 
     pub fn apply_environment_hash(&mut self, environment_hash: String) {
-        if self.environment_hash == environment_hash {
+        let non_py = self.non_python_environment_hash.clone();
+        self.apply_environment_hashes(environment_hash, non_py);
+    }
+
+    pub fn apply_environment_hashes(
+        &mut self,
+        environment_hash: String,
+        non_python_environment_hash: String,
+    ) {
+        if self.environment_hash == environment_hash
+            && self.non_python_environment_hash == non_python_environment_hash
+        {
             return;
         }
         self.environment_hash = environment_hash;
+        self.non_python_environment_hash = non_python_environment_hash;
         if self.file_index_to_path.len() != self.files.len() {
             self.recompute_edges();
         } else {
@@ -521,10 +615,12 @@ impl DependencyGraph {
 
     fn recompute_all_test_hashes(&mut self) {
         let base_hasher = self.build_base_hasher();
+        let non_py_base_hasher = self.build_non_python_base_hasher();
         let node_digests = self.build_all_node_hash_bytes();
         for (test_path, reachable_ids) in &self.transitive_dep_ids_for_test {
             let self_id = self.path_to_id.get(test_path).copied();
-            let mut hasher = base_hasher.clone();
+            let mut hasher =
+                self.base_hasher_for_test(test_path, reachable_ids, &base_hasher, &non_py_base_hasher);
             self.update_relevant_config_hashes(&mut hasher, test_path, reachable_ids);
             for &dep_id in reachable_ids {
                 if let Some((self_bytes, api_bytes)) = node_digests.get(dep_id as usize) {
@@ -992,6 +1088,7 @@ impl DependencyGraph {
             return;
         }
         let base_hasher = self.build_base_hasher();
+        let non_py_base_hasher = self.build_non_python_base_hasher();
 
         let affected: Vec<String> = self
             .affected_tests(changed_files)
@@ -1005,7 +1102,12 @@ impl DependencyGraph {
                 continue;
             };
             let self_id = self.path_to_id.get(&test_path).copied();
-            let mut hasher = base_hasher.clone();
+            let mut hasher = self.base_hasher_for_test(
+                &test_path,
+                reachable_ids,
+                &base_hasher,
+                &non_py_base_hasher,
+            );
             self.update_relevant_config_hashes(&mut hasher, &test_path, reachable_ids);
             for &dep_id in reachable_ids {
                 let is_self = Some(dep_id) == self_id;
@@ -1230,6 +1332,7 @@ impl DependencyGraph {
             .collect();
 
         let base_hasher = self.build_base_hasher();
+        let non_py_base_hasher = self.build_non_python_base_hasher();
         self.last_env_ref_digest = self.compute_env_ref_digest();
         let node_digests = self.build_all_node_hash_bytes();
 
@@ -1244,6 +1347,7 @@ impl DependencyGraph {
             let cf_ref = &conftests;
             let digests_ref = &node_digests;
             let base_ref = &base_hasher;
+            let non_py_base_ref = &non_py_base_hasher;
             type TestEdgeOutcome = (String, Vec<String>, Vec<u32>, String);
             let chunk_outcomes: Vec<Vec<TestEdgeOutcome>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = test_files
@@ -1289,7 +1393,12 @@ impl DependencyGraph {
                                 }
                                 reachable_ids.sort_unstable();
                                 let self_id = this_ref.path_to_id.get(test_path).copied();
-                                let mut hasher = base_ref.clone();
+                                let mut hasher = this_ref.base_hasher_for_test(
+                                    test_path,
+                                    &reachable_ids,
+                                    base_ref,
+                                    non_py_base_ref,
+                                );
                                 this_ref.update_relevant_config_hashes(
                                     &mut hasher,
                                     test_path,
@@ -1376,7 +1485,12 @@ impl DependencyGraph {
                 reachable_ids.sort_unstable();
 
                 let self_id = self.path_to_id.get(&test_path).copied();
-                let mut hasher = base_hasher.clone();
+                let mut hasher = self.base_hasher_for_test(
+                    &test_path,
+                    &reachable_ids,
+                    &base_hasher,
+                    &non_py_base_hasher,
+                );
                 self.update_relevant_config_hashes(&mut hasher, &test_path, &reachable_ids);
                 for &dep_id in &reachable_ids {
                     if let Some((self_bytes, api_bytes)) = node_digests.get(dep_id as usize) {
@@ -1539,6 +1653,7 @@ impl DependencyGraph {
         }
         let conftests = self.conftest_paths.clone();
         let base_hasher = self.build_base_hasher();
+        let non_py_base_hasher = self.build_non_python_base_hasher();
         let mut digest_cache: BTreeMap<(u32, bool), Vec<u8>> = BTreeMap::new();
         let mut visited_stamp = vec![0u32; self.file_index_to_path.len()];
         let mut epoch = 0u32;
@@ -1577,7 +1692,8 @@ impl DependencyGraph {
                 }
             }
             reachable.sort_unstable();
-            let mut hasher = base_hasher.clone();
+            let mut hasher =
+                self.base_hasher_for_test(test_path, &reachable, &base_hasher, &non_py_base_hasher);
             self.update_relevant_config_hashes(&mut hasher, test_path, &reachable);
             for &id in &reachable {
                 let is_self = id == test_id;
@@ -9640,6 +9756,62 @@ mod tests {
         assert_ne!(
             graph.dep_hash_for_test["src/consumer.rs"],
             consumer_hash_before
+        );
+    }
+
+    #[test]
+    fn pure_rust_dep_hash_tracks_cargo_lock_and_ignores_python_env_or_plain_pyproject() {
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "pyproject.toml",
+            b"[project]\nname = \"py-app\"\nversion = \"0.1.0\"\n",
+        );
+        graph.insert_file_bytes(
+            "Cargo.toml",
+            b"[package]\nname = \"rs-core\"\nversion = \"0.1.0\"\n",
+        );
+        graph.insert_file_bytes("Cargo.lock", b"version = 3\n[[package]]\nname = \"serde\"\n");
+        graph.insert_file_bytes(
+            "src/lib.rs",
+            b"#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_rs() { assert_eq!(2 + 2, 4); }\n}\n",
+        );
+        graph.insert_file_bytes(
+            "tests/test_py.py",
+            b"def test_py():\n    assert 1 + 1 == 2\n",
+        );
+        graph.environment_hash = "py-env-v1".to_string();
+        graph.non_python_environment_hash = "rust-env-v1".to_string();
+        graph.recompute_edges();
+
+        let rs_before = graph.dep_hash_for_test["src/lib.rs"].clone();
+        let py_before = graph.dep_hash_for_test["tests/test_py.py"].clone();
+
+        // Python environment rotation invalidates Python tests but preserves pure Rust dep_hash.
+        graph.apply_environment_hashes("py-env-v2".to_string(), "rust-env-v1".to_string());
+        assert_eq!(graph.dep_hash_for_test["src/lib.rs"], rs_before);
+        assert_ne!(graph.dep_hash_for_test["tests/test_py.py"], py_before);
+
+        // Plain (non-maturin) pyproject.toml change affects Python tests only, not pure Rust.
+        let py_after_env = graph.dep_hash_for_test["tests/test_py.py"].clone();
+        graph.insert_file_bytes(
+            "pyproject.toml",
+            b"[project]\nname = \"py-app\"\nversion = \"0.2.0\"\n",
+        );
+        graph.recompute_hashes_for_changed(&["pyproject.toml".to_string()]);
+        assert_eq!(graph.dep_hash_for_test["src/lib.rs"], rs_before);
+        assert_ne!(graph.dep_hash_for_test["tests/test_py.py"], py_after_env);
+
+        // Cargo.lock change invalidates Rust tests without invalidating pure Python tests.
+        let py_after_pyproject = graph.dep_hash_for_test["tests/test_py.py"].clone();
+        graph.insert_file_bytes(
+            "Cargo.lock",
+            b"version = 3\n[[package]]\nname = \"serde\"\nversion = \"1.0.219\"\n",
+        );
+        graph.recompute_hashes_for_changed(&["Cargo.lock".to_string()]);
+        assert_ne!(graph.dep_hash_for_test["src/lib.rs"], rs_before);
+        assert_eq!(
+            graph.dep_hash_for_test["tests/test_py.py"],
+            py_after_pyproject
         );
     }
 }

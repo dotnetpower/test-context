@@ -39,6 +39,32 @@ fn configured_max_daemon_rss_bytes() -> u64 {
         .unwrap_or(MAX_DAEMON_RSS_BYTES)
 }
 
+fn configured_max_resident_roots() -> usize {
+    std::env::var("TCTX_MAX_RESIDENT_ROOTS")
+        .ok()
+        .and_then(|val| val.trim().parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(MAX_RESIDENT_ROOTS)
+}
+
+fn configured_idle_root_timeout() -> Duration {
+    std::env::var("TCTX_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|val| val.trim().parse::<u64>().ok())
+        .filter(|secs| (60..=86_400).contains(secs))
+        .map(Duration::from_secs)
+        .unwrap_or(IDLE_ROOT_TIMEOUT)
+}
+
+fn configured_large_root_idle_timeout() -> Duration {
+    std::env::var("TCTX_LARGE_ROOT_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|val| val.trim().parse::<u64>().ok())
+        .filter(|secs| (60..=86_400).contains(secs))
+        .map(Duration::from_secs)
+        .unwrap_or(LARGE_ROOT_IDLE_TIMEOUT)
+}
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 fn trim_allocator() -> bool {
     unsafe { libc::malloc_trim(0) != 0 }
@@ -63,9 +89,9 @@ fn daemon_rss_bytes() -> Option<u64> {
 
 fn root_idle_timeout(indexed_files: usize) -> Duration {
     if indexed_files >= LARGE_ROOT_FILE_THRESHOLD {
-        LARGE_ROOT_IDLE_TIMEOUT
+        configured_large_root_idle_timeout()
     } else {
-        IDLE_ROOT_TIMEOUT
+        configured_idle_root_timeout()
     }
 }
 
@@ -352,7 +378,8 @@ impl DaemonHub {
                     evicted.push(old);
                 }
             }
-            while guard.len() >= MAX_RESIDENT_ROOTS {
+            let max_resident = configured_max_resident_roots();
+            while guard.len() >= max_resident {
                 let oldest_key = guard
                     .iter()
                     .filter(|(_, r)| r.is_evictable())

@@ -7,8 +7,9 @@ StartLimitBurst=3
 Type=simple
 ExecStart=%h/.local/bin/tctx daemon
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-Environment=CARGO_BUILD_JOBS=4
-Environment=RUST_TEST_THREADS=4
+Environment=TCTX_IDLE_TIMEOUT_SECS=7200
+Environment=TCTX_LARGE_ROOT_IDLE_TIMEOUT_SECS=3600
+Environment=TCTX_MAX_RSS_MB=4096
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10
@@ -21,9 +22,9 @@ LimitNOFILE=16384
 MemoryAccounting=yes
 MemoryHigh=3G
 MemoryMax=6G
-CPUWeight=30
+CPUWeight=100
 IOAccounting=yes
-IOWeight=20
+IOWeight=100
 
 [Install]
 WantedBy=default.target

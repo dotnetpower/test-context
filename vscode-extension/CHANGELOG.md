@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.4
+
+- Allow safe Rust unit tests (`src/**/*.rs` without deny markers) to run speculatively in the background worker even under `background_safe_only`, while keeping foreground `cargo test` builds uncapped and scoping `CARGO_BUILD_JOBS=4` / `RUST_TEST_THREADS=4` to background worker subprocesses.
+- Isolate pure Rust, Frontend, and Go `dep_hash` calculations from Python virtual-environment/plugin fingerprints (`non_python_environment_hash`) and non-Maturin `pyproject.toml` edits, while tracking `Cargo.lock` changes and post-build lockfile updates without false `SOURCE_CHANGED_DURING_TEST` discards.
+- Batch multi-crate Cargo workspace `--lib` test precompilation in a single `cargo test --no-run` pass, map `src/main.rs` directly to its `[[bin]]` executable instead of rebuilding `--bins` twice, attribute precompile duration into `saved_ms`, and fix two-token Cargo flags (`-p`, `--bin`, `--features`, `-j`, `-- --skip`) in the `tctx-cargo-test` drop-in parser.
+- Migrate legacy `pytest_timeout_secs: 180` workspace policies to `300`, fall back to `HEAD` commit files when `targets` is omitted on clean >64-test repositories, add configurable daemon root retention (`TCTX_IDLE_TIMEOUT_SECS`, `TCTX_LARGE_ROOT_IDLE_TIMEOUT_SECS`, `TCTX_MAX_RESIDENT_ROOTS`), and split integration tests into parallel binaries.
+
 ## 0.1.3
 
 - Add persisted `bincode` AST + edge snapshots (`.v4.ast.bin`), multi-core directory scanning, `O(1)` scoped config hashing, and persisted Python runtime metadata caching for up to 6–25× faster cold workspace loads.

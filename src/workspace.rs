@@ -26,6 +26,7 @@ pub const PYTEST_CONFIG_FILES: &[&str] = &[
 
 pub const RUST_CONFIG_FILES: &[&str] = &[
     "Cargo.toml",
+    "Cargo.lock",
     "rust-toolchain.toml",
     "rust-toolchain",
 ];

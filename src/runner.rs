@@ -139,12 +139,16 @@ fn background_eligible(spec: &Spec, graph: &DependencyGraph, test_file: &str) ->
     {
         return false;
     }
-    !spec.policy.background_safe_only
+    if !spec.policy.background_safe_only
         || node
             .parsed
             .module_markers
             .iter()
             .any(|marker| marker == "background_safe")
+    {
+        return true;
+    }
+    test_file.ends_with(".rs") && !crate::ast_graph::is_rust_integration_test_path(test_file)
 }
 
 fn background_eligible_with_cache(guard: &RootState, test_file: &str) -> bool {
@@ -309,6 +313,7 @@ impl ManagedRoot {
             );
         }
         graph.environment_hash = environment_fingerprint_for_graph(&spec, &graph);
+        graph.non_python_environment_hash = non_python_environment_fingerprint(&spec);
         let save_snapshot = !graph.has_persisted_edges();
         graph.recompute_edges_or_reuse_persisted();
         if save_snapshot {
@@ -845,7 +850,8 @@ impl ManagedRoot {
             for (test_file, dep_hash) in &batch {
                 guard.in_flight.remove(&flight_key(test_file, dep_hash));
             }
-            Self::reconcile_live_files_locked(&mut guard, Some(&files_only));
+            let has_rs_batch = files_only.iter().any(|f| f.ends_with(".rs"));
+            Self::reconcile_live_files_inner_locked(&mut guard, Some(&files_only), has_rs_batch);
             let unstable: BTreeSet<String> = batch
                 .iter()
                 .filter(|(test_file, expected_hash)| {
@@ -861,6 +867,7 @@ impl ManagedRoot {
             }
             match exec_res {
                 Ok((mut records, _raw_out)) => {
+                    Self::sync_cargo_locks_after_exec_locked(&mut guard, &files_only, &mut records);
                     let workspace = guard.workspace.clone();
                     let policy_snapshot = guard.spec.policy.clone();
                     let mut runtime_changed = false;
@@ -1257,7 +1264,10 @@ impl ManagedRoot {
         }
         if guard.last_environment_check.elapsed() >= Duration::from_secs(300) {
             let environment_hash = environment_fingerprint_for_graph(&guard.spec, &guard.graph);
-            guard.graph.apply_environment_hash(environment_hash);
+            let non_py_hash = non_python_environment_fingerprint(&guard.spec);
+            guard
+                .graph
+                .apply_environment_hashes(environment_hash, non_py_hash);
             guard.last_environment_check = Instant::now();
         }
     }
@@ -1265,7 +1275,15 @@ impl ManagedRoot {
     /// Reconciles live disk contents for candidate files before serving a test_run or affected query.
     /// Returns `true` if the dependency graph structure changed.
     fn reconcile_live_files_locked(guard: &mut RootState, target_tests: Option<&[String]>) -> bool {
-        let files_to_check: Vec<String> = if let Some(tests) = target_tests {
+        Self::reconcile_live_files_inner_locked(guard, target_tests, false)
+    }
+
+    fn reconcile_live_files_inner_locked(
+        guard: &mut RootState,
+        target_tests: Option<&[String]>,
+        skip_cargo_lock: bool,
+    ) -> bool {
+        let mut files_to_check: Vec<String> = if let Some(tests) = target_tests {
             let num_indexed = guard.graph.file_index_to_path.len();
             if num_indexed == guard.graph.files.len() && num_indexed > 0 {
                 let mut seen = vec![false; num_indexed];
@@ -1314,6 +1332,9 @@ impl ManagedRoot {
         } else {
             guard.graph.files.keys().cloned().collect()
         };
+        if skip_cargo_lock {
+            files_to_check.retain(|p| p != "Cargo.lock" && !p.ends_with("/Cargo.lock"));
+        }
 
         let mut changed: Vec<String> = Vec::new();
         let mut structure_changed = false;
@@ -1433,6 +1454,68 @@ impl ManagedRoot {
         structure_changed
     }
 
+    fn sync_cargo_locks_after_exec_locked(
+        guard: &mut RootState,
+        executed_files: &[String],
+        records: &mut [CachedTestRecord],
+    ) {
+        if !executed_files.iter().any(|f| f.ends_with(".rs")) {
+            return;
+        }
+        let mut lock_candidates = BTreeSet::new();
+        lock_candidates.insert("Cargo.lock".to_string());
+        for tf in executed_files {
+            if tf.ends_with(".rs") {
+                let cdir = crate::ast_graph::rust_crate_dir(tf);
+                if !cdir.is_empty() {
+                    lock_candidates.insert(format!("{cdir}/Cargo.lock"));
+                }
+            }
+        }
+        let mut lock_changed = Vec::new();
+        let mut structure_changed = false;
+        let limit = guard.spec.policy.max_file_bytes.max(8 * 1024 * 1024);
+        for lock_rel in lock_candidates {
+            let rel_path = Path::new(&lock_rel);
+            let full = guard.workspace.root.join(rel_path);
+            let Some(live_stamp) = file_stamp(&full) else {
+                continue;
+            };
+            let Ok(bytes) = guard.workspace.read_known_with_limit(rel_path, limit) else {
+                continue;
+            };
+            let live_sha = sha256_hex(&bytes);
+            let indexed_sha = guard.graph.files.get(&lock_rel).map(|n| n.sha256.as_str());
+            if indexed_sha != Some(live_sha.as_str()) {
+                if guard.graph.insert_file_bytes_with_stamp(
+                    &lock_rel,
+                    &bytes,
+                    Some(live_stamp),
+                ) {
+                    structure_changed = true;
+                }
+                lock_changed.push(lock_rel);
+            } else if let Some(node) = guard.graph.files.get_mut(&lock_rel) {
+                node.stamp = Some(live_stamp);
+            }
+        }
+        if !lock_changed.is_empty() {
+            guard.generation = guard.generation.saturating_add(1);
+            if structure_changed {
+                guard.graph.recompute_edges();
+            } else {
+                guard.graph.recompute_hashes_for_changed(&lock_changed);
+            }
+            for rec in records {
+                if rec.test_file.ends_with(".rs")
+                    && let Some(dh) = guard.graph.dep_hash_for_test.get(&rec.test_file)
+                {
+                    rec.dep_hash.clone_from(dh);
+                }
+            }
+        }
+    }
+
     pub fn sync(&self, wait_background: bool) -> Result<serde_json::Value> {
         let (workspace, spec) = {
             let mut guard = self.lock_state();
@@ -1441,7 +1524,8 @@ impl ManagedRoot {
         };
         let mut new_graph = DependencyGraph::build(&workspace, &spec.policy)?;
         let environment_hash = environment_fingerprint_for_graph(&spec, &new_graph);
-        new_graph.apply_environment_hash(environment_hash);
+        let non_py_hash = non_python_environment_fingerprint(&spec);
+        new_graph.apply_environment_hashes(environment_hash, non_py_hash);
         let watch_dirs =
             workspace.watch_directories_for(new_graph.files.keys().map(Path::new), &spec.policy)?;
         {
@@ -2095,12 +2179,23 @@ impl ManagedRoot {
                 && guard.graph.dep_hash_for_test.len() > 64
             {
                 let dirty = git_dirty_files(&guard.workspace.root).unwrap_or_default();
-                let affected: Vec<String> = guard
+                let mut affected: Vec<String> = guard
                     .graph
                     .affected_tests(&dirty)
                     .into_iter()
                     .map(|a| a.test_file)
                     .collect();
+                if affected.is_empty() {
+                    let recent = git_recent_commit_files(&guard.workspace.root).unwrap_or_default();
+                    if !recent.is_empty() {
+                        affected = guard
+                            .graph
+                            .affected_tests(&recent)
+                            .into_iter()
+                            .map(|a| a.test_file)
+                            .collect();
+                    }
+                }
                 if affected.is_empty() {
                     norm_targets.clone()
                 } else {
@@ -2602,7 +2697,8 @@ impl ManagedRoot {
             for (tf, dh) in &dep_hashes_for_exec {
                 guard.in_flight.remove(&flight_key(tf, dh));
             }
-            Self::reconcile_live_files_locked(&mut guard, Some(&to_execute));
+            let has_rs_exec = to_execute.iter().any(|f| f.ends_with(".rs"));
+            Self::reconcile_live_files_inner_locked(&mut guard, Some(&to_execute), has_rs_exec);
             let unstable_set: BTreeSet<String> = dep_hashes_for_exec
                 .iter()
                 .filter(|(test_file, expected_hash)| {
@@ -2623,6 +2719,7 @@ impl ManagedRoot {
                 .into_iter()
                 .filter(|rec| !unstable_set.contains(&rec.test_file))
                 .collect();
+            Self::sync_cargo_locks_after_exec_locked(&mut guard, &to_execute, &mut stable_records);
             if !stable_records.is_empty() {
                 let mut runtime_changed = false;
                 let workspace_snapshot = guard.workspace.clone();
@@ -3446,12 +3543,21 @@ fn environment_fingerprint_for_graph(spec: &Spec, graph: &DependencyGraph) -> St
     environment_fingerprint_with_python(spec, has_python)
 }
 
+fn non_python_environment_fingerprint(spec: &Spec) -> String {
+    environment_fingerprint_with_python(spec, false)
+}
+
 fn environment_fingerprint_with_python(spec: &Spec, include_python: bool) -> String {
-    let pytest_cmd = spec.effective_pytest_cmd();
-    let (runtime_identity, plugins) = if include_python {
-        python_runtime_identity(spec)
+    let (pytest_sig, runtime_identity, plugins) = if include_python {
+        let pytest_cmd = spec.effective_pytest_cmd();
+        let (ident, plugs) = python_runtime_identity(spec);
+        (pytest_cmd.join("\0"), ident, plugs)
     } else {
-        ("rust-only".to_string(), Vec::new())
+        (
+            "non-python".to_string(),
+            "rust-only".to_string(),
+            Vec::new(),
+        )
     };
     let mut evidence = Vec::new();
     evidence.extend_from_slice(b"tctx-env-v4\n");
@@ -3459,7 +3565,7 @@ fn environment_fingerprint_with_python(spec: &Spec, include_python: bool) -> Str
     evidence.push(b'\n');
     evidence.extend_from_slice(spec.root.to_string_lossy().as_bytes());
     evidence.push(b'\n');
-    evidence.extend_from_slice(pytest_cmd.join("\0").as_bytes());
+    evidence.extend_from_slice(pytest_sig.as_bytes());
     evidence.push(b'\n');
 
     evidence.extend_from_slice(runtime_identity.as_bytes());
@@ -3470,15 +3576,17 @@ fn environment_fingerprint_with_python(spec: &Spec, include_python: bool) -> Str
     }
 
     let mut env_keys = vec![
-        "PYTHONHASHSEED".to_string(),
         "TZ".to_string(),
         "LANG".to_string(),
         "LC_ALL".to_string(),
-        "PYTEST_ADDOPTS".to_string(),
         "RUSTFLAGS".to_string(),
         "CARGO_TARGET_DIR".to_string(),
         "NODE_ENV".to_string(),
     ];
+    if include_python {
+        env_keys.push("PYTHONHASHSEED".to_string());
+        env_keys.push("PYTEST_ADDOPTS".to_string());
+    }
     if let Some(extra) = std::env::var_os("TCTX_ENV_KEYS") {
         env_keys.extend(
             extra
@@ -3795,6 +3903,24 @@ fn git_dirty_files(root: &Path) -> Result<Vec<String>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(root.to_path_buf(), (Instant::now(), files.clone()));
     Ok(files)
+}
+
+fn git_recent_commit_files(root: &Path) -> Result<Vec<String>> {
+    let mut cmd = Command::new("git");
+    cmd.args(["--no-optional-locks", "-c", "core.quotePath=false", "-C"])
+        .arg(root)
+        .args(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"]);
+    let out = run_command_with_timeout(&mut cmd, Duration::from_secs(3), 512 * 1024)?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 fn build_pythonpath(root: &Path, existing: Option<std::ffi::OsString>) -> std::ffi::OsString {
@@ -4732,6 +4858,227 @@ fn cargo_compile_timeout_for(spec: &Spec) -> Duration {
     Duration::from_secs(configured)
 }
 
+fn apply_cargo_exec_env(cmd: &mut Command, source_label: &str) {
+    cmd.env_remove("TCTX_IDLE_TIMEOUT_SECS")
+        .env_remove("TCTX_LARGE_ROOT_IDLE_TIMEOUT_SECS")
+        .env_remove("TCTX_MAX_RESIDENT_ROOTS")
+        .env_remove("TCTX_MAX_RSS_MB");
+    if source_label == "background" {
+        if std::env::var_os("CARGO_BUILD_JOBS").is_none() {
+            cmd.env("CARGO_BUILD_JOBS", "4");
+        }
+        if std::env::var_os("RUST_TEST_THREADS").is_none() {
+            cmd.env("RUST_TEST_THREADS", "4");
+        }
+    }
+}
+
+fn unquote_toml_scalar(raw: &str) -> Option<String> {
+    let val = raw.split('#').next().unwrap_or(raw).trim();
+    if val.len() >= 2
+        && ((val.starts_with('"') && val.ends_with('"'))
+            || (val.starts_with('\'') && val.ends_with('\'')))
+    {
+        Some(val[1..val.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
+fn is_cargo_workspace_root(root: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join("Cargo.toml")) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let t = line.trim();
+        t == "[workspace]" || t.starts_with("[workspace.")
+    })
+}
+
+fn parse_cargo_package_and_main_bin(workdir: &Path) -> (Option<String>, Option<String>) {
+    let Ok(text) = std::fs::read_to_string(workdir.join("Cargo.toml")) else {
+        return (None, None);
+    };
+    let mut section = "";
+    let mut pkg_name: Option<String> = None;
+    let mut autobins = true;
+    let mut bins: Vec<(Option<String>, Option<String>)> = Vec::new();
+    let mut cur_bin: (Option<String>, Option<String>) = (None, None);
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if section == "[[bin]]" && (cur_bin.0.is_some() || cur_bin.1.is_some()) {
+                bins.push(std::mem::take(&mut cur_bin));
+            }
+            section = if line == "[package]" {
+                "package"
+            } else if line == "[[bin]]" {
+                "[[bin]]"
+            } else {
+                "other"
+            };
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        match section {
+            "package" => {
+                if key == "name" {
+                    pkg_name = unquote_toml_scalar(v);
+                } else if key == "autobins" {
+                    let b = v.split('#').next().unwrap_or(v).trim();
+                    if b == "false" {
+                        autobins = false;
+                    }
+                }
+            }
+            "[[bin]]" => {
+                if key == "name" {
+                    cur_bin.0 = unquote_toml_scalar(v);
+                } else if key == "path" {
+                    cur_bin.1 = unquote_toml_scalar(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    if section == "[[bin]]" && (cur_bin.0.is_some() || cur_bin.1.is_some()) {
+        bins.push(cur_bin);
+    }
+
+    let main_bin = if workdir.join("src/main.rs").is_file() {
+        if let Some((Some(name), _)) = bins.iter().find(|(_, p)| {
+            p.as_deref()
+                .is_some_and(|path| path.trim_start_matches("./") == "src/main.rs")
+        }) {
+            Some(name.clone())
+        } else if let Some(ref p) = pkg_name
+            && let Some((Some(name), None)) = bins.iter().find(|(n, path)| n.as_deref() == Some(p.as_str()) && path.is_none())
+        {
+            Some(name.clone())
+        } else if autobins
+            && let Some(ref p) = pkg_name
+            && !bins.iter().any(|(n, path)| {
+                n.as_deref() == Some(p.as_str())
+                    && path
+                        .as_deref()
+                        .is_some_and(|bp| bp.trim_start_matches("./") != "src/main.rs")
+            })
+        {
+            Some(p.clone())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    (pkg_name, main_bin)
+}
+
+fn parse_cargo_test_executables_workspace_json(
+    stdout: &[u8],
+    workspace_root: &Path,
+) -> BTreeMap<(String, RustArtifactKind), PathBuf> {
+    let mut map = BTreeMap::new();
+    let canon_root = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
+    let text = String::from_utf8_lossy(stdout);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('{') {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if val.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-artifact") {
+            continue;
+        }
+        let is_test_profile = val
+            .get("profile")
+            .and_then(|p| p.get("test"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if !is_test_profile {
+            continue;
+        }
+        let Some(exe_str) = val.get("executable").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let exe_path = PathBuf::from(exe_str);
+        if !exe_path.is_file() {
+            continue;
+        }
+        let Some(manifest_str) = val.get("manifest_path").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(manifest_dir) = Path::new(manifest_str).parent() else {
+            continue;
+        };
+        let crate_dir = manifest_dir
+            .strip_prefix(workspace_root)
+            .ok()
+            .or_else(|| {
+                manifest_dir
+                    .canonicalize()
+                    .ok()
+                    .and_then(|c| c.strip_prefix(&canon_root).ok().map(Path::to_path_buf))
+                    .as_deref()
+                    .map(|_| Path::new(""))
+            });
+        let resolved_crate_dir = if let Ok(rel) = manifest_dir.strip_prefix(workspace_root) {
+            normalize_rel_str(rel)
+        } else if let Ok(canon_dir) = manifest_dir.canonicalize()
+            && let Ok(rel) = canon_dir.strip_prefix(&canon_root)
+        {
+            normalize_rel_str(rel)
+        } else {
+            let _ = crate_dir;
+            continue;
+        };
+        let Some(target) = val.get("target") else {
+            continue;
+        };
+        let name = target
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let kinds: Vec<&str> = target
+            .get("kind")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        if kinds.contains(&"test") {
+            map.insert(
+                (
+                    resolved_crate_dir,
+                    RustArtifactKind::IntegrationTest(name.to_string()),
+                ),
+                exe_path,
+            );
+        } else if kinds.contains(&"bin") {
+            map.insert(
+                (resolved_crate_dir, RustArtifactKind::Bin(name.to_string())),
+                exe_path,
+            );
+        } else if kinds
+            .iter()
+            .any(|k| matches!(*k, "lib" | "rlib" | "cdylib" | "dylib" | "proc-macro"))
+        {
+            map.insert((resolved_crate_dir, RustArtifactKind::Lib), exe_path);
+        }
+    }
+    map
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_cargo_test_batch(
     spec: &Spec,
@@ -4795,7 +5142,93 @@ fn execute_cargo_test_batch(
     }
     let mut precompiled_failed_crates: BTreeMap<String, (String, u64)> = BTreeMap::new();
     let mut precompiled_executables: BTreeMap<(String, RustArtifactKind), PathBuf> = BTreeMap::new();
+    let mut precompiled_duration_ms: BTreeMap<String, u64> = BTreeMap::new();
+    let mut crate_manifest_info: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+    for crate_dir in files_by_crate.keys() {
+        let workdir = if crate_dir.is_empty() {
+            spec.root.clone()
+        } else {
+            spec.root.join(crate_dir)
+        };
+        crate_manifest_info.insert(crate_dir.clone(), parse_cargo_package_and_main_bin(&workdir));
+    }
+
+    let mut workspace_batched_crates: BTreeSet<String> = BTreeSet::new();
+    if files_by_crate.len() >= 2 && extra_args.is_empty() && is_cargo_workspace_root(&spec.root) {
+        let mut ws_packages: Vec<(String, String)> = Vec::new();
+        for (crate_dir, crate_files) in &files_by_crate {
+            let workdir = if crate_dir.is_empty() {
+                spec.root.clone()
+            } else {
+                spec.root.join(crate_dir)
+            };
+            let all_lib = workdir.join("src/lib.rs").is_file()
+                && crate_files.iter().all(|tf| {
+                    !crate::ast_graph::is_rust_integration_test_path(tf)
+                        && !tf.ends_with("src/main.rs")
+                        && tf != "src/main.rs"
+                        && !tf.contains("src/bin/")
+                });
+            if all_lib
+                && let Some((Some(pkg_name), _)) = crate_manifest_info.get(crate_dir)
+            {
+                ws_packages.push((crate_dir.clone(), pkg_name.clone()));
+            }
+        }
+        if ws_packages.len() >= 2 {
+            let mut command = Command::new(program);
+            command.current_dir(&spec.root);
+            apply_cargo_exec_env(&mut command, source_label);
+            command.args(base_args);
+            command
+                .arg("test")
+                .arg("--no-run")
+                .arg("--message-format=json")
+                .arg("--lib");
+            for (_, pkg_name) in &ws_packages {
+                command.arg("-p").arg(pkg_name);
+            }
+            let output = run_command_with_timeout_tracked(
+                &mut command,
+                compile_timeout,
+                4 * 1024 * 1024,
+                active_pgid,
+                active_pgids,
+            )?;
+            if output.timed_out {
+                return Err(invalid(format!(
+                    "cargo test compilation timed out after {}s",
+                    compile_timeout.as_secs()
+                ))
+                .into());
+            }
+            if output.cancelled {
+                return Err(invalid(
+                    "TEST_CANCELLED: cargo test child process group was terminated",
+                )
+                .into());
+            }
+            if output.status.success() {
+                let parsed =
+                    parse_cargo_test_executables_workspace_json(&output.stdout, &spec.root);
+                let per_crate_ms = output.duration_ms / (ws_packages.len() as u64);
+                for (crate_dir, _) in &ws_packages {
+                    if parsed.contains_key(&(crate_dir.clone(), RustArtifactKind::Lib)) {
+                        workspace_batched_crates.insert(crate_dir.clone());
+                        precompiled_duration_ms.insert(crate_dir.clone(), per_crate_ms);
+                    }
+                }
+                for (k, v) in parsed {
+                    precompiled_executables.insert(k, v);
+                }
+            }
+        }
+    }
+
     for (crate_dir, crate_files) in &files_by_crate {
+        if workspace_batched_crates.contains(crate_dir) {
+            continue;
+        }
         let lib_count = lib_groups.get(crate_dir).map_or(0, Vec::len);
         let indiv_count = crate_files.len().saturating_sub(if lib_count > 1 { lib_count } else { 0 });
         let total_invocations = usize::from(lib_count > 1) + indiv_count;
@@ -4807,6 +5240,9 @@ fn execute_cargo_test_batch(
         } else {
             spec.root.join(crate_dir)
         };
+        let main_bin_opt = crate_manifest_info
+            .get(crate_dir)
+            .and_then(|(_, mb)| mb.clone());
         let mut need_lib = lib_count > 0;
         let mut need_bins = false;
         let mut specific_bins = BTreeSet::new();
@@ -4817,19 +5253,26 @@ fn execute_cargo_test_batch(
                     specific_tests.insert(stem.to_string());
                 }
             } else if tf.ends_with("src/main.rs") || tf == "src/main.rs" {
-                need_bins = true;
+                if let Some(ref main_bin) = main_bin_opt {
+                    specific_bins.insert(main_bin.clone());
+                } else {
+                    need_bins = true;
+                }
             } else if let Some((_, bin_rel)) = tf.rsplit_once("src/bin/")
                 && let Some(stem) = Path::new(bin_rel).file_stem().and_then(|s| s.to_str())
             {
                 specific_bins.insert(stem.to_string());
             } else if workdir.join("src/lib.rs").is_file() {
                 need_lib = true;
+            } else if let Some(ref main_bin) = main_bin_opt {
+                specific_bins.insert(main_bin.clone());
             } else {
                 need_bins = true;
             }
         }
         let mut command = Command::new(program);
         command.current_dir(&workdir);
+        apply_cargo_exec_env(&mut command, source_label);
         command.args(base_args);
         command.arg("test").arg("--no-run").arg("--message-format=json");
         if need_lib {
@@ -4879,6 +5322,7 @@ fn execute_cargo_test_batch(
             };
             precompiled_failed_crates.insert(crate_dir.clone(), (combined_out, output.duration_ms));
         } else {
+            precompiled_duration_ms.insert(crate_dir.clone(), output.duration_ms);
             for (kind, exe_path) in parse_cargo_test_executables_json(&output.stdout) {
                 precompiled_executables.insert((crate_dir.clone(), kind), exe_path);
             }
@@ -4910,6 +5354,7 @@ fn execute_cargo_test_batch(
         let mut command = if let Some(ref exe_path) = direct_lib_exe {
             let mut cmd = Command::new(exe_path);
             cmd.current_dir(&workdir);
+            apply_cargo_exec_env(&mut cmd, source_label);
             if let Some(k) = k_expr
                 && !k.trim().is_empty()
             {
@@ -4931,6 +5376,7 @@ fn execute_cargo_test_batch(
         } else {
             let mut cmd = Command::new(program);
             cmd.current_dir(&workdir);
+            apply_cargo_exec_env(&mut cmd, source_label);
             cmd.args(base_args);
             cmd.arg("test").arg("--lib");
             if let Some(k) = k_expr
@@ -4999,6 +5445,19 @@ fn execute_cargo_test_batch(
         let overall_success = output.status.success();
         let mut demuxed =
             demux_cargo_lib_output(&combined_out, &group_files, output.duration_ms, overall_success);
+        let crate_total_files = files_by_crate
+            .get(&crate_dir)
+            .map_or(group_files.len(), Vec::len)
+            .max(1) as u64;
+        let compile_share_ms = if direct_lib_exe.is_some() {
+            precompiled_duration_ms
+                .get(&crate_dir)
+                .copied()
+                .unwrap_or(0)
+                / crate_total_files
+        } else {
+            0
+        };
         let now = now_unix_ms();
         for test_file in group_files {
             let Some(dep_hash) = dep_hashes.get(&test_file) else {
@@ -5034,7 +5493,7 @@ fn execute_cargo_test_batch(
                 failed: stats.failed,
                 skipped: stats.skipped,
                 errors: stats.errors,
-                duration_ms: stats.duration_ms.max(1),
+                duration_ms: stats.duration_ms.max(1).saturating_add(compile_share_ms),
                 failed_nodeids: stats.failed_nodeids,
                 output_snippet: if outcome.is_green() {
                     String::new()
@@ -5055,7 +5514,7 @@ fn execute_cargo_test_batch(
         }
     }
 
-    let mut direct_parallel_tasks: Vec<(String, String, PathBuf, PathBuf, Option<String>)> =
+    let mut direct_parallel_tasks: Vec<(String, String, PathBuf, PathBuf, Option<String>, u64)> =
         Vec::new();
     let mut sequential_files: Vec<String> = Vec::new();
 
@@ -5114,6 +5573,9 @@ fn execute_cargo_test_batch(
                 None
             }
         });
+        let main_bin_opt = crate_manifest_info
+            .get(&crate_dir)
+            .and_then(|(_, mb)| mb.clone());
         let direct_exe = if extra_args.is_empty() {
             let kind_opt = if crate::ast_graph::is_rust_integration_test_path(test_file) {
                 Path::new(test_file)
@@ -5125,13 +5587,12 @@ fn execute_cargo_test_batch(
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .map(|stem| RustArtifactKind::Bin(stem.to_string()))
-            } else if workdir.join("src/lib.rs").is_file()
-                && !test_file.ends_with("src/main.rs")
-                && test_file != "src/main.rs"
-            {
+            } else if test_file.ends_with("src/main.rs") || test_file == "src/main.rs" {
+                main_bin_opt.map(RustArtifactKind::Bin)
+            } else if workdir.join("src/lib.rs").is_file() {
                 Some(RustArtifactKind::Lib)
             } else {
-                None
+                main_bin_opt.map(RustArtifactKind::Bin)
             };
             kind_opt.and_then(|kind| precompiled_executables.get(&(crate_dir.clone(), kind)).cloned())
         } else {
@@ -5141,12 +5602,22 @@ fn execute_cargo_test_batch(
             let filter_arg = explicit_node_filter
                 .or_else(|| k_expr.map(ToOwned::to_owned))
                 .or_else(|| rust_module_filter_for_file(test_file));
+            let crate_total_files = files_by_crate
+                .get(&crate_dir)
+                .map_or(1, Vec::len)
+                .max(1) as u64;
+            let compile_share_ms = precompiled_duration_ms
+                .get(&crate_dir)
+                .copied()
+                .unwrap_or(0)
+                / crate_total_files;
             direct_parallel_tasks.push((
                 test_file.clone(),
                 dep_hash.clone(),
                 workdir,
                 exe_path,
                 filter_arg,
+                compile_share_ms,
             ));
         } else {
             sequential_files.push(test_file.clone());
@@ -5168,10 +5639,19 @@ fn execute_cargo_test_batch(
                     .map(|chunk| {
                         scope.spawn(move || -> Result<Vec<(CachedTestRecord, String)>> {
                             let mut local_out = Vec::with_capacity(chunk.len());
-                            for (test_file, dep_hash, workdir, exe_path, filter_arg) in chunk {
+                            for (
+                                test_file,
+                                dep_hash,
+                                workdir,
+                                exe_path,
+                                filter_arg,
+                                compile_share_ms,
+                            ) in chunk
+                            {
                                 let run_started_unix_ms = now_unix_ms();
                                 let mut cmd = Command::new(exe_path);
                                 cmd.current_dir(workdir);
+                                apply_cargo_exec_env(&mut cmd, source_label);
                                 if ignore_flag {
                                     cmd.arg("--ignored");
                                 }
@@ -5242,7 +5722,7 @@ fn execute_cargo_test_batch(
                                         failed: stats.failed,
                                         skipped: stats.skipped,
                                         errors: stats.errors,
-                                        duration_ms: stats.duration_ms,
+                                        duration_ms: stats.duration_ms.saturating_add(*compile_share_ms),
                                         failed_nodeids: stats.failed_nodeids,
                                         output_snippet: if outcome.is_green() {
                                             String::new()
@@ -5320,29 +5800,40 @@ fn execute_cargo_test_batch(
         {
             let mut cmd = Command::new(nx_prog);
             cmd.current_dir(&workdir);
+            apply_cargo_exec_env(&mut cmd, source_label);
             cmd.args(nx_base);
             cmd.arg("run").arg("--no-fail-fast");
             cmd
         } else {
             let mut cmd = Command::new(program);
             cmd.current_dir(&workdir);
+            apply_cargo_exec_env(&mut cmd, source_label);
             cmd.args(base_args);
             cmd.arg("test");
             cmd
         };
 
+        let main_bin_opt = crate_manifest_info
+            .get(&crate_dir)
+            .and_then(|(_, mb)| mb.clone());
         if crate::ast_graph::is_rust_integration_test_path(test_file) {
             if let Some(stem) = Path::new(test_file).file_stem().and_then(|s| s.to_str()) {
                 command.arg("--test").arg(stem);
             }
         } else if test_file.ends_with("src/main.rs") || test_file == "src/main.rs" {
-            command.arg("--bins");
+            if let Some(main_bin) = main_bin_opt {
+                command.arg("--bin").arg(main_bin);
+            } else {
+                command.arg("--bins");
+            }
         } else if let Some((_, bin_rel)) = test_file.rsplit_once("src/bin/")
             && let Some(stem) = Path::new(bin_rel).file_stem().and_then(|s| s.to_str())
         {
             command.arg("--bin").arg(stem);
         } else if workdir.join("src/lib.rs").is_file() {
             command.arg("--lib");
+        } else if let Some(main_bin) = main_bin_opt {
+            command.arg("--bin").arg(main_bin);
         } else {
             command.arg("--bins");
         }
@@ -7918,5 +8409,44 @@ ok 3 - skipped browser check # SKIP no display
         );
         let compacted = compact_passed_delta_stdout(verbose_pass);
         assert_eq!(compacted, "warning: DeprecationWarning: legacy call");
+    }
+
+    #[test]
+    fn rust_unit_tests_are_background_eligible_and_main_bin_is_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname = \"test-context\"\nversion = \"0.1.3\"\n\n[[bin]]\nname = \"tctx\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let (pkg, main_bin) = parse_cargo_package_and_main_bin(tmp.path());
+        assert_eq!(pkg.as_deref(), Some("test-context"));
+        assert_eq!(main_bin.as_deref(), Some("tctx"));
+
+        let spec = Spec {
+            root: tmp.path().to_path_buf(),
+            scopes: Vec::new(),
+            globs: Vec::new(),
+            excludes: Vec::new(),
+            default_excludes: true,
+            pytest_cmd: Vec::new(),
+            policy: Default::default(),
+            allow_worktrees: false,
+            managed_parent: None,
+        };
+        let mut graph = DependencyGraph::new();
+        graph.insert_file_bytes(
+            "src/calc.rs",
+            b"#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_ok() { assert_eq!(1, 1); }\n}\n",
+        );
+        graph.insert_file_bytes(
+            "tests/int_test.rs",
+            b"#[test]\nfn test_int() { assert_eq!(1, 1); }\n",
+        );
+        graph.recompute_edges();
+        assert!(background_eligible(&spec, &graph, "src/calc.rs"));
+        assert!(!background_eligible(&spec, &graph, "tests/int_test.rs"));
     }
 }
