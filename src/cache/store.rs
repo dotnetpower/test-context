@@ -1,539 +1,4 @@
-use crate::Result;
-use crate::ast_graph::sha256_hex;
-use crate::catalog;
-use crate::policy::MemoryPolicy;
-use fs2::FileExt;
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, BufWriter, Read, Seek, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TestOutcome {
-    Passed,
-    Failed,
-    Skipped,
-    Error,
-}
-
-impl TestOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Passed => "passed",
-            Self::Failed => "failed",
-            Self::Skipped => "skipped",
-            Self::Error => "error",
-        }
-    }
-
-    pub fn is_green(self) -> bool {
-        matches!(self, Self::Passed | Self::Skipped)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CachedNodeResult {
-    pub nodeid: String,
-    pub outcome: TestOutcome,
-    pub duration_ms: u64,
-    pub output_snippet: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExternalModuleStamp {
-    pub resolved_path: String,
-    pub stamp: crate::ast_graph::FileStamp,
-    #[serde(default)]
-    pub is_dir: bool,
-}
-
-fn dir_stamp_for_freshness(full_path: &Path) -> Option<crate::ast_graph::FileStamp> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(full_path).ok()?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        return None;
-    }
-    Some(crate::ast_graph::FileStamp {
-        mtime_sec: meta.mtime(),
-        mtime_nsec: meta.mtime_nsec(),
-        size: meta.len(),
-        ino: meta.ino(),
-        ctime_sec: meta.ctime(),
-        ctime_nsec: meta.ctime_nsec(),
-    })
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CachedTestRecord {
-    pub test_file: String,
-    pub dep_hash: String,
-    pub outcome: TestOutcome,
-    pub passed: usize,
-    pub failed: usize,
-    pub skipped: usize,
-    pub errors: usize,
-    pub duration_ms: u64,
-    pub failed_nodeids: Vec<String>,
-    pub output_snippet: String,
-    pub updated_unix_ms: u64,
-    pub source: String,
-    #[serde(default)]
-    pub environment_hash: String,
-    #[serde(default)]
-    pub tctx_version: String,
-    #[serde(default)]
-    pub runner_mode: String,
-    #[serde(default)]
-    pub started_unix_ms: u64,
-    #[serde(default)]
-    pub completed_unix_ms: u64,
-    #[serde(default)]
-    pub dynamic_dependencies: Vec<String>,
-    #[serde(default)]
-    pub dynamic_dependencies_complete: bool,
-    #[serde(default)]
-    pub node_results: BTreeMap<String, CachedNodeResult>,
-    #[serde(default)]
-    pub external_module_stamps: BTreeMap<String, ExternalModuleStamp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-}
-
-impl CachedTestRecord {
-    pub fn external_modules_fresh(&self) -> bool {
-        self.external_module_stamps.iter().all(|(lex_path, entry)| {
-            let Ok(canon) = std::fs::canonicalize(Path::new(lex_path)) else {
-                return false;
-            };
-            if canon != Path::new(&entry.resolved_path) {
-                return false;
-            }
-            let live = if entry.is_dir {
-                dir_stamp_for_freshness(&canon)
-            } else {
-                crate::ast_graph::file_stamp(&canon)
-            };
-            live.as_ref() == Some(&entry.stamp)
-        })
-    }
-}
-
-fn current_cache_schema() -> u32 {
-    7
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InvocationPattern {
-    pub test_files: Vec<String>,
-    pub frequency: u64,
-    pub last_used_unix_ms: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RootCache {
-    #[serde(default = "current_cache_schema")]
-    pub schema: u32,
-    pub root: PathBuf,
-    pub latest_by_file: BTreeMap<String, CachedTestRecord>,
-    pub history_by_key: BTreeMap<String, CachedTestRecord>,
-    pub total_saved_ms: u64,
-    pub total_cache_hits: u64,
-    pub total_delta_runs: u64,
-    pub total_background_runs: u64,
-    #[serde(default)]
-    pub quarantined_keys: BTreeSet<String>,
-    #[serde(default)]
-    pub persistence_error: Option<String>,
-    #[serde(default)]
-    pub invocation_patterns: BTreeMap<String, InvocationPattern>,
-    #[serde(skip)]
-    pending_events: Vec<CacheWalEvent>,
-    #[serde(default)]
-    wal_sequence: u64,
-    /// Highest WAL sequence of a `Reset` (full invalidation) applied to this cache.
-    #[serde(default)]
-    last_reset_seq: u64,
-    /// Highest WAL sequence of an `InvalidateFile` per test file, used during cross-process
-    /// rebasing to block stale pre-invalidation upserts without dropping concurrent writes to
-    /// unrelated test files.
-    #[serde(default)]
-    last_file_invalidation_seq: BTreeMap<String, u64>,
-    #[serde(skip)]
-    wal_valid_bytes: u64,
-    #[serde(skip)]
-    wal_needs_repair: bool,
-    #[serde(skip)]
-    wal_needs_newline: bool,
-    #[serde(skip)]
-    wal_read_capped: bool,
-    #[serde(skip)]
-    last_snapshot_stamp: Option<(u64, i64, i64)>,
-    #[serde(skip)]
-    last_wal_stamp: Option<(u64, i64, i64)>,
-    #[serde(skip)]
-    cached_memory_bytes: Option<usize>,
-    #[serde(skip)]
-    last_saved_metrics: (u64, u64, u64, u64),
-    #[serde(skip)]
-    pending_invocation_idx: std::collections::HashMap<String, usize>,
-    #[serde(skip)]
-    configured_max_cached_results: usize,
-    #[serde(skip)]
-    configured_max_cache_bytes: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case")]
-enum CacheWalEvent {
-    Upsert {
-        record: Box<CachedTestRecord>,
-    },
-    InvalidateFile {
-        test_file: String,
-    },
-    Reset,
-    RemoveKey {
-        key: String,
-    },
-    Quarantine {
-        key: String,
-    },
-    Metrics {
-        total_saved_ms: u64,
-        total_cache_hits: u64,
-        total_delta_runs: u64,
-        total_background_runs: u64,
-    },
-    Invocation {
-        key: String,
-        pattern: InvocationPattern,
-    },
-}
-
-pub struct PendingWalFlush {
-    root: PathBuf,
-    events: Vec<CacheWalEvent>,
-    wal_sequence: u64,
-    wal_valid_bytes: u64,
-    wal_needs_repair: bool,
-    last_snapshot_stamp: Option<(u64, i64, i64)>,
-    base_metrics: (u64, u64, u64, u64),
-    max_cached_results: usize,
-    max_cache_bytes: usize,
-}
-
-pub struct WalFlushOutcome {
-    wal_sequence: u64,
-    wal_valid_bytes: u64,
-    last_snapshot_stamp: Option<(u64, i64, i64)>,
-    last_wal_stamp: Option<(u64, i64, i64)>,
-    base_metrics: (u64, u64, u64, u64),
-    rebased_cache: Option<Box<RootCache>>,
-    compaction_error: Option<String>,
-}
-
-impl PendingWalFlush {
-    /// Performs file locking, WAL append, fsync, and optional compaction completely outside `RootState`.
-    pub fn flush(&self) -> Result<WalFlushOutcome> {
-        let wal_path = RootCache::wal_path(&self.root)?;
-        let lock_path = RootCache::lock_path(&self.root)?;
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)?;
-        lock_file.lock_exclusive()?;
-        let disk_wal_len = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-        let disk_snap_stamp = RootCache::snapshot_stamp(&self.root);
-
-        if self.wal_needs_repair
-            || disk_wal_len != self.wal_valid_bytes
-            || disk_snap_stamp != self.last_snapshot_stamp
-        {
-            let mut durable = RootCache::load_unlocked_with_limits(
-                &self.root,
-                self.max_cached_results,
-                self.max_cache_bytes,
-            );
-            if durable.persistence_error.as_deref() == Some("CACHE_SNAPSHOT_UNREADABLE_OR_OVERSIZE")
-                || durable.wal_read_capped
-            {
-                return Err(crate::invalid(
-                    "CACHE_FAIL_CLOSED: refusing to overwrite snapshot or truncate WAL",
-                )
-                .into());
-            }
-            // Reconcile pending local events onto the newer durable state: ALWAYS detect and
-            // emit flaky-outcome Quarantine BEFORE dropping upserts superseded by a newer
-            // external `Reset` or `InvalidateFile` (while preserving concurrent writes to
-            // unrelated test files).
-            let events_to_write = RootCache::reconcile_pending_onto_durable(
-                &mut durable,
-                self.events.clone(),
-                self.wal_sequence,
-            );
-            // Enforce configured policy limits on merged state so concurrent writers cannot exceed bounds
-            let limit_policy = MemoryPolicy {
-                max_cached_results: self.max_cached_results,
-                max_cache_bytes: self.max_cache_bytes,
-                ..MemoryPolicy::default()
-            };
-            let current_bytes = durable.estimated_bytes();
-            if durable.history_by_key.len() > limit_policy.max_cached_results
-                || current_bytes > limit_policy.max_cache_bytes
-            {
-                let evicted_bytes = durable.evict_to_bounds(current_bytes, &limit_policy, false);
-                durable.cached_memory_bytes = Some(evicted_bytes);
-            }
-            durable.pending_events = events_to_write;
-            // Already hold lock_file; write WAL directly
-            let mut options = std::fs::OpenOptions::new();
-            options.create(true).read(true).write(true);
-            let mut wal = options.mode(0o600).open(&wal_path)?;
-            if durable.wal_needs_repair {
-                wal.set_len(durable.wal_valid_bytes)?;
-                if durable.wal_needs_newline && durable.wal_valid_bytes > 0 {
-                    wal.seek(std::io::SeekFrom::End(0))?;
-                    wal.write_all(b"\n")?;
-                }
-                wal.sync_data()?;
-            }
-            durable.wal_needs_repair = false;
-            durable.wal_needs_newline = false;
-            wal.seek(std::io::SeekFrom::End(0))?;
-            let wal_start_pos = wal.stream_position()?;
-            let mut next_sequence = durable.wal_sequence.saturating_add(1);
-            let write_res: Result<()> = (|| {
-                {
-                    let mut writer = BufWriter::with_capacity(64 * 1024, &mut wal);
-                    for event in &durable.pending_events {
-                        let event_bytes = serde_json::to_vec(event)?;
-                        let checksum = sha256_hex(&event_bytes);
-                        write!(
-                            writer,
-                            "{{\"sequence\":{next_sequence},\"checksum\":\"{checksum}\",\"event\":"
-                        )?;
-                        writer.write_all(&event_bytes)?;
-                        writer.write_all(b"}\n")?;
-                        next_sequence = next_sequence.saturating_add(1);
-                    }
-                    writer.flush()?;
-                }
-                wal.sync_data()?;
-                Ok(())
-            })();
-            if write_res.is_ok() {
-                let mut seq_cursor = durable.wal_sequence.saturating_add(1);
-                for event in &durable.pending_events {
-                    match event {
-                        CacheWalEvent::Reset => {
-                            durable.last_reset_seq = durable.last_reset_seq.max(seq_cursor);
-                            durable.last_file_invalidation_seq.clear();
-                        }
-                        CacheWalEvent::InvalidateFile { test_file } => {
-                            let slot = durable
-                                .last_file_invalidation_seq
-                                .entry(test_file.clone())
-                                .or_insert(0);
-                            *slot = (*slot).max(seq_cursor);
-                        }
-                        _ => {}
-                    }
-                    seq_cursor = seq_cursor.saturating_add(1);
-                }
-            }
-            if let Err(err) = write_res {
-                // Roll back any partially written or unsynced bytes so a retry cannot duplicate events
-                // after another writer's invalidation; if rollback itself fails, fail closed.
-                if wal.set_len(wal_start_pos).is_err() || wal.sync_data().is_err() {
-                    return Err(crate::invalid(format!(
-                        "CACHE_FAIL_CLOSED: WAL write/sync failed and rollback failed: {err}"
-                    ))
-                    .into());
-                }
-                return Err(err);
-            }
-            durable.wal_sequence = next_sequence.saturating_sub(1);
-            durable.wal_valid_bytes = wal.stream_position()?;
-            durable.pending_events.clear();
-            durable.pending_invocation_idx.clear();
-            // WAL events are already durably synced; if post-sync compaction fails, never return Err
-            // (which would cause `restore_failed_flush` to re-append already-committed events).
-            let compaction_error = if durable.wal_valid_bytes > 4 * 1024 * 1024 {
-                durable
-                    .compact_snapshot(&wal_path)
-                    .err()
-                    .map(|e| e.to_string())
-            } else {
-                None
-            };
-            durable.last_saved_metrics = (
-                durable.total_saved_ms,
-                durable.total_cache_hits,
-                durable.total_delta_runs,
-                durable.total_background_runs,
-            );
-            return Ok(WalFlushOutcome {
-                wal_sequence: durable.wal_sequence,
-                wal_valid_bytes: durable.wal_valid_bytes,
-                last_snapshot_stamp: durable.last_snapshot_stamp,
-                last_wal_stamp: RootCache::wal_stamp(&self.root),
-                base_metrics: self.base_metrics,
-                rebased_cache: Some(Box::new(durable)),
-                compaction_error,
-            });
-        }
-
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).read(true).write(true);
-        let mut wal = options.mode(0o600).open(&wal_path)?;
-        wal.seek(std::io::SeekFrom::End(0))?;
-        let wal_start_pos = wal.stream_position()?;
-        let mut next_sequence = self.wal_sequence.saturating_add(1);
-        let write_res: Result<()> = (|| {
-            {
-                let mut writer = BufWriter::with_capacity(64 * 1024, &mut wal);
-                for event in &self.events {
-                    let event_bytes = serde_json::to_vec(event)?;
-                    let checksum = sha256_hex(&event_bytes);
-                    write!(
-                        writer,
-                        "{{\"sequence\":{next_sequence},\"checksum\":\"{checksum}\",\"event\":"
-                    )?;
-                    writer.write_all(&event_bytes)?;
-                    writer.write_all(b"}\n")?;
-                    next_sequence = next_sequence.saturating_add(1);
-                }
-                writer.flush()?;
-            }
-            wal.sync_data()?;
-            Ok(())
-        })();
-        if let Err(err) = write_res {
-            if wal.set_len(wal_start_pos).is_err() || wal.sync_data().is_err() {
-                return Err(crate::invalid(format!(
-                    "CACHE_FAIL_CLOSED: WAL write/sync failed and rollback failed: {err}"
-                ))
-                .into());
-            }
-            return Err(err);
-        }
-        let new_seq = next_sequence.saturating_sub(1);
-        let new_pos = wal.stream_position()?;
-        if new_pos > 4 * 1024 * 1024 {
-            let mut durable = RootCache::load_unlocked_with_limits(
-                &self.root,
-                self.max_cached_results,
-                self.max_cache_bytes,
-            );
-            // WAL append is already committed on disk; if reload shows fail-closed or compaction fails,
-            // advance WAL state without re-queueing committed events, and surface the error.
-            if durable.is_fail_closed() {
-                return Ok(WalFlushOutcome {
-                    wal_sequence: new_seq,
-                    wal_valid_bytes: new_pos,
-                    last_snapshot_stamp: self.last_snapshot_stamp,
-                    last_wal_stamp: RootCache::wal_stamp(&self.root),
-                    base_metrics: self.base_metrics,
-                    rebased_cache: None,
-                    compaction_error: Some(
-                        "CACHE_FAIL_CLOSED: refusing to overwrite snapshot or truncate WAL"
-                            .to_string(),
-                    ),
-                });
-            }
-            if let Err(err) = durable.compact_snapshot(&wal_path) {
-                return Ok(WalFlushOutcome {
-                    wal_sequence: new_seq,
-                    wal_valid_bytes: new_pos,
-                    last_snapshot_stamp: self.last_snapshot_stamp,
-                    last_wal_stamp: RootCache::wal_stamp(&self.root),
-                    base_metrics: self.base_metrics,
-                    rebased_cache: None,
-                    compaction_error: Some(err.to_string()),
-                });
-            }
-            return Ok(WalFlushOutcome {
-                wal_sequence: durable.wal_sequence,
-                wal_valid_bytes: durable.wal_valid_bytes,
-                last_snapshot_stamp: durable.last_snapshot_stamp,
-                last_wal_stamp: RootCache::wal_stamp(&self.root),
-                base_metrics: self.base_metrics,
-                rebased_cache: Some(Box::new(durable)),
-                compaction_error: None,
-            });
-        }
-        Ok(WalFlushOutcome {
-            wal_sequence: new_seq,
-            wal_valid_bytes: new_pos,
-            last_snapshot_stamp: self.last_snapshot_stamp,
-            last_wal_stamp: RootCache::wal_stamp(&self.root),
-            base_metrics: self.base_metrics,
-            rebased_cache: None,
-            compaction_error: None,
-        })
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct CacheWalEnvelope {
-    sequence: u64,
-    checksum: String,
-    event: CacheWalEvent,
-}
-
-fn read_line_capped<R: BufRead>(
-    reader: &mut R,
-    out: &mut String,
-    max_bytes: usize,
-) -> std::io::Result<usize> {
-    out.clear();
-    let mut raw = Vec::new();
-    let mut total = 0usize;
-    loop {
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
-            break;
-        }
-        let buf_len = buf.len();
-        let remaining = max_bytes.saturating_sub(total);
-        if let Some(nl) = memchr::memchr(b'\n', buf) {
-            let take = nl + 1;
-            if take > remaining {
-                reader.consume(remaining.min(buf_len));
-                total = max_bytes.saturating_add(1);
-                return Ok(total);
-            }
-            raw.extend_from_slice(&buf[..take]);
-            reader.consume(take);
-            total = total.saturating_add(take);
-            break;
-        }
-        if buf_len > remaining {
-            reader.consume(remaining.min(buf_len));
-            total = max_bytes.saturating_add(1);
-            return Ok(total);
-        }
-        raw.extend_from_slice(buf);
-        reader.consume(buf_len);
-        total = total.saturating_add(buf_len);
-    }
-    match String::from_utf8(raw) {
-        Ok(s) => {
-            *out = s;
-            Ok(total)
-        }
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "WAL line contains invalid UTF-8",
-        )),
-    }
-}
+use super::*;
 
 impl RootCache {
     pub fn new(root: PathBuf) -> Self {
@@ -568,7 +33,7 @@ impl RootCache {
         }
     }
 
-    fn is_fail_closed(&self) -> bool {
+    pub(super) fn is_fail_closed(&self) -> bool {
         self.wal_read_capped
             || self.persistence_error.as_deref().is_some_and(|err| {
                 err == "CACHE_SNAPSHOT_UNREADABLE_OR_OVERSIZE"
@@ -576,7 +41,7 @@ impl RootCache {
             })
     }
 
-    fn snapshot_read_cap_bytes(max_cache_bytes: usize) -> u64 {
+    pub(super) fn snapshot_read_cap_bytes(max_cache_bytes: usize) -> u64 {
         // JSON escaping can expand strings up to 6x plus structural overhead; 8x (>= 256 MiB)
         // guarantees any policy-compliant self-written snapshot stays strictly below its read cap.
         (max_cache_bytes as u64)
@@ -584,7 +49,7 @@ impl RootCache {
             .max(256 * 1024 * 1024)
     }
 
-    fn effective_limits(&self) -> (usize, usize) {
+    pub(super) fn effective_limits(&self) -> (usize, usize) {
         let default_policy = MemoryPolicy::default();
         let max_results = if self.configured_max_cached_results > 0 {
             self.configured_max_cached_results
@@ -599,17 +64,17 @@ impl RootCache {
         (max_results, max_bytes)
     }
 
-    fn key(test_file: &str, dep_hash: &str) -> String {
+    pub(super) fn key(test_file: &str, dep_hash: &str) -> String {
         format!("{test_file}@{dep_hash}")
     }
 
-    fn snapshot_stamp(root: &Path) -> Option<(u64, i64, i64)> {
+    pub(super) fn snapshot_stamp(root: &Path) -> Option<(u64, i64, i64)> {
         let path = Self::storage_path(root).ok()?;
         let meta = std::fs::metadata(path).ok()?;
         Some((meta.len(), meta.mtime(), meta.mtime_nsec()))
     }
 
-    fn wal_stamp(root: &Path) -> Option<(u64, i64, i64)> {
+    pub(super) fn wal_stamp(root: &Path) -> Option<(u64, i64, i64)> {
         let path = Self::wal_path(root).ok()?;
         let meta = std::fs::metadata(path).ok()?;
         Some((meta.len(), meta.mtime(), meta.mtime_nsec()))
@@ -628,7 +93,7 @@ impl RootCache {
     /// 2. Discards stale pre-invalidation `Upsert` events ONLY when a newer external `Reset` or
     ///    matching `InvalidateFile` (`seq > prev_wal_seq`) invalidated that test file, preserving
     ///    legitimate concurrent writes to unrelated files.
-    fn reconcile_pending_onto_durable(
+    pub(super) fn reconcile_pending_onto_durable(
         durable: &mut RootCache,
         local_pending: Vec<CacheWalEvent>,
         prev_wal_seq: u64,
@@ -856,7 +321,7 @@ impl RootCache {
         self.cached_memory_bytes = Some(current_bytes);
     }
 
-    fn evict_to_bounds(
+    pub(super) fn evict_to_bounds(
         &mut self,
         mut current_bytes: usize,
         policy: &MemoryPolicy,
@@ -1007,7 +472,7 @@ impl RootCache {
         self.trim_invocation_patterns();
     }
 
-    fn trim_invocation_patterns(&mut self) {
+    pub(super) fn trim_invocation_patterns(&mut self) {
         while self.invocation_patterns.len() > 128 {
             let Some(oldest) = self
                 .invocation_patterns
@@ -1063,17 +528,17 @@ impl RootCache {
             .any(|pattern| pattern.test_files.iter().any(|path| path == test_file))
     }
 
-    fn storage_path(root: &Path) -> Result<PathBuf> {
+    pub(super) fn storage_path(root: &Path) -> Result<PathBuf> {
         let root_hash = sha256_hex(root.to_string_lossy().as_bytes());
         Ok(catalog::cache_dir()?.join(format!("{root_hash}.json")))
     }
 
-    fn lock_path(root: &Path) -> Result<PathBuf> {
+    pub(super) fn lock_path(root: &Path) -> Result<PathBuf> {
         let root_hash = sha256_hex(root.to_string_lossy().as_bytes());
         Ok(catalog::cache_dir()?.join(format!("{root_hash}.lock")))
     }
 
-    fn wal_path(root: &Path) -> Result<PathBuf> {
+    pub(super) fn wal_path(root: &Path) -> Result<PathBuf> {
         let root_hash = sha256_hex(root.to_string_lossy().as_bytes());
         Ok(
             catalog::cache_dir()?
@@ -1121,7 +586,7 @@ impl RootCache {
         Self::load_unlocked_with_limits(root, max_cached_results, max_cache_bytes)
     }
 
-    fn load_unlocked_with_limits(
+    pub(super) fn load_unlocked_with_limits(
         root: &Path,
         max_cached_results: usize,
         max_cache_bytes: usize,
@@ -1589,11 +1054,11 @@ impl RootCache {
         self.persistence_error = Some(error);
     }
 
-    fn apply_wal_event(&mut self, event: CacheWalEvent) {
+    pub(super) fn apply_wal_event(&mut self, event: CacheWalEvent) {
         self.apply_wal_event_with_seq(event, 0);
     }
 
-    fn apply_wal_event_with_seq(&mut self, event: CacheWalEvent, seq: u64) {
+    pub(super) fn apply_wal_event_with_seq(&mut self, event: CacheWalEvent, seq: u64) {
         self.cached_memory_bytes = None;
         match event {
             CacheWalEvent::Upsert { record } => {
@@ -1673,7 +1138,7 @@ impl RootCache {
         }
     }
 
-    fn compact_snapshot(&mut self, wal_path: &Path) -> Result<()> {
+    pub(super) fn compact_snapshot(&mut self, wal_path: &Path) -> Result<()> {
         let (_, max_bytes) = self.effective_limits();
         let max_snapshot_bytes = Self::snapshot_read_cap_bytes(max_bytes);
         let path = Self::storage_path(&self.root)?;
@@ -1965,7 +1430,7 @@ impl RootCache {
     }
 }
 
-fn record_estimated_bytes(record: &CachedTestRecord) -> usize {
+pub(super) fn record_estimated_bytes(record: &CachedTestRecord) -> usize {
     record.test_file.len()
         + record.dep_hash.len()
         + record.output_snippet.len()
@@ -1995,7 +1460,7 @@ fn record_estimated_bytes(record: &CachedTestRecord) -> usize {
         + std::mem::size_of::<CachedTestRecord>()
 }
 
-fn truncate_utf8(value: &mut String, max_bytes: usize) {
+pub(super) fn truncate_utf8(value: &mut String, max_bytes: usize) {
     if value.len() <= max_bytes {
         return;
     }
@@ -2013,242 +1478,4 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Mutex, OnceLock};
 
-    fn record(outcome: TestOutcome) -> CachedTestRecord {
-        CachedTestRecord {
-            test_file: "tests/test_one.py".to_string(),
-            dep_hash: "same-hash".to_string(),
-            outcome,
-            passed: usize::from(outcome == TestOutcome::Passed),
-            failed: usize::from(outcome == TestOutcome::Failed),
-            skipped: usize::from(outcome == TestOutcome::Skipped),
-            errors: usize::from(outcome == TestOutcome::Error),
-            duration_ms: 10,
-            failed_nodeids: Vec::new(),
-            output_snippet: String::new(),
-            updated_unix_ms: now_unix_ms(),
-            source: "test".to_string(),
-            environment_hash: "env".to_string(),
-            tctx_version: env!("CARGO_PKG_VERSION").to_string(),
-            runner_mode: "zygote".to_string(),
-            started_unix_ms: 1,
-            completed_unix_ms: 2,
-            dynamic_dependencies: Vec::new(),
-            dynamic_dependencies_complete: true,
-            node_results: BTreeMap::new(),
-            external_module_stamps: BTreeMap::new(),
-            exit_code: None,
-        }
-    }
-
-    #[test]
-    fn quarantines_flaky_same_hash_and_never_caches_all_skipped_file() {
-        let root = tempfile::tempdir().unwrap();
-        let mut cache = RootCache::new(root.path().to_path_buf());
-        let policy = MemoryPolicy::default();
-        cache.insert(record(TestOutcome::Passed), &policy);
-        assert!(
-            cache
-                .get_matching("tests/test_one.py", "same-hash")
-                .is_some()
-        );
-        cache.insert(record(TestOutcome::Failed), &policy);
-        assert!(
-            cache
-                .get_matching("tests/test_one.py", "same-hash")
-                .is_none()
-        );
-
-        let mut skipped = record(TestOutcome::Skipped);
-        skipped.dep_hash = "skip-hash".to_string();
-        cache.insert(skipped, &policy);
-        assert!(
-            cache
-                .get_matching("tests/test_one.py", "skip-hash")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn wal_recovers_valid_prefix_from_truncated_tail_and_compacts_atomically() {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
-        let state = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(
-            state.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .unwrap();
-        let previous = std::env::var_os("TCTX_HOME");
-        unsafe {
-            std::env::set_var("TCTX_HOME", state.path());
-        }
-        let root = state.path().join("project");
-        std::fs::create_dir_all(&root).unwrap();
-
-        let mut cache = RootCache::new(root.clone());
-        cache.insert(record(TestOutcome::Passed), &MemoryPolicy::default());
-        cache.save().unwrap();
-        let wal_path = RootCache::wal_path(&root).unwrap();
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&wal_path)
-            .unwrap()
-            .write_all(b"{\"sequence\":")
-            .unwrap();
-
-        let mut loaded = RootCache::load_or_new(&root);
-        assert!(
-            loaded
-                .get_matching("tests/test_one.py", "same-hash")
-                .is_some()
-        );
-        assert_eq!(
-            loaded.persistence_error.as_deref(),
-            Some("CACHE_WAL_TRUNCATED_TAIL")
-        );
-
-        let mut second = record(TestOutcome::Passed);
-        second.test_file = "tests/test_two.py".to_string();
-        second.dep_hash = "second-hash".to_string();
-        loaded.insert(second, &MemoryPolicy::default());
-        loaded.save().unwrap();
-        let repaired = RootCache::load_or_new(&root);
-        assert!(
-            repaired
-                .get_matching("tests/test_one.py", "same-hash")
-                .is_some()
-        );
-        assert!(
-            repaired
-                .get_matching("tests/test_two.py", "second-hash")
-                .is_some()
-        );
-
-        let mut concurrent_a = RootCache::load_or_new(&root);
-        let mut concurrent_b = RootCache::load_or_new(&root);
-        let mut third = record(TestOutcome::Passed);
-        third.test_file = "tests/test_three.py".to_string();
-        third.dep_hash = "third-hash".to_string();
-        concurrent_a.insert(third, &MemoryPolicy::default());
-        let mut fourth = record(TestOutcome::Passed);
-        fourth.test_file = "tests/test_four.py".to_string();
-        fourth.dep_hash = "fourth-hash".to_string();
-        concurrent_b.insert(fourth, &MemoryPolicy::default());
-        concurrent_a.save().unwrap();
-        concurrent_b.save().unwrap();
-        concurrent_a.record_invocation(&["tests/test_three.py".to_string()]);
-        concurrent_a.save().unwrap();
-        concurrent_a.compact_snapshot(&wal_path).unwrap();
-        let mut merged = RootCache::load_or_new(&root);
-        assert!(
-            merged
-                .get_matching("tests/test_three.py", "third-hash")
-                .is_some()
-        );
-        assert!(
-            merged
-                .get_matching("tests/test_four.py", "fourth-hash")
-                .is_some()
-        );
-
-        for index in 0..200 {
-            merged.record_invocation(&[format!("tests/test_pattern_{index}.py")]);
-        }
-        merged.save().unwrap();
-        let bounded = RootCache::load_or_new(&root);
-        assert!(bounded.invocation_patterns.len() <= 128);
-
-        merged.compact_snapshot(&wal_path).unwrap();
-        assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
-        assert!(RootCache::storage_path(&root).unwrap().is_file());
-
-        unsafe {
-            if let Some(value) = previous {
-                std::env::set_var("TCTX_HOME", value);
-            } else {
-                std::env::remove_var("TCTX_HOME");
-            }
-        }
-    }
-
-    #[test]
-    fn enforces_record_and_total_memory_bounds() {
-        let root = tempfile::tempdir().unwrap();
-        let mut cache = RootCache::new(root.path().to_path_buf());
-        let policy = MemoryPolicy {
-            max_cache_bytes: 32 * 1024,
-            max_node_results_per_file: 4,
-            ..MemoryPolicy::default()
-        };
-        for index in 0..20 {
-            let mut item = record(TestOutcome::Failed);
-            item.test_file = format!("tests/test_{index}.py");
-            item.dep_hash = format!("hash-{index}");
-            item.output_snippet = "실패".repeat(10_000);
-            for node_index in 0..20 {
-                let nodeid = format!("tests/test_{index}.py::test_{node_index}");
-                item.node_results.insert(
-                    nodeid.clone(),
-                    CachedNodeResult {
-                        nodeid,
-                        outcome: TestOutcome::Failed,
-                        duration_ms: 1,
-                        output_snippet: "trace".repeat(2_000),
-                    },
-                );
-            }
-            cache.insert(item, &policy);
-        }
-        assert!(cache.estimated_bytes() <= policy.max_cache_bytes);
-        assert!(cache.latest_by_file.values().all(|record| {
-            record.node_results.len() <= 4
-                && record.output_snippet.len() <= 8 * 1024
-                && record
-                    .node_results
-                    .values()
-                    .all(|node| node.output_snippet.len() <= 2 * 1024)
-        }));
-    }
-
-    #[test]
-    fn learns_bounded_invocation_patterns_and_ranks_affected_tests() {
-        let root = tempfile::tempdir().unwrap();
-        let mut cache = RootCache::new(root.path().to_path_buf());
-        cache.record_invocation(&["tests/test_recent.py".to_string()]);
-        for _ in 0..3 {
-            cache.record_invocation(&["tests/test_frequent.py".to_string()]);
-        }
-        let ranked = cache.predicted_affected_tests(&[
-            "tests/test_other.py".to_string(),
-            "tests/test_recent.py".to_string(),
-            "tests/test_frequent.py".to_string(),
-        ]);
-        assert_eq!(
-            ranked,
-            vec![
-                "tests/test_frequent.py".to_string(),
-                "tests/test_recent.py".to_string()
-            ]
-        );
-        assert!(cache.was_invoked("tests/test_frequent.py"));
-        assert!(!cache.was_invoked("tests/test_other.py"));
-
-        for index in 0..200 {
-            cache.record_invocation(&[format!("tests/test_pattern_{index}.py")]);
-        }
-        assert!(cache.invocation_patterns.len() <= 128);
-        assert!(
-            cache
-                .pending_events
-                .iter()
-                .filter(|event| matches!(event, CacheWalEvent::Invocation { .. }))
-                .count()
-                <= 128
-        );
-    }
-}

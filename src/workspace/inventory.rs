@@ -1,16 +1,4 @@
-use crate::exclusion_policy::{is_excluded_dir_name, is_excluded_rel_path};
-use crate::policy::MemoryPolicy;
-use crate::{Result, invalid};
-use globset::{Glob, GlobSet, GlobSetBuilder};
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
-use std::os::unix::process::CommandExt;
-use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::{Duration, Instant};
+use super::*;
 
 pub const PYTEST_CONFIG_FILES: &[&str] = &[
     "pyproject.toml",
@@ -101,16 +89,6 @@ pub const DATA_FILE_EXTENSIONS: &[&str] = &[
     ".stylus", ".svg", ".mdx", ".html",
 ];
 
-#[derive(Clone, Debug)]
-struct GitignoreMatcher {
-    ignore: GlobSet,
-    ignore_ranks: Vec<usize>,
-    dir_only_ignore: GlobSet,
-    dir_only_ignore_ranks: Vec<usize>,
-    allow: GlobSet,
-    allow_ranks: Vec<usize>,
-    allow_ancestors: BTreeSet<PathBuf>,
-}
 
 #[derive(Clone, Debug)]
 pub struct Workspace {
@@ -119,222 +97,11 @@ pub struct Workspace {
     pub globs: Vec<String>,
     pub excludes: Vec<String>,
     pub default_excludes: bool,
-    include_matcher: GlobSet,
-    exclude_matcher: GlobSet,
-    gitignore: GitignoreMatcher,
+    pub(super) include_matcher: GlobSet,
+    pub(super) exclude_matcher: GlobSet,
+    pub(super) gitignore: GitignoreMatcher,
 }
 
-fn compile_root_gitignore(root: &Path, enabled: bool) -> GitignoreMatcher {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let empty = || GitignoreMatcher {
-        ignore: GlobSetBuilder::new().build().unwrap_or_default(),
-        ignore_ranks: Vec::new(),
-        dir_only_ignore: GlobSetBuilder::new().build().unwrap_or_default(),
-        dir_only_ignore_ranks: Vec::new(),
-        allow: GlobSetBuilder::new().build().unwrap_or_default(),
-        allow_ranks: Vec::new(),
-        allow_ancestors: BTreeSet::new(),
-    };
-    if !enabled {
-        return empty();
-    }
-    type GitignoreCacheKey = (PathBuf, Option<crate::ast_graph::FileStamp>);
-    static GITIGNORE_CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, (GitignoreCacheKey, GitignoreMatcher)>>,
-    > = std::sync::OnceLock::new();
-    let path = root.join(".gitignore");
-    let stamp = crate::ast_graph::file_stamp(&path);
-    let key = (path.clone(), stamp);
-    let cache =
-        GITIGNORE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some((cached_key, matcher)) = cache
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(root)
-        && *cached_key == key
-    {
-        return matcher.clone();
-    }
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)
-    {
-        Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let m = empty();
-            let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
-            if guard.len() > 256 {
-                guard.clear();
-            }
-            guard.insert(root.to_path_buf(), (key, m.clone()));
-            return m;
-        }
-        Err(_) => {
-            // Do not cache transient open errors (e.g., EACCES/EMFILE) as an empty matcher
-            return empty();
-        }
-    };
-    let mut raw_bytes = Vec::new();
-    if file.take(256 * 1024).read_to_end(&mut raw_bytes).is_err() {
-        return empty();
-    }
-    let compiled = compile_root_gitignore_from_bytes(&raw_bytes, empty);
-    let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
-    if guard.len() > 256 {
-        guard.clear();
-    }
-    guard.insert(root.to_path_buf(), (key, compiled.clone()));
-    compiled
-}
-
-fn compile_root_gitignore_from_bytes(
-    raw_bytes: &[u8],
-    empty: fn() -> GitignoreMatcher,
-) -> GitignoreMatcher {
-    let text = String::from_utf8_lossy(raw_bytes);
-    let mut ignore_builder = GlobSetBuilder::new();
-    let mut ignore_ranks = Vec::new();
-    let mut dir_only_builder = GlobSetBuilder::new();
-    let mut dir_only_ranks = Vec::new();
-    let mut allow_builder = GlobSetBuilder::new();
-    let mut allow_ranks = Vec::new();
-    let mut allow_ancestors = BTreeSet::new();
-
-    for (line_idx, raw_line) in text.lines().enumerate() {
-        let line = raw_line.trim_end_matches('\r');
-        let trimmed_start = line.trim_start();
-        if trimmed_start.is_empty() || trimmed_start.starts_with('#') {
-            continue;
-        }
-        let (negated, rest) = if let Some(after_bang) = line.strip_prefix('!') {
-            (true, after_bang)
-        } else if let Some(escaped) = line.strip_prefix("\\!") {
-            (false, escaped)
-        } else if let Some(escaped_hash) = line.strip_prefix("\\#") {
-            (false, escaped_hash)
-        } else {
-            (false, line)
-        };
-        let raw_trimmed = rest.trim();
-        let dir_only = raw_trimmed.ends_with('/');
-        let cleaned = raw_trimmed.trim_end_matches('/');
-        if cleaned.is_empty() || cleaned == "." || cleaned == "**" {
-            continue;
-        }
-        let anchored = cleaned.starts_with('/') || cleaned.contains('/');
-        let base = cleaned.trim_start_matches('/');
-        if base.is_empty() {
-            continue;
-        }
-        let build_git_glob = |pat: &str| {
-            globset::GlobBuilder::new(pat)
-                .literal_separator(true)
-                .build()
-                .ok()
-        };
-        if negated {
-            let mut cur = Path::new(base).parent();
-            while let Some(anc) = cur {
-                if anc.as_os_str().is_empty() {
-                    break;
-                }
-                let clean_anc: PathBuf = anc
-                    .components()
-                    .take_while(|c| {
-                        let s = c.as_os_str().to_string_lossy();
-                        !s.contains(['*', '?', '['])
-                    })
-                    .collect();
-                if !clean_anc.as_os_str().is_empty() {
-                    allow_ancestors.insert(clean_anc);
-                }
-                cur = anc.parent();
-            }
-            let candidates = if anchored {
-                vec![base.to_string(), format!("{base}/**")]
-            } else {
-                vec![
-                    base.to_string(),
-                    format!("**/{base}"),
-                    format!("{base}/**"),
-                    format!("**/{base}/**"),
-                ]
-            };
-            for cand in candidates {
-                if let Some(glob) = build_git_glob(&cand) {
-                    allow_builder.add(glob);
-                    allow_ranks.push(line_idx + 1);
-                }
-            }
-        } else if dir_only {
-            let self_dir_cands = if anchored {
-                vec![base.to_string()]
-            } else {
-                vec![base.to_string(), format!("**/{base}")]
-            };
-            for cand in self_dir_cands {
-                if let Some(glob) = build_git_glob(&cand) {
-                    dir_only_builder.add(glob);
-                    dir_only_ranks.push(line_idx + 1);
-                }
-            }
-            let desc_cands = if anchored {
-                vec![format!("{base}/*"), format!("{base}/**/*")]
-            } else {
-                vec![
-                    format!("{base}/*"),
-                    format!("{base}/**/*"),
-                    format!("**/{base}/*"),
-                    format!("**/{base}/**/*"),
-                ]
-            };
-            for cand in desc_cands {
-                if let Some(glob) = build_git_glob(&cand) {
-                    ignore_builder.add(glob);
-                    ignore_ranks.push(line_idx + 1);
-                }
-            }
-        } else {
-            let candidates = if anchored {
-                vec![base.to_string(), format!("{base}/**")]
-            } else {
-                vec![
-                    base.to_string(),
-                    format!("**/{base}"),
-                    format!("{base}/**"),
-                    format!("**/{base}/**"),
-                ]
-            };
-            for cand in candidates {
-                if let Some(glob) = build_git_glob(&cand) {
-                    ignore_builder.add(glob);
-                    ignore_ranks.push(line_idx + 1);
-                }
-            }
-        }
-    }
-
-    let Ok(ignore) = ignore_builder.build() else {
-        return empty();
-    };
-    let Ok(dir_only_ignore) = dir_only_builder.build() else {
-        return empty();
-    };
-    let Ok(allow) = allow_builder.build() else {
-        return empty();
-    };
-    GitignoreMatcher {
-        ignore,
-        ignore_ranks,
-        dir_only_ignore,
-        dir_only_ignore_ranks: dir_only_ranks,
-        allow,
-        allow_ranks,
-        allow_ancestors,
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Inventory {
@@ -352,7 +119,7 @@ pub struct Inventory {
     pub skipped_unreadable_dirs: usize,
 }
 
-fn split_shell_tokens(input: &str) -> Vec<String> {
+pub(super) fn split_shell_tokens(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
@@ -403,7 +170,7 @@ fn split_shell_tokens(input: &str) -> Vec<String> {
     tokens
 }
 
-fn decode_toml_basic_escape(raw: &str, i: &mut usize, out: &mut String) {
+pub(super) fn decode_toml_basic_escape(raw: &str, i: &mut usize, out: &mut String) {
     let bytes = raw.as_bytes();
     let len = bytes.len();
     if *i >= len {
@@ -469,7 +236,7 @@ fn decode_toml_basic_escape(raw: &str, i: &mut usize, out: &mut String) {
     }
 }
 
-fn parse_toml_key_segments(raw: &str) -> Vec<String> {
+pub(super) fn parse_toml_key_segments(raw: &str) -> Vec<String> {
     let mut parts = Vec::new();
     let bytes = raw.as_bytes();
     let len = bytes.len();
@@ -518,7 +285,7 @@ fn parse_toml_key_segments(raw: &str) -> Vec<String> {
     parts
 }
 
-fn split_key_value_line(line: &str) -> Option<(Vec<String>, &str)> {
+pub(super) fn split_key_value_line(line: &str) -> Option<(Vec<String>, &str)> {
     let bytes = line.as_bytes();
     let mut quote: Option<u8> = None;
     let mut escaped = false;
@@ -545,7 +312,7 @@ fn split_key_value_line(line: &str) -> Option<(Vec<String>, &str)> {
     None
 }
 
-fn is_pyproject_pytest_table(segs: &[String]) -> bool {
+pub(super) fn is_pyproject_pytest_table(segs: &[String]) -> bool {
     let refs: Vec<&str> = segs.iter().map(String::as_str).collect();
     matches!(
         refs.as_slice(),
@@ -553,7 +320,7 @@ fn is_pyproject_pytest_table(segs: &[String]) -> bool {
     )
 }
 
-fn is_pyproject_pytest_option_key(full_segs: &[String], option: &str) -> bool {
+pub(super) fn is_pyproject_pytest_option_key(full_segs: &[String], option: &str) -> bool {
     let refs: Vec<&str> = full_segs.iter().map(String::as_str).collect();
     refs == ["tool", "pytest", "ini_options", option] || refs == ["tool", "pytest", option]
 }
@@ -740,14 +507,14 @@ impl Workspace {
         self.exclude_matcher.is_match(rel) || self.is_gitignored_entry(rel, true)
     }
 
-    fn is_gitignored_dir_prunable(&self, rel: &Path) -> bool {
+    pub(super) fn is_gitignored_dir_prunable(&self, rel: &Path) -> bool {
         if self.gitignore.allow_ancestors.contains(rel) {
             return false;
         }
         self.is_gitignored_entry(rel, true)
     }
 
-    fn is_gitignored_entry(&self, rel: &Path, is_dir: bool) -> bool {
+    pub(super) fn is_gitignored_entry(&self, rel: &Path, is_dir: bool) -> bool {
         if !self.default_excludes
             || (self.gitignore.ignore_ranks.is_empty()
                 && self.gitignore.dir_only_ignore_ranks.is_empty())
@@ -849,7 +616,7 @@ impl Workspace {
         self.matches_permitted_filename_or_glob(rel, file_name)
     }
 
-    fn matches_permitted_filename_or_glob(&self, rel: &Path, file_name: &str) -> bool {
+    pub(super) fn matches_permitted_filename_or_glob(&self, rel: &Path, file_name: &str) -> bool {
         self.include_matcher.is_match(rel)
             || self.include_matcher.is_match(Path::new(file_name))
             || PYTEST_CONFIG_FILES.contains(&file_name)
@@ -1417,7 +1184,7 @@ impl Workspace {
         Ok(buf)
     }
 
-    fn effective_pytest_config(&self) -> Option<(&'static str, String)> {
+    pub(super) fn effective_pytest_config(&self) -> Option<(&'static str, String)> {
         // Pytest 9+ selects a single configuration file by precedence:
         // pytest.toml > .pytest.toml > pytest.ini > .pytest.ini > pyproject.toml ([tool.pytest.ini_options] / [tool.pytest] / dotted tool.pytest.*) > tox.ini ([pytest]) > setup.cfg ([tool:pytest])
         fn strip_line_comment(raw: &str) -> &str {
@@ -1475,7 +1242,7 @@ impl Workspace {
         None
     }
 
-    fn pytest_option_tokens(&self, option: &str) -> Vec<String> {
+    pub(super) fn pytest_option_tokens(&self, option: &str) -> Vec<String> {
         let mut values = Vec::new();
         let Some((name, text)) = self.effective_pytest_config() else {
             return values;
@@ -1751,377 +1518,4 @@ impl Workspace {
     }
 }
 
-pub fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Result<Vec<u8>> {
-    let output = run_command_with_timeout(command, timeout, 4 * 1024 * 1024)?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(invalid(format!(
-            "command failed ({}): {}",
-            output.status,
-            stderr.trim()
-        ))
-        .into());
-    }
-    Ok(output.stdout)
-}
 
-pub struct BoundedOutput {
-    pub status: std::process::ExitStatus,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub duration_ms: u64,
-    pub timed_out: bool,
-    pub structured: Option<Vec<u8>>,
-    pub cancelled: bool,
-}
-
-fn drain_bounded_interruptible(
-    mut reader: impl Read + std::os::unix::io::AsRawFd,
-    max_output_bytes: usize,
-    stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Vec<u8> {
-    let fd = reader.as_raw_fd();
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
-    let mut kept = Vec::with_capacity(max_output_bytes.min(64 * 1024));
-    let mut chunk = [0_u8; 64 * 1024];
-    let mut stop_deadline: Option<Instant> = None;
-    loop {
-        if stop_flag.load(Ordering::Acquire) {
-            let deadline = *stop_deadline.get_or_insert_with(|| Instant::now() + Duration::from_millis(250));
-            if Instant::now() >= deadline {
-                break;
-            }
-        }
-        let mut pfd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let poll_ms = if stop_deadline.is_some() { 25 } else { 50 };
-        let rc = unsafe { libc::poll(&mut pfd, 1, poll_ms) };
-        if rc < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
-        if rc == 0 {
-            continue;
-        }
-        let mut hit_eof = false;
-        loop {
-            if stop_flag.load(Ordering::Acquire) {
-                let deadline = *stop_deadline
-                    .get_or_insert_with(|| Instant::now() + Duration::from_millis(250));
-                if Instant::now() >= deadline {
-                    hit_eof = true;
-                    break;
-                }
-            }
-            match reader.read(&mut chunk) {
-                Ok(0) => {
-                    hit_eof = true;
-                    break;
-                }
-                Ok(read) => {
-                    if kept.len() < max_output_bytes {
-                        let remaining = max_output_bytes - kept.len();
-                        kept.extend_from_slice(&chunk[..read.min(remaining)]);
-                    }
-                    if stop_flag.load(Ordering::Acquire) {
-                        let deadline = *stop_deadline
-                            .get_or_insert_with(|| Instant::now() + Duration::from_millis(250));
-                        if Instant::now() >= deadline {
-                            hit_eof = true;
-                            break;
-                        }
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => {
-                    hit_eof = true;
-                    break;
-                }
-            }
-        }
-        if hit_eof || (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0) {
-            break;
-        }
-    }
-    kept
-}
-
-pub fn run_command_with_timeout(
-    command: &mut Command,
-    timeout: Duration,
-    max_output_bytes: usize,
-) -> Result<BoundedOutput> {
-    run_command_with_timeout_tracked(command, timeout, max_output_bytes, None, None)
-}
-
-pub fn run_command_with_timeout_tracked(
-    command: &mut Command,
-    timeout: Duration,
-    max_output_bytes: usize,
-    active_pgid: Option<&AtomicI32>,
-    active_pgids: Option<&Mutex<BTreeSet<i32>>>,
-) -> Result<BoundedOutput> {
-    let started = Instant::now();
-    if command.get_envs().all(|(k, _)| k != "PATH")
-        && let Some(aug_path) = crate::catalog::augmented_user_path()
-    {
-        command.env("PATH", aug_path);
-    }
-    command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    command.process_group(0);
-    #[cfg(target_os = "linux")]
-    unsafe {
-        command.pre_exec(|| {
-            let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            Ok(())
-        });
-    }
-    let mut child = command.spawn()?;
-    let pid = child.id();
-    if let Some(active) = active_pgid
-        && let Ok(pgid) = i32::try_from(pid)
-    {
-        active.store(pgid, Ordering::Release);
-    }
-    let mut already_cancelled = false;
-    if let Some(active) = active_pgids
-        && let Ok(pgid) = i32::try_from(pid)
-    {
-        let mut guard = active
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if guard.contains(&i32::MIN) {
-            already_cancelled = true;
-        } else {
-            guard.insert(pgid);
-        }
-    }
-    struct PgidReset<'a> {
-        single: Option<&'a AtomicI32>,
-        many: Option<&'a Mutex<BTreeSet<i32>>>,
-        pid: u32,
-    }
-    impl Drop for PgidReset<'_> {
-        fn drop(&mut self) {
-            if let Some(active) = self.single {
-                active.store(0, Ordering::Release);
-            }
-            if let Some(active) = self.many
-                && let Ok(pgid) = i32::try_from(self.pid)
-            {
-                active
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&pgid);
-            }
-        }
-    }
-    let _pgid_reset = PgidReset {
-        single: active_pgid,
-        many: active_pgids,
-        pid,
-    };
-    if already_cancelled
-        && let Ok(pgid) = i32::try_from(pid)
-        && pgid > 0
-    {
-        unsafe {
-            let _ = libc::kill(-pgid, libc::SIGKILL);
-        }
-        let _ = child.kill();
-    }
-    let stdout_pipe = child.stdout.take().expect("piped stdout");
-    let stderr_pipe = child.stderr.take().expect("piped stderr");
-
-    let stop_draining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_stdout = std::sync::Arc::clone(&stop_draining);
-    let stop_stderr = std::sync::Arc::clone(&stop_draining);
-    let stdout_handle =
-        std::thread::spawn(move || drain_bounded_interruptible(stdout_pipe, max_output_bytes, stop_stdout));
-    let stderr_handle =
-        std::thread::spawn(move || drain_bounded_interruptible(stderr_pipe, max_output_bytes, stop_stderr));
-
-    let mut timed_out = false;
-    let mut poll_sleep = Duration::from_micros(250);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if started.elapsed() >= timeout {
-            timed_out = true;
-            if let Ok(pgid) = i32::try_from(pid)
-                && pgid > 0
-            {
-                unsafe {
-                    let _ = libc::kill(-pgid, libc::SIGKILL);
-                }
-            }
-            let _ = child.kill();
-            break child.wait()?;
-        }
-        std::thread::sleep(poll_sleep);
-        poll_sleep = (poll_sleep * 2).min(Duration::from_millis(10));
-    };
-    // Ensure any orphaned descendant in the child's process group that inherited stdout/stderr is terminated,
-    // and bound pipe draining so even a setsid() grandchild keeping stdout/stderr open cannot hang join().
-    if let Ok(pgid) = i32::try_from(pid)
-        && pgid > 0
-    {
-        unsafe {
-            let _ = libc::kill(-pgid, libc::SIGKILL);
-        }
-    }
-    stop_draining.store(true, Ordering::Release);
-
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
-    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let cancelled = !timed_out
-        && status
-            .signal()
-            .is_some_and(|signal| matches!(signal, libc::SIGKILL | libc::SIGTERM));
-    Ok(BoundedOutput {
-        status,
-        stdout,
-        stderr,
-        duration_ms,
-        timed_out,
-        structured: None,
-        cancelled,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bounded_output_drains_excess_without_signalling_child() {
-        let mut command = Command::new("/bin/sh");
-        command.args(["-c", "head -c 1048576 /dev/zero"]);
-        let output = run_command_with_timeout(&mut command, Duration::from_secs(5), 1024).unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout.len(), 1024);
-    }
-
-    #[test]
-    fn tracked_process_group_kill_is_reported_as_cancellation() {
-        let active_pgid = std::sync::Arc::new(AtomicI32::new(0));
-        let worker_pgid = std::sync::Arc::clone(&active_pgid);
-        let handle = std::thread::spawn(move || {
-            let mut command = Command::new("/bin/sh");
-            command.args(["-c", "sleep 30"]);
-            run_command_with_timeout_tracked(
-                &mut command,
-                Duration::from_secs(35),
-                1024,
-                Some(&worker_pgid),
-                None,
-            )
-            .unwrap()
-        });
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while active_pgid.load(Ordering::Acquire) <= 0 {
-            assert!(
-                Instant::now() < deadline,
-                "child process group was not published"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let pgid = active_pgid.load(Ordering::Acquire);
-        assert_eq!(unsafe { libc::kill(-pgid, libc::SIGKILL) }, 0);
-        let output = handle.join().unwrap();
-        assert!(output.cancelled);
-        assert!(!output.timed_out);
-    }
-
-    #[test]
-    fn include_globs_limit_python_inventory_but_keep_pytest_config() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = Workspace::new(
-            root.path(),
-            vec![".".to_string()],
-            vec!["tests/**/*.py".to_string()],
-        )
-        .unwrap();
-        assert!(workspace.is_permitted_rel(Path::new("tests/unit/test_api.py")));
-        assert!(!workspace.is_permitted_rel(Path::new("src/pkg/api.py")));
-        assert!(workspace.is_permitted_rel(Path::new("pyproject.toml")));
-        assert!(workspace.is_permitted_rel(Path::new("Cargo.toml")));
-    }
-
-    #[test]
-    fn default_globs_include_rust_sources_configs_and_snapshot_data_files() {
-        let root = tempfile::tempdir().unwrap();
-        let workspace = Workspace::new(root.path(), Vec::new(), Vec::new()).unwrap();
-        assert!(workspace.is_permitted_rel(Path::new("src/lib.rs")));
-        assert!(workspace.is_permitted_rel(Path::new("tests/integration.rs")));
-        assert!(workspace.is_permitted_rel(Path::new("Cargo.toml")));
-        assert!(workspace.is_permitted_rel(Path::new("rust-toolchain.toml")));
-        assert!(workspace.is_permitted_data_rel(Path::new("snapshots/output.snap")));
-        assert!(workspace.is_permitted_data_rel(Path::new("testdata/expected.golden")));
-    }
-
-    #[test]
-    fn root_gitignore_excludes_mutable_runtime_dirs_and_honors_negation() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join(".gitignore"),
-            "workspaces/\ndata/eval/*\n!data/eval/golden_fixture.json\ndata/autonomy/x_social_state.json\n",
-        )
-        .unwrap();
-        let workspace = Workspace::new(root.path(), Vec::new(), Vec::new()).unwrap();
-        assert!(!workspace.is_permitted_rel(Path::new("workspaces/wt1/tests/test_a.py")));
-        assert!(!workspace.is_permitted_data_rel(Path::new("data/eval/live_state.json")));
-        assert!(!workspace.is_permitted_data_rel(Path::new("data/autonomy/x_social_state.json")));
-        assert!(workspace.is_permitted_data_rel(Path::new("data/eval/golden_fixture.json")));
-        assert!(workspace.is_permitted_data_rel(Path::new("config/schema.json")));
-        assert!(!workspace.is_gitignored_entry(Path::new("workspaces"), false));
-        assert!(workspace.is_gitignored_entry(Path::new("workspaces"), true));
-        assert!(workspace.is_gitignored_entry(Path::new("workspaces/wt1/a.py"), false));
-
-        // Verify deep negation (`/*` + `!/src/nested/keep.py`) is not prematurely pruned at `src/`.
-        let root2 = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root2.path().join(".gitignore"),
-            "/*\n!/src/nested/keep.py\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(root2.path().join("src/nested")).unwrap();
-        std::fs::write(root2.path().join("src/nested/keep.py"), "def ok(): pass\n").unwrap();
-        std::fs::write(root2.path().join("src/ignored.py"), "def no(): pass\n").unwrap();
-        let ws2 = Workspace::new(root2.path(), Vec::new(), Vec::new()).unwrap();
-        let inv2 = ws2.files_limited(&MemoryPolicy::default()).unwrap();
-        assert_eq!(inv2.files, vec![PathBuf::from("src/nested/keep.py")]);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_known_with_limit_rejects_intermediate_symlink_escape() {
-        let ws_dir = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::fs::write(outside.path().join("secret.py"), "SECRET = 1\n").unwrap();
-        std::os::unix::fs::symlink(outside.path(), ws_dir.path().join("linked")).unwrap();
-        std::fs::write(ws_dir.path().join("ok.py"), "OK = 1\n").unwrap();
-
-        let ws = Workspace::new(ws_dir.path(), Vec::new(), Vec::new()).unwrap();
-        assert!(ws.read_known_with_limit(Path::new("ok.py"), 1024).is_ok());
-        assert!(
-            ws.read_known_with_limit(Path::new("linked/secret.py"), 1024)
-                .is_err()
-        );
-    }
-}

@@ -43,7 +43,13 @@ def command(argv, *, cwd=None, env=None):
 def source_tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
     files = [root / "Cargo.toml", root / "Cargo.lock"]
-    files.extend(sorted((root / "src").glob("*.rs")))
+    files.extend(
+        sorted(
+            p
+            for p in (root / "src").rglob("*")
+            if p.is_file() and p.suffix in {".rs", ".py"}
+        )
+    )
     for path in files:
         relative = str(path.relative_to(root)).encode()
         data = path.read_bytes()

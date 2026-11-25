@@ -14,7 +14,13 @@ class BenchmarkTests(unittest.TestCase):
     def _source_tree_digest(self):
         digest = hashlib.sha256()
         files = [ROOT / "Cargo.toml", ROOT / "Cargo.lock"]
-        files.extend(sorted((ROOT / "src").glob("*.rs")))
+        files.extend(
+            sorted(
+                p
+                for p in (ROOT / "src").rglob("*")
+                if p.is_file() and p.suffix in {".rs", ".py"}
+            )
+        )
         for path in files:
             relative = str(path.relative_to(ROOT)).encode()
             data = path.read_bytes()
