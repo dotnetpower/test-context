@@ -220,10 +220,31 @@ export class NativeToolBridge implements vscode.Disposable {
           : undefined;
       const savedMs = typeof valRec?.saved_ms === 'number' ? valRec.saved_ms : 0;
       const cachedFiles = typeof valRec?.cached_files_count === 'number' ? valRec.cached_files_count : 0;
+      const executedFiles =
+        typeof valRec?.executed_files_count === 'number' ? valRec.executed_files_count : 0;
+      const passed = typeof valRec?.passed === 'number' ? valRec.passed : undefined;
+      const failed = typeof valRec?.failed === 'number' ? valRec.failed : undefined;
+      const skipped = typeof valRec?.skipped === 'number' ? valRec.skipped : undefined;
+      const mode = typeof valRec?.mode === 'string' ? valRec.mode : undefined;
+      const ruffIssues = Array.isArray(valRec?.ruff_diagnostics)
+        ? valRec.ruff_diagnostics.length
+        : undefined;
       const rootStillCurrent =
         this.client.generation === startGen && this.rootStateGeneration === startRootGen;
       const currentGenRoot = rootStillCurrent ? root : null;
-      this.onUsage?.({ operation: definition.operation, root: currentGenRoot, savedMs, cachedFiles });
+      this.onUsage?.({
+        operation: definition.operation,
+        root: currentGenRoot,
+        durationMs: result.trace.total_ms,
+        savedMs,
+        cachedFiles,
+        executedFiles,
+        ...(passed !== undefined ? { passed } : {}),
+        ...(failed !== undefined ? { failed } : {}),
+        ...(skipped !== undefined ? { skipped } : {}),
+        ...(mode !== undefined ? { mode } : {}),
+        ...(ruffIssues !== undefined ? { ruffIssues } : {}),
+      });
       this.output.appendLine(
         `[success] operation=${definition.operation} root=${root ?? '-'} duration=${result.trace.total_ms.toFixed(3)}ms trace=${traceId}`,
       );
@@ -273,6 +294,16 @@ export class NativeToolBridge implements vscode.Disposable {
         `[warning] trace_report_failed id=${trace.trace_id} message=${String(error)}`,
       );
     });
+  }
+
+  public async queryDaemonStatus(
+    root: string | null,
+    token: vscode.CancellationToken,
+  ): Promise<JsonValue> {
+    return this.client.request<JsonValue>(
+      request(root, 'test_status', { load: false }),
+      token,
+    );
   }
 
   public async listWorkspaces(token: vscode.CancellationToken): Promise<WorkspaceSpec[]> {

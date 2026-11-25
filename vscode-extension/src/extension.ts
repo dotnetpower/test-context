@@ -19,8 +19,30 @@ import { UsageSummary } from './usage.js';
 
 const execFileAsync = promisify(execFile);
 const OUTPUT_DISCOVERED_STATE_KEY = 'testContextNative.outputDiscovered';
+const PERIODIC_STATUS_REFRESH_MS = 30_000;
+const FOCUS_STATUS_THROTTLE_MS = 5_000;
+const TOOLTIP_TRUSTED_COMMANDS = [
+  'testContextNative.showStatus',
+  'testContextNative.syncWorkspace',
+  'testContextNative.selfTest',
+  'testContextNative.showSessionRoi',
+];
 
 let client: DaemonClient | undefined;
+
+function applyStatusBarUsage(target: vscode.StatusBarItem, usage: UsageSummary): void {
+  if (!usage.hasRenderableData) {
+    return;
+  }
+  target.text = usage.text();
+  if (typeof vscode.MarkdownString === 'function') {
+    const md = new vscode.MarkdownString(usage.markdownTooltip(), true);
+    md.isTrusted = { enabledCommands: TOOLTIP_TRUSTED_COMMANDS };
+    target.tooltip = md;
+  } else {
+    target.tooltip = usage.tooltip();
+  }
+}
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel('Test Context Native', {
@@ -29,6 +51,7 @@ export function activate(context: vscode.ExtensionContext): void {
   client = new DaemonClient(readSettings);
   const usage = new UsageSummary();
   let renderUsage = (): void => {};
+  let scheduleDaemonRefresh: (force?: boolean) => void = () => {};
 
   const bridge = new NativeToolBridge(
     client,
@@ -50,6 +73,7 @@ export function activate(context: vscode.ExtensionContext): void {
     (event) => {
       usage.record(event);
       renderUsage();
+      scheduleDaemonRefresh(false);
     },
   );
   bridge.register();
@@ -61,15 +85,92 @@ export function activate(context: vscode.ExtensionContext): void {
   status.tooltip = 'Show Test Context native tool status';
   status.show();
 
+  let needsManualRegistration = false;
+  let probing: Promise<void> | undefined;
+  let daemonRefreshing: Promise<void> | undefined;
+  let lastDaemonRefreshAt = 0;
+  let daemonRefreshTimer: NodeJS.Timeout | undefined;
+  let periodicStatusTimer: NodeJS.Timeout | undefined;
+  let folderProbeTimer: NodeJS.Timeout | undefined;
+
+  const transportLabel = (): string =>
+    client?.usesWslBridge ? 'WSL bridge' : 'Unix socket';
+
   renderUsage = (): void => {
-    if (usage.last) {
-      status.text = usage.text();
-      status.tooltip = usage.tooltip();
+    if (needsManualRegistration) {
+      return;
     }
+    applyStatusBarUsage(status, usage);
   };
 
-  let probing: Promise<void> | undefined;
-  let folderProbeTimer: NodeJS.Timeout | undefined;
+  const refreshDaemonSnapshot = async (
+    explicitRoot?: string | null,
+    force = false,
+  ): Promise<void> => {
+    if (!vscode.workspace.isTrusted || !client) {
+      return;
+    }
+    if (!force && Date.now() - lastDaemonRefreshAt < FOCUS_STATUS_THROTTLE_MS) {
+      return;
+    }
+    if (daemonRefreshing) {
+      return daemonRefreshing;
+    }
+    const task = (async (): Promise<void> => {
+      const source = new vscode.CancellationTokenSource();
+      try {
+        let targetRoot: string | null =
+          explicitRoot !== undefined ? explicitRoot : (usage.lastRoot ?? null);
+        if (targetRoot === null && !client?.usesWslBridge) {
+          try {
+            targetRoot = await bridge.resolveRoot(undefined, source.token, false);
+          } catch {
+            targetRoot = null;
+          }
+        }
+        const raw = await bridge.queryDaemonStatus(targetRoot, source.token);
+        const snap = usage.ingestDaemonStatus(raw, transportLabel());
+        // When no explicit root was known (e.g. Windows WSL Agents window before first call)
+        // and the daemon already has a loaded root, pull its non-blocking cached status too.
+        if (targetRoot === null && snap && !snap.workspace && snap.loadedRoots.length > 0) {
+          const firstLoaded = snap.loadedRoots[0];
+          if (firstLoaded) {
+            try {
+              const loadedRaw = await bridge.queryDaemonStatus(firstLoaded, source.token);
+              usage.ingestDaemonStatus(loadedRaw, transportLabel());
+            } catch {
+              // Keep daemon-level snapshot if root-specific lookup fails.
+            }
+          }
+        }
+        lastDaemonRefreshAt = Date.now();
+        renderUsage();
+      } catch {
+        // Never overwrite an active status indicator on a passive background status poll.
+      } finally {
+        source.dispose();
+      }
+    })().finally(() => {
+      daemonRefreshing = undefined;
+    });
+    daemonRefreshing = task;
+    return task;
+  };
+
+  scheduleDaemonRefresh = (force = false): void => {
+    if (!vscode.workspace.isTrusted || !client) {
+      return;
+    }
+    if (daemonRefreshTimer) {
+      clearTimeout(daemonRefreshTimer);
+    }
+    daemonRefreshTimer = setTimeout(() => {
+      daemonRefreshTimer = undefined;
+      void refreshDaemonSnapshot(undefined, force);
+    }, 500);
+    daemonRefreshTimer.unref?.();
+  };
+
   const currentFoldersFingerprint = (): string =>
     (vscode.workspace.workspaceFolders ?? [])
       .map((folder) => folder.uri.toString())
@@ -77,12 +178,21 @@ export function activate(context: vscode.ExtensionContext): void {
       .join('\n');
   let lastFoldersFingerprint = currentFoldersFingerprint();
   const probe = (): Promise<void> => {
-    probing ??= runStartupProbe(bridge, status, output).finally(() => {
+    probing ??= runStartupProbe(bridge, status, output, usage, transportLabel, (manual) => {
+      needsManualRegistration = manual;
+    }).finally(() => {
       probing = undefined;
       renderUsage();
     });
     return probing;
   };
+
+  periodicStatusTimer = setInterval(() => {
+    if (vscode.workspace.isTrusted && vscode.window.state?.focused !== false && client) {
+      void refreshDaemonSnapshot(undefined, false);
+    }
+  }, PERIODIC_STATUS_REFRESH_MS);
+  periodicStatusTimer.unref?.();
 
   context.subscriptions.push(
     output,
@@ -103,7 +213,7 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     }),
     vscode.commands.registerCommand('testContextNative.showStatus', async () => {
-      await showStatus(bridge, status, output);
+      await showStatus(bridge, status, output, usage, transportLabel);
     }),
     vscode.commands.registerCommand('testContextNative.showSessionRoi', () => {
       output.appendLine(usage.sessionRoiReport());
@@ -176,6 +286,7 @@ export function activate(context: vscode.ExtensionContext): void {
         client?.reset();
         bridge.invalidateRegistry();
         usage.clearLastRoot();
+        usage.clearDaemonStatus();
         void probe();
       }
     }),
@@ -188,8 +299,25 @@ export function activate(context: vscode.ExtensionContext): void {
           clearTimeout(folderProbeTimer);
           folderProbeTimer = undefined;
         }
+        if (daemonRefreshTimer) {
+          clearTimeout(daemonRefreshTimer);
+          daemonRefreshTimer = undefined;
+        }
+        if (periodicStatusTimer) {
+          clearInterval(periodicStatusTimer);
+          periodicStatusTimer = undefined;
+        }
       },
     },
+    ...(typeof (vscode.window as { onDidChangeWindowState?: unknown }).onDidChangeWindowState === 'function'
+      ? [
+          vscode.window.onDidChangeWindowState((state) => {
+            if (state.focused && vscode.workspace.isTrusted) {
+              void refreshDaemonSnapshot(undefined, false);
+            }
+          }),
+        ]
+      : []),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       const nextFingerprint = currentFoldersFingerprint();
       if (nextFingerprint === lastFoldersFingerprint) {
@@ -198,6 +326,7 @@ export function activate(context: vscode.ExtensionContext): void {
       lastFoldersFingerprint = nextFingerprint;
       bridge.invalidateRegistry();
       usage.clearLastRoot();
+      usage.clearDaemonStatus();
       renderUsage();
       if (folderProbeTimer) {
         clearTimeout(folderProbeTimer);
@@ -312,6 +441,8 @@ async function showStatus(
   bridge: NativeToolBridge,
   statusBar: vscode.StatusBarItem,
   output: vscode.OutputChannel,
+  usage: UsageSummary,
+  transportLabel: () => string,
   explicitRoot?: string,
 ): Promise<void> {
   const source = new vscode.CancellationTokenSource();
@@ -329,6 +460,8 @@ async function showStatus(
       explicitRoot ? { root: explicitRoot } : {},
       source.token,
     );
+    usage.ingestDaemonStatus(value, transportLabel());
+    applyStatusBarUsage(statusBar, usage);
     output.appendLine(formatToolResult('test_status', value));
     output.show(true);
   } catch (error: unknown) {
@@ -387,6 +520,9 @@ async function runStartupProbe(
   bridge: NativeToolBridge,
   statusBar: vscode.StatusBarItem,
   output: vscode.OutputChannel,
+  usage: UsageSummary,
+  transportLabel: () => string,
+  setManualRegistration: (needed: boolean) => void,
 ): Promise<void> {
   const source = new vscode.CancellationTokenSource();
   try {
@@ -397,9 +533,25 @@ async function runStartupProbe(
       );
     }
     const workspaces = await bridge.listWorkspaces(source.token);
+    setManualRegistration(false);
     if (client?.usesWslBridge) {
       statusBar.text = '$(beaker) TCTX Available';
       statusBar.tooltip = `${registered.length} Test Context native tools registered through the WSL bridge; pass an explicit Linux root when multiple roots are registered`;
+      try {
+        const raw = await bridge.queryDaemonStatus(usage.lastRoot ?? null, source.token);
+        const snap = usage.ingestDaemonStatus(raw, transportLabel());
+        if (!snap?.workspace && snap && snap.loadedRoots.length > 0 && snap.loadedRoots[0]) {
+          try {
+            const loadedRaw = await bridge.queryDaemonStatus(snap.loadedRoots[0], source.token);
+            usage.ingestDaemonStatus(loadedRaw, transportLabel());
+          } catch {
+            // Keep daemon-level snapshot.
+          }
+        }
+        applyStatusBarUsage(statusBar, usage);
+      } catch {
+        // Keep fallback tooltip when passive status lookup fails.
+      }
       output.appendLine(
         `[ready] tools=${registered.length} workspaces=${workspaces.length} transport=wsl-native-bridge root=explicit-when-ambiguous`,
       );
@@ -408,16 +560,25 @@ async function runStartupProbe(
     const root = await bridge.resolveRoot(undefined, source.token, false);
     statusBar.text = '$(beaker) TCTX Available';
     statusBar.tooltip = `${registered.length} Test Context native tools registered and callable for ${root}`;
+    try {
+      const raw = await bridge.queryDaemonStatus(root, source.token);
+      usage.ingestDaemonStatus(raw, transportLabel());
+      applyStatusBarUsage(statusBar, usage);
+    } catch {
+      // Keep fallback tooltip when passive status lookup fails.
+    }
     output.appendLine(
       `[ready] tools=${registered.length} workspaces=${workspaces.length} transport=unix-socket root=${root}`,
     );
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     if (error instanceof RootResolutionError) {
+      setManualRegistration(true);
       statusBar.text = '$(add) TCTX Register';
       statusBar.tooltip = 'Workspace will be registered on first Test Context tool call; click for status';
       output.appendLine(`[info] workspace_registration_deferred message=${message}`);
     } else {
+      setManualRegistration(false);
       statusBar.text = '$(warning) TCTX Native';
       statusBar.tooltip = message;
       output.appendLine(`[error] native_not_ready message=${message}`);

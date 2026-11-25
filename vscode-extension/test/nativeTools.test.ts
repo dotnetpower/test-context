@@ -292,3 +292,100 @@ void test('UsageSummary tracks counts and formats status text', () => {
   assert.equal(classifyOutcome(undefined), 'success');
   assert.match(usage.text(), /TCTX S:1 E:0/);
 });
+
+void test('UsageSummary ingests daemon status and renders rich Markdown hover tooltip', () => {
+  const usage = new UsageSummary();
+  usage.record({
+    operation: 'test_run',
+    root: '/home/dev/demo',
+    durationMs: 0.72,
+    savedMs: 1_500,
+    cachedFiles: 4,
+    executedFiles: 0,
+    mode: 'instant_cache_hit',
+  });
+  const snap = usage.ingestDaemonStatus(
+    {
+      daemon: {
+        ok: true,
+        version: '0.1.4',
+        pid: 4242,
+        uptime_secs: 185,
+        registered_roots: 3,
+        loaded_roots: ['/home/dev/demo'],
+        metrics: {
+          total_requests: 28,
+          error_requests: 0,
+          test_runs: 12,
+          total_saved_ms: 42_500,
+          total_cached_files: 48,
+          total_executed_files: 6,
+        },
+      },
+      workspace: {
+        root: '/home/dev/demo',
+        indexed_total_files: 120,
+        indexed_python_files: 50,
+        indexed_rust_files: 40,
+        indexed_frontend_files: 25,
+        total_test_files: 18,
+        total_python_test_files: 8,
+        total_rust_test_files: 6,
+        total_frontend_test_files: 4,
+        cached_passed_files: 17,
+        cached_failed_files: 0,
+        uncached_or_stale_files: 1,
+        ruff_cached_files: 115,
+        ruff_diagnostics_count: 2,
+        background_running: true,
+        background_pending_queue: 1,
+        background_in_flight: 1,
+        background_batches: 5,
+        total_background_runs: 9,
+        total_cache_hits: 30,
+        total_delta_runs: 4,
+        total_saved_ms: 42_500,
+        watched_directories: 16,
+        watcher_overflow_pending: false,
+        last_watcher_error: 'bad [link](command:evil) | pipe',
+        cache_storage: {
+          estimated_memory_bytes: 32_768,
+          history_records: 24,
+          wal_bytes: 12_288,
+        },
+        zygote: {
+          ready: true,
+          pid: 5151,
+          runs: 7,
+          rss_bytes: 94_371_840,
+          circuit_open: false,
+        },
+      },
+    },
+    'Unix socket',
+    Date.UTC(2026, 10, 25, 7, 30, 0),
+  );
+  assert.ok(snap);
+  assert.equal(usage.hasRenderableData, true);
+  assert.match(usage.text(), /~43s saved/);
+  assert.match(usage.text(), /17\/18 cached/);
+  assert.match(usage.text(), /2 lint/);
+  assert.match(usage.text(), /BG 2/);
+
+  const md = usage.markdownTooltip();
+  assert.match(md, /### \$\(beaker\) Test Context — demo · Unix socket/);
+  assert.match(md, /\| ⏱️ Time Saved \| 🎯 Cache Hit Rate \| 🧪 Cached Tests \| 🔍 Lint Issues \|/);
+  assert.match(md, /88\.9%.*48\/54/);
+  assert.match(md, /Python \(`pytest`\)/);
+  assert.match(md, /Rust \(`cargo test`\)/);
+  assert.match(md, /Frontend \(`vitest`\/`jest`\/`node`\)/);
+  assert.match(md, /C\/C\+\+ · C# · Data\/Config/);
+  assert.match(md, /Pytest Zygote: 🟢 Ready \(PID `5151`, `7` runs, `90\.0 MiB`\)/);
+  assert.match(md, /Extension Host Native Tool Breakdown/);
+  assert.match(md, /\[.*Show Status\]\(command:testContextNative\.showStatus\)/);
+  assert.match(md, /\[.*Sync Graph\]\(command:testContextNative\.syncWorkspace\)/);
+  assert.match(md, /\[.*Self-Test\]\(command:testContextNative\.selfTest\)/);
+  // Untrusted watcher error strings must be markdown-escaped so they cannot inject command links
+  assert.ok(!md.includes('[link](command:evil)'));
+  assert.match(md, /bad \\\[link\\\]\(command:evil\) \\\| pipe/);
+});
