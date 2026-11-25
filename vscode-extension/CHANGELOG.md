@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.5
+
+- Complete multi-round hardening across the Rust backend, polyglot AST dependency graph, Warm Pytest Zygote, CLI drop-in runners, and VS Code native extension, and decompose monolithic Rust/TypeScript source files (`ast_graph`, `runner`, `zygote`, `cli`, `daemon`, `cache`, `workspace`, `rootResolver`, `nativeTools`) into cohesive SRP submodules (extracting `zygote_worker.py` via `include_str!`).
+- Focus polyglot support on **Python, Rust, Frontend (TS/JS/Vue/Svelte/CSS), C/C++, and C#** (plus Protobuf/GraphQL): add C# `namespace` / `using` / `global using` / `using static` / alias resolution, live incremental namespace updates, `.sln`/`.csproj`/`Directory.Build.props` isolation, and C/C++ `include/`/`inc/`/`src/` & nonstandard `.inc` header discovery with `CMakeLists.txt` scoping.
+- Fix real-world FastAPI/Zygote regressions (multiline `os.environ.get`/`os.getenv` parsing, scoped `.env` handling, benign stdlib/wheel audit probes, immutable wheel stamp deduplication, and hot-path env probe throttling) and refresh the 8-session, 320-pair `aks-store-demo` benchmark suite.
+- Upgrade the VS Code status bar with a `cctx`-style rich `MarkdownString` hover tooltip (KPI summary table, per-ecosystem AST/test breakdown, Background Worker & Warm Pytest Zygote telemetry, Native tool metrics, clickable quick-action links, and automatic non-blocking daemon status polling).
+
 ## 0.1.4
 
 - Allow safe Rust unit tests (`src/**/*.rs` without deny markers) to run speculatively in the background worker even under `background_safe_only`, while keeping foreground `cargo test` builds uncapped and scoping `CARGO_BUILD_JOBS=4` / `RUST_TEST_THREADS=4` to background worker subprocesses.

@@ -288,7 +288,7 @@ export class UsageSummary {
     const daemonPid = asOptionalNumber(daemonRec.pid);
     const snapshot: DaemonStatusSnapshot = {
       ok: daemonRec.ok === true,
-      version: asString(daemonRec.version) ?? '0.1.4',
+      version: asString(daemonRec.version) ?? '0.1.5',
       ...(daemonPid !== undefined ? { pid: daemonPid } : {}),
       uptimeSecs: asNumber(daemonRec.uptime_secs),
       registeredRoots: asNumber(daemonRec.registered_roots),
