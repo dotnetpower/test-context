@@ -408,18 +408,45 @@ def _is_known_safe_pth_line(s):
         if len(parts) == 2:
             mod = parts[0][7:].strip()
             return mod.isidentifier() and parts[1] == f"{mod}.install()"
-    # Standard setuptools namespace-package `.pth` shim (validate exact statement structure):
+    # Standard setuptools namespace-package `.pth` shims (validate exact statement structure):
     _ns_pfx = "import sys, types, os;has_mfs = sys.version_info > (3, 5);p = os.path.join(sys._getframe(1).f_locals['sitedir'], *("
     _ns_mid = ");importlib = has_mfs and __import__('importlib.util');has_mfs and __import__('importlib.machinery');m = has_mfs and sys.modules.setdefault("
-    if s.startswith(_ns_pfx) and _ns_mid in s and s.endswith(" or None") and s.count(";") == 5:
+    if s.startswith(_ns_pfx) and _ns_mid in s and (
+        (s.endswith(" or None") and s.count(";") == 5)
+        or (s.endswith("(p not in mp) and mp.append(p)") and s.count(";") in (8, 9))
+        or (
+            ";mp = (m or []) and m.__dict__.setdefault('__path__',[]);(p not in mp) and mp.append(p)"
+            in s
+            and s.count(";") in (8, 9)
+        )
+    ):
         return True
     return False
 
-if "sitecustomize" in sys.modules or "usercustomize" in sys.modules:
-    _parent_startup_untrackable = True
+def _is_os_distro_sitecustomize(mod):
+    try:
+        sf = getattr(mod, "__file__", None)
+        if not isinstance(sf, str) or not sf:
+            return False
+        real_sf = os.path.realpath(sf)
+        if any(
+            real_sf == pp or real_sf.startswith(pp + os.sep)
+            for pp in _parent_startup_pp_prefixes
+        ):
+            return False
+        if sf.startswith("/usr/lib/python") or real_sf.startswith(("/usr/lib/python", "/etc/python")):
+            return True
+    except Exception:
+        pass
+    return False
+
 import site
 _startup_tls.in_obs = True
 try:
+    if "usercustomize" in sys.modules or (
+        "sitecustomize" in sys.modules and not _is_os_distro_sitecustomize(sys.modules.get("sitecustomize"))
+    ):
+        _parent_startup_untrackable = True
     for _sp_fn in (getattr(site, "getsitepackages", None), getattr(site, "getusersitepackages", None)):
         if callable(_sp_fn):
             try:
