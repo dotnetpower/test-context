@@ -209,6 +209,14 @@ void test('subagent argument builders normalize aliases, line numbers, URIs, and
     normalizeTargetForRoot('/repo', '[test_a.py](file:///repo/tests/test_a.py:18)::test_ok'),
     'tests/test_a.py::test_ok',
   );
+  assert.equal(
+    normalizeTargetForRoot('/repo', 'file:///repo/tests/test_a.py?version=1#L10'),
+    'tests/test_a.py',
+  );
+  assert.equal(
+    normalizeTargetForRoot('/repo', 'file:///repo/tests/test_%3Fa.py?version=2#L5'),
+    'tests/test_?a.py',
+  );
   assert.deepEqual(
     buildRunArguments(
       {

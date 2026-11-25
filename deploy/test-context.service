@@ -6,10 +6,10 @@ StartLimitBurst=3
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/tctx daemon
-Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
 Environment=TCTX_IDLE_TIMEOUT_SECS=7200
 Environment=TCTX_LARGE_ROOT_IDLE_TIMEOUT_SECS=3600
-Environment=TCTX_MAX_RSS_MB=4096
+Environment=TCTX_MAX_RSS_MB=2560
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=10

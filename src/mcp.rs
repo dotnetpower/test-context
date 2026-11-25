@@ -7,20 +7,20 @@ pub fn tools() -> Value {
         "tools": [
             {
                 "name": "test_run",
-                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Use this before shell pytest, cargo test, vitest, jest, or node --test in a registered workspace. Resolves target test files (or expands modified Python, Rust, or Frontend source/stylesheet files via the AST reverse dependency graph), checks live SHA-256 Merkle dependency hashes (dep_hash), skips tests that already passed in the background or prior runs, joins in-flight background runs, and executes only the uncached delta. Returns instant results (< 5ms) when all targeted tests are already cached green.",
+                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Run incremental tests (pytest, cargo test, vitest, jest, node --test, go test) via AST graph & dep_hash cache; unchanged passes return in <5ms, only uncached deltas run.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "root": {
                             "type": "string",
-                            "description": "Optional absolute registered workspace/worktree root. Always pass explicitly when known (especially in subagents, Windows/WSL Agent Sessions, and multi-root setups); omit to resolve from the current workspace."
+                            "description": "Absolute registered workspace/worktree root (pass explicitly when known)."
                         },
                         "targets": {
                             "type": "array",
                             "maxItems": 128,
                             "items": { "type": "string" },
-                            "description": "Optional relative test file paths, test directories, test nodeids (path::test_name), or modified Python/Rust/Frontend source file paths. Omit to target all workspace tests."
+                            "description": "Relative test files, directories, nodeids (path::test), or modified source files. Omit to run workspace tests (when >64 test files and no k/mark filter, scopes to git-dirty or recent-commit affected tests and falls back to all tests if none; pass [\".\"] for full suite)."
                         },
                         "k": {
                             "type": "string",
@@ -33,23 +33,23 @@ pub fn tools() -> Value {
                         "rerun_failed": {
                             "type": "boolean",
                             "default": true,
-                            "description": "Re-run tests whose cached result for the current dep_hash was failed."
+                            "description": "Re-run tests whose cached result for the current dep_hash failed."
                         },
                         "no_cache": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Bypass cached pass results and force execution."
+                            "description": "Bypass cached passes and force execution."
                         },
                         "ruff_fix": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Auto-fix safe Ruff/ESLint lint and import issues (ruff check --fix / eslint --fix) on targeted files before running tests."
+                            "description": "Auto-fix safe lint issues on targeted files before running tests."
                         },
                         "pytest_args": {
                             "type": "array",
                             "maxItems": 32,
                             "items": { "type": "string" },
-                            "description": "Optional additional test runner CLI flags."
+                            "description": "Optional additional runner CLI flags."
                         }
                     }
                 },
@@ -61,7 +61,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "test_affected",
-                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Find which Python (pytest), Rust (cargo test), or Frontend (Vitest/Jest/Node/Storybook) test files are impacted by changed source files or git working-tree edits via the AST reverse dependency graph, along with each test file's dependency chain, live background cache state (cached_passed, cached_failed, running_in_background, queued_in_background, uncached), and pre-checked Ruff/ESLint diagnostics.",
+                "description": "MCP fallback for sessions where the matching Native tool is unavailable. List tests affected by modified files or git diff, with dependency chains, cache states, and cached lint diagnostics.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -74,12 +74,12 @@ pub fn tools() -> Value {
                             "type": "array",
                             "maxItems": 128,
                             "items": { "type": "string" },
-                            "description": "Optional relative paths of modified Python, Rust, Frontend, stylesheet, or config files. If omitted, uses git status dirty files when git_diff=true."
+                            "description": "Modified relative paths; omit to use git dirty files when git_diff=true."
                         },
                         "git_diff": {
                             "type": "boolean",
                             "default": true,
-                            "description": "Use git working-tree dirty files when files is empty."
+                            "description": "Use git dirty files when files is empty."
                         }
                     }
                 },
@@ -91,7 +91,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "test_graph",
-                "description": "Inspect the AST dependency graph for a specific Python, Rust, or Frontend (TS/JS/JSX/TSX/Vue/Svelte/CSS/SCSS) source or test file: direct imports, reverse importers, transitive dependencies, conftest.py / tests/common / setupTests.ts chains, affected test files, test symbols, fixtures, and Merkle dep_hash.",
+                "description": "Inspect AST dependency graph for one file: imports, reverse importers, transitive deps, setup/conftest chain, affected tests, symbols, and dep_hash.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -103,7 +103,7 @@ pub fn tools() -> Value {
                         "file": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Relative path to the Python, Rust, or Frontend file within the workspace."
+                            "description": "Relative file path within the workspace."
                         }
                     },
                     "required": ["file"]
@@ -116,7 +116,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "test_status",
-                "description": "Show test-context daemon health and workspace residency immediately. Set load=true to load an inactive graph and include detailed AST, cache, queue, and saved-time counts.",
+                "description": "Show daemon health and workspace residency immediately; set load=true to load an inactive graph.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -128,7 +128,7 @@ pub fn tools() -> Value {
                         "load": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Load an inactive workspace graph to include detailed file and cache counts. False returns registered/unloaded state immediately."
+                            "description": "Load inactive graph to include detailed counts."
                         }
                     }
                 },
@@ -140,7 +140,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "test_sync",
-                "description": "Synchronize the Python AST dependency graph with saved files on disk and queue any uncached or modified tests for background execution. Set wait=true to wait for background execution to finish.",
+                "description": "Sync AST dependency graph with disk and queue uncached tests for background execution.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -152,7 +152,7 @@ pub fn tools() -> Value {
                         "wait": {
                             "type": "boolean",
                             "default": false,
-                            "description": "Wait for queued background test runs to finish before returning."
+                            "description": "Wait for queued background runs to finish."
                         }
                     }
                 },
@@ -164,7 +164,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "test_invalidate",
-                "description": "Invalidate cached test results for specific test/source files (or the entire workspace when files is omitted) and schedule background re-execution.",
+                "description": "Invalidate cached test results for given files (or whole workspace) and schedule background re-runs.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,
@@ -177,7 +177,7 @@ pub fn tools() -> Value {
                             "type": "array",
                             "maxItems": 128,
                             "items": { "type": "string" },
-                            "description": "Optional relative test or source file paths to invalidate. Omit to invalidate all cached results in the workspace."
+                            "description": "Relative paths to invalidate; omit for whole workspace."
                         }
                     }
                 },
@@ -189,7 +189,7 @@ pub fn tools() -> Value {
             },
             {
                 "name": "test_workspaces",
-                "description": "List explicitly registered test-context workspace roots, scopes, globs, and detected pytest commands.",
+                "description": "List registered test-context workspace roots, scopes, globs, and test commands.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,

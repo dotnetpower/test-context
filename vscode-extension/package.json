@@ -154,7 +154,7 @@
         "name": "test-context-native_testRun",
         "toolReferenceName": "tctxNativeRun",
         "displayName": "Test Context: Incremental Test Run",
-        "modelDescription": "Use this FIRST instead of running shell pytest, cargo test, vitest, jest, or node --test in a registered workspace. Resolves target test files or expands modified Python, Rust, or Frontend (TS/JS/JSX/TSX/Vue/Svelte/CSS/SCSS) source files through the polyglot AST reverse dependency graph, verifies live SHA-256 Merkle dependency hashes (dep_hash), skips tests that already passed in the background worker, joins in-flight background runs, and runs only the uncached delta. Returns instant results (< 5ms) when all targeted tests are already cached green.",
+        "modelDescription": "Run incremental tests (pytest, cargo test, vitest, jest, node --test, go test) via AST graph & dep_hash cache. Unchanged passes return in <5ms; only uncached deltas run.",
         "userDescription": "Run pytest, cargo test, vitest, jest, and node --test incrementally using the AST dependency graph and background test cache.",
         "tags": [
           "test",
@@ -185,7 +185,7 @@
               "items": {
                 "type": "string"
               },
-              "description": "Optional relative test file paths, test directories, test nodeids (path::test_name), or modified Python/Rust/Frontend source file paths. Omit to target all workspace tests."
+              "description": "Optional relative test file paths, test directories, test nodeids (path::test_name), or modified Python/Rust/Frontend source file paths. Omit to run workspace tests (when >64 test files and no k/mark filter, scopes to git-dirty or recent-commit affected tests and falls back to all tests if none; pass [\".\"] for full suite)."
             },
             "k": {
               "type": "string",
@@ -225,7 +225,7 @@
         "name": "test-context-native_testAffected",
         "toolReferenceName": "tctxNativeAffected",
         "displayName": "Test Context: Affected Tests",
-        "modelDescription": "Use this FIRST to discover which Python (pytest), Rust (cargo test), or Frontend (Vitest/Jest/Node/Storybook) test files are impacted by modified source files or git working-tree changes via the AST reverse dependency graph, along with each test file's dependency chain, live background cache status (cached_passed, cached_failed, running_in_background, queued_in_background, uncached), and pre-checked Ruff/ESLint diagnostics.",
+        "modelDescription": "List tests affected by modified files or git diff via the AST graph, with dependency chains, cache states, and cached lint diagnostics.",
         "userDescription": "Find Python, Rust, and Frontend test files affected by source changes and inspect their background cache and lint status.",
         "tags": [
           "test",
@@ -267,7 +267,7 @@
         "name": "test-context-native_testGraph",
         "toolReferenceName": "tctxNativeGraph",
         "displayName": "Test Context: AST Dependency Graph",
-        "modelDescription": "Inspect the AST dependency graph for a specific Python, Rust, or Frontend (TS/JS/JSX/TSX/Vue/Svelte/CSS/SCSS) source or test file: direct imports, reverse importers, transitive dependencies, conftest.py / tests/common / setupTests.ts chains, affected test files, test symbols, fixtures, and Merkle dep_hash.",
+        "modelDescription": "Inspect AST dependency graph for one file: imports, reverse importers, transitive deps, setup/conftest chain, affected tests, symbols, and dep_hash.",
         "userDescription": "Inspect the Python, Rust, or Frontend AST import and fixture dependency graph for a file.",
         "tags": [
           "test",
@@ -304,7 +304,7 @@
         "name": "test-context-native_testStatus",
         "toolReferenceName": "tctxNativeStatus",
         "displayName": "Test Context: Status",
-        "modelDescription": "Show test-context daemon health and workspace residency immediately. Set load=true to load an inactive graph for detailed AST, cache, queue, and saved-time counts.",
+        "modelDescription": "Show daemon health and workspace residency immediately; set load=true to load an inactive graph.",
         "userDescription": "Show test-context daemon and background cache status.",
         "tags": [
           "status",
@@ -332,7 +332,7 @@
         "name": "test-context-native_testSync",
         "toolReferenceName": "tctxNativeSync",
         "displayName": "Test Context: Sync AST & Background Queue",
-        "modelDescription": "Synchronize the Python AST dependency graph with saved files on disk and queue any uncached or modified tests for background execution. Set wait=true to wait for background execution to finish.",
+        "modelDescription": "Sync AST dependency graph with disk and queue uncached tests for background execution.",
         "userDescription": "Synchronize the Python AST dependency graph and trigger background test runs.",
         "tags": [
           "sync",

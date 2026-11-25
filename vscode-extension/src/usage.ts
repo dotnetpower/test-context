@@ -33,6 +33,10 @@ export class UsageSummary {
   public totalSavedMs = 0;
   public totalCachedFiles = 0;
 
+  public clearLastRoot(): void {
+    this.lastRoot = undefined;
+  }
+
   public record(event: UsageEvent, at = Date.now()): void {
     const outcome = classifyOutcome(event.error);
     this.counts[outcome] += 1;

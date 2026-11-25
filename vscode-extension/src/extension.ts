@@ -5,10 +5,15 @@ import { promisify } from 'node:util';
 
 import * as vscode from 'vscode';
 
-import { DaemonClient } from './daemonClient.js';
+import { DaemonClient, RequestCancelledError } from './daemonClient.js';
 import { NATIVE_TOOL_NAMES, NativeToolBridge } from './nativeTools.js';
 import { formatToolResult, validateDaemonStatus } from './resultFormatter.js';
-import { RootResolutionError } from './rootResolver.js';
+import {
+  assertWslDistributionMatches,
+  extractWslUncDistribution,
+  RootResolutionError,
+  toPosixPathIfPossible,
+} from './rootResolver.js';
 import type { ClientSettings } from './types.js';
 import { UsageSummary } from './usage.js';
 
@@ -28,14 +33,19 @@ export function activate(context: vscode.ExtensionContext): void {
   const bridge = new NativeToolBridge(
     client,
     output,
-    async (missingRootPath: string) => {
+    async (missingRootPath: string, token?: vscode.CancellationToken) => {
       if (!readAutoRegister()) {
         throw new RootResolutionError(
           `Workspace ${missingRootPath} is not registered with Test Context.`,
         );
       }
-      await registerRootWithCli(missingRootPath, output);
-      bridge.invalidateRegistry();
+      const regGen = client?.generation;
+      await registerRootWithCli(missingRootPath, output, token);
+      // Only refresh registry cache (preserving the current invocation's rootStateGeneration
+      // so the newly registered root is recorded in sticky state and usage summary).
+      if (client?.generation === regGen) {
+        bridge.refreshRegistry();
+      }
     },
     (event) => {
       usage.record(event);
@@ -93,7 +103,7 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     }),
     vscode.commands.registerCommand('testContextNative.showStatus', async () => {
-      await showStatus(bridge, status, output, usage.lastRoot);
+      await showStatus(bridge, status, output);
     }),
     vscode.commands.registerCommand('testContextNative.showSessionRoi', () => {
       output.appendLine(usage.sessionRoiReport());
@@ -103,9 +113,33 @@ export function activate(context: vscode.ExtensionContext): void {
       await runSelfTest(bridge, output, root);
     }),
     vscode.commands.registerCommand('testContextNative.registerWorkspace', async () => {
-      const folder = vscode.workspace.workspaceFolders?.[0];
-      if (!folder) {
+      const folders = vscode.workspace.workspaceFolders ?? [];
+      if (folders.length === 0) {
         await vscode.window.showErrorMessage('Open a workspace folder before registering Test Context.');
+        return;
+      }
+      let folder = folders[0];
+      if (folders.length > 1) {
+        const activeUri = vscode.window.activeTextEditor?.document.uri;
+        const activeFolder = activeUri ? vscode.workspace.getWorkspaceFolder(activeUri) : undefined;
+        const picked = await vscode.window.showQuickPick(
+          folders.map((f) => ({
+            label: f.name,
+            description: f.uri.fsPath,
+            folder: f,
+          })),
+          {
+            placeHolder: activeFolder
+              ? `Select workspace folder to register (active: ${activeFolder.name})`
+              : 'Select workspace folder to register with Test Context',
+          },
+        );
+        if (!picked) {
+          return;
+        }
+        folder = picked.folder;
+      }
+      if (!folder) {
         return;
       }
       await registerRootWithCli(folder.uri.fsPath, output);
@@ -118,7 +152,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('testContextNative.syncWorkspace', async () => {
       const source = new vscode.CancellationTokenSource();
       try {
-        const root = await bridge.resolveRoot(usage.lastRoot, source.token, true);
+        // Resolve the root INSIDE the generation-guarded `bridge.invoke` rather than before it
+        // so workspace folder changes mid-resolution never turn a stale root into an explicit target.
         const value = await bridge.invoke(
           {
             name: 'command_sync',
@@ -127,7 +162,7 @@ export function activate(context: vscode.ExtensionContext): void {
             invocationMessage: () => 'Synchronizing Test Context AST graph',
             arguments: () => ({ wait: false }),
           },
-          { root },
+          {},
           source.token,
         );
         output.appendLine(formatToolResult('test_sync', value));
@@ -140,6 +175,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (event.affectsConfiguration('testContextNative')) {
         client?.reset();
         bridge.invalidateRegistry();
+        usage.clearLastRoot();
         void probe();
       }
     }),
@@ -161,6 +197,8 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       lastFoldersFingerprint = nextFingerprint;
       bridge.invalidateRegistry();
+      usage.clearLastRoot();
+      renderUsage();
       if (folderProbeTimer) {
         clearTimeout(folderProbeTimer);
       }
@@ -178,9 +216,25 @@ export function activate(context: vscode.ExtensionContext): void {
     void context.globalState.update(OUTPUT_DISCOVERED_STATE_KEY, true);
   }
 
-  output.appendLine(`[ready] native endpoint=${client.endpoint}`);
+  try {
+    output.appendLine(`[ready] native endpoint=${client.endpoint}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    output.appendLine(`[error] invalid native endpoint configuration: ${message}`);
+    status.text = '$(warning) TCTX Native';
+    status.tooltip = `Invalid Test Context native endpoint: ${message}`;
+  }
   if (vscode.workspace.isTrusted) {
-    void probe();
+    // Defer startup daemon probe briefly so extension activation stays zero-IPC on startup
+    const startupProbeTimer = setTimeout(() => {
+      if (vscode.workspace.isTrusted && client) {
+        void probe();
+      }
+    }, 1_500);
+    startupProbeTimer.unref?.();
+    context.subscriptions.push({
+      dispose: () => clearTimeout(startupProbeTimer),
+    });
   } else {
     status.text = '$(lock) TCTX Native';
     status.tooltip = 'Trust this workspace to enable native Test Context tools';
@@ -192,13 +246,66 @@ export function deactivate(): void {
   client = undefined;
 }
 
-async function registerRootWithCli(rootPath: string, output: vscode.OutputChannel): Promise<void> {
-  const exe = executablePath();
-  const resolved = resolve(rootPath);
-  await execFileAsync(exe, ['--root', resolved, 'register'], {
-    timeout: 15_000,
+async function registerRootWithCli(
+  rootPath: string,
+  output: vscode.OutputChannel,
+  token?: vscode.CancellationToken,
+): Promise<void> {
+  if (token?.isCancellationRequested) {
+    throw new RequestCancelledError();
+  }
+  const abortController = new AbortController();
+  const cancelSub = token?.onCancellationRequested(() => {
+    abortController.abort();
   });
-  output.appendLine(`[success] workspace_registered root=${resolved}`);
+  try {
+    if (process.platform === 'win32') {
+      const settings = readSettings();
+      assertWslDistributionMatches(rootPath, settings.wslDistribution);
+      const pathDistro = extractWslUncDistribution(rootPath);
+      const effectiveDistro = settings.wslDistribution || pathDistro;
+      const linuxRoot = toPosixPathIfPossible(rootPath, effectiveDistro);
+      if (!linuxRoot) {
+        throw new Error(`Cannot map workspace path '${rootPath}' to a WSL Linux path.`);
+      }
+      const wslArgs: string[] = [];
+      if (effectiveDistro) {
+        wslArgs.push('-d', effectiveDistro);
+      }
+      const wslExe = settings.wslExecutablePath || 'tctx';
+      // Probe the actual Linux path inside WSL (`[ -f "$target" ]`) so a file target resolves to
+      // its parent directory while dotted directories (e.g. `/home/dev/project.v2`) stay intact.
+      wslArgs.push(
+        '--',
+        'sh',
+        '-c',
+        'target="$1"; [ -f "$target" ] && target="$(dirname "$target")"; exec "$2" --root "$target" register',
+        'tctx-register',
+        linuxRoot,
+        wslExe,
+      );
+      await execFileAsync('wsl.exe', wslArgs, {
+        timeout: 15_000,
+        signal: abortController.signal,
+      });
+      output.appendLine(`[success] workspace_registered root=${linuxRoot}`);
+      return;
+    }
+    const exe = executablePath();
+    const resolved = resolve(rootPath);
+    await execFileAsync(exe, ['--root', resolved, 'register'], {
+      timeout: 15_000,
+      signal: abortController.signal,
+    });
+    output.appendLine(`[success] workspace_registered root=${resolved}`);
+  } catch (error: unknown) {
+    if (token?.isCancellationRequested || abortController.signal.aborted) {
+      throw new RequestCancelledError();
+    }
+    throw error;
+  } finally {
+    cancelSub?.dispose();
+  }
 }
 
 async function showStatus(
@@ -209,7 +316,8 @@ async function showStatus(
 ): Promise<void> {
   const source = new vscode.CancellationTokenSource();
   try {
-    const root = await bridge.resolveRoot(explicitRoot, source.token, true);
+    // Resolve the root solely inside the generation-guarded `bridge.invoke` so workspace folder
+    // changes mid-resolution cannot turn a stale root into an explicit target.
     const value = await bridge.invoke(
       {
         name: 'command_status',
@@ -218,7 +326,7 @@ async function showStatus(
         invocationMessage: () => 'Reading Test Context status',
         arguments: () => ({ load: true }),
       },
-      { root },
+      explicitRoot ? { root: explicitRoot } : {},
       source.token,
     );
     output.appendLine(formatToolResult('test_status', value));
@@ -242,14 +350,13 @@ async function runSelfTest(
   const source = new vscode.CancellationTokenSource();
   try {
     await vscode.commands.executeCommand('setContext', 'testContextNative.selfTestPassed', false);
-    const root = await bridge.resolveRoot(explicitRoot, source.token, true);
     const registered = registeredNativeTools();
     if (registered.length !== NATIVE_TOOL_NAMES.length) {
       throw new Error(
         `Expected ${NATIVE_TOOL_NAMES.length} native tools, found ${registered.length}.`,
       );
     }
-    const daemonStatus = await bridge.invoke(
+    const { value: daemonStatus, trace } = await bridge.invokeTraced(
       {
         name: 'self_test_status',
         operation: 'test_status',
@@ -257,14 +364,16 @@ async function runSelfTest(
         invocationMessage: () => 'Running Test Context self-test',
         arguments: () => ({ load: false }),
       },
-      { root },
+      explicitRoot ? { root: explicitRoot } : {},
       source.token,
     );
     validateDaemonStatus(daemonStatus);
     await vscode.commands.executeCommand('setContext', 'testContextNative.selfTestPassed', true);
     output.appendLine(formatToolResult('test_status', daemonStatus));
     output.show(true);
-    await vscode.window.showInformationMessage(`Test Context self-test passed: ${root}`);
+    await vscode.window.showInformationMessage(
+      `Test Context self-test passed: ${trace.root ?? explicitRoot ?? ''}`,
+    );
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     output.appendLine(`[error] self_test message=${message}`);

@@ -38,7 +38,7 @@ impl Default for MemoryPolicy {
             background_enabled: true,
             background_safe_only: true,
             background_max_load_ratio_percent: 75,
-            parallel_delta_enabled: false,
+            parallel_delta_enabled: true,
             predictive_background_enabled: true,
         }
     }

@@ -87,7 +87,7 @@ void test('manifest metadata, branding PNGs, walkthrough, and 7 native tools are
     resolve(__dirname, '../../prompts/test-context.instructions.md'),
     'utf8',
   );
-  assert.match(instructions, /applyTo:\s*"\*\*"/);
+  assert.match(instructions, /applyTo:\s*"\*\*\/\*\.\{[^"]+\}"/);
   assert.match(instructions, /MUST use `#tctxNativeRun`/);
   assert.match(instructions, /When delegating to subagents/);
   assert.match(instructions, /tool_search/);

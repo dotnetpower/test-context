@@ -117,6 +117,35 @@ pub fn detect_frontend_test_cmd(root: &Path, managed_parent: Option<&Path>) -> V
 }
 
 pub fn detect_node_bin() -> String {
+    type NodeCacheKey = (
+        Option<std::ffi::OsString>,
+        Option<std::ffi::OsString>,
+        Option<std::ffi::OsString>,
+    );
+    type NodeCacheEntry = (NodeCacheKey, std::time::Instant, String);
+    static NODE_BIN_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<NodeCacheEntry>>> =
+        std::sync::OnceLock::new();
+    let cache_key = (
+        std::env::var_os("TCTX_NODE_BIN"),
+        std::env::var_os("PATH"),
+        std::env::var_os("HOME"),
+    );
+    let cache = NODE_BIN_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Some((ref cached_key, captured, ref cached_val)) =
+        *cache.lock().unwrap_or_else(|p| p.into_inner())
+        && *cached_key == cache_key
+        && captured.elapsed() < std::time::Duration::from_secs(30)
+        && (cached_val == "node" || Path::new(cached_val).is_file())
+    {
+        return cached_val.clone();
+    }
+    let resolved = detect_node_bin_uncached();
+    *cache.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some((cache_key, std::time::Instant::now(), resolved.clone()));
+    resolved
+}
+
+fn detect_node_bin_uncached() -> String {
     if let Some(env_bin) = std::env::var_os("TCTX_NODE_BIN") {
         let p = PathBuf::from(env_bin);
         if p.is_file() {
@@ -167,11 +196,33 @@ pub fn detect_node_bin() -> String {
 }
 
 pub fn augmented_user_path() -> Option<std::ffi::OsString> {
+    type PathCacheKey = (
+        String,
+        Option<std::ffi::OsString>,
+        Option<std::ffi::OsString>,
+    );
+    type PathCacheValue = (PathCacheKey, std::time::Instant, Option<std::ffi::OsString>);
+    static AUGMENTED_PATH_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<PathCacheValue>>> =
+        std::sync::OnceLock::new();
+    let node_bin_str = detect_node_bin();
+    let cache_key = (
+        node_bin_str.clone(),
+        std::env::var_os("PATH"),
+        std::env::var_os("HOME"),
+    );
+    let cache = AUGMENTED_PATH_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Some((ref cached_key, captured, ref cached_val)) =
+        *cache.lock().unwrap_or_else(|p| p.into_inner())
+        && *cached_key == cache_key
+        && captured.elapsed() < std::time::Duration::from_secs(30)
+    {
+        return cached_val.clone();
+    }
     let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
     let mut changed = false;
-    let node_bin = PathBuf::from(detect_node_bin());
+    let node_bin = PathBuf::from(node_bin_str);
     if node_bin.is_absolute()
         && let Some(parent) = node_bin.parent()
         && !dirs.iter().any(|d| d == parent)
@@ -189,33 +240,243 @@ pub fn augmented_user_path() -> Option<std::ffi::OsString> {
             }
         }
     }
-    if changed {
+    let result = if changed {
         std::env::join_paths(dirs).ok()
     } else {
         None
+    };
+    *cache.lock().unwrap_or_else(|p| p.into_inner()) =
+        Some((cache_key, std::time::Instant::now(), result.clone()));
+    result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontendRunnerPreference {
+    Vitest,
+    Jest,
+    NodeTest,
+}
+
+fn dir_preferred_frontend_runner(dir: &Path) -> Option<FrontendRunnerPreference> {
+    for cfg in [
+        "vitest.config.ts",
+        "vitest.config.mts",
+        "vitest.config.cts",
+        "vitest.config.js",
+        "vitest.config.mjs",
+        "vitest.config.cjs",
+    ] {
+        if dir.join(cfg).is_file() {
+            return Some(FrontendRunnerPreference::Vitest);
+        }
     }
+    for cfg in [
+        "jest.config.ts",
+        "jest.config.mts",
+        "jest.config.cts",
+        "jest.config.js",
+        "jest.config.mjs",
+        "jest.config.cjs",
+        "jest.config.json",
+    ] {
+        if dir.join(cfg).is_file() {
+            return Some(FrontendRunnerPreference::Jest);
+        }
+    }
+    let pkg_json = dir.join("package.json");
+    let text = std::fs::read_to_string(&pkg_json).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let has_dep = |name: &str| -> bool {
+        [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ]
+        .iter()
+        .any(|section| {
+            val.get(section)
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|obj| obj.contains_key(name))
+        })
+    };
+    let test_script = val
+        .get("scripts")
+        .and_then(|s| s.get("test"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let script_has_vitest = test_script.contains("vitest");
+    let script_has_jest = test_script.contains("jest");
+    let script_has_node_test = test_script.contains("node ") && test_script.contains("--test");
+    if script_has_vitest {
+        return Some(FrontendRunnerPreference::Vitest);
+    }
+    if script_has_jest {
+        return Some(FrontendRunnerPreference::Jest);
+    }
+    if script_has_node_test {
+        return Some(FrontendRunnerPreference::NodeTest);
+    }
+    if has_dep("vitest") {
+        return Some(FrontendRunnerPreference::Vitest);
+    }
+    if has_dep("jest") || val.get("jest").is_some() {
+        return Some(FrontendRunnerPreference::Jest);
+    }
+    None
 }
 
 pub fn detect_frontend_runner_for_dir(
     root: &Path,
     pkg_dir: &str,
-    fallback_cmd: &[String],
+    managed_parent: Option<&Path>,
 ) -> (Vec<String>, PathBuf) {
+    let workdir = if !pkg_dir.is_empty() && root.join(pkg_dir).is_dir() {
+        root.join(pkg_dir)
+    } else {
+        root.to_path_buf()
+    };
+    if let Some(env_bin) = std::env::var_os("TCTX_FRONTEND_TEST_BIN") {
+        let p = PathBuf::from(env_bin);
+        if p.is_file() {
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let bin = p.to_string_lossy().into_owned();
+            let cmd = if name.contains("vitest") {
+                vec![bin, "run".to_string()]
+            } else {
+                vec![bin]
+            };
+            return (cmd, workdir);
+        }
+    }
+    let find_specific_in_ancestors =
+        |base: &Path, rel_pkg: &str, wanted: Option<FrontendRunnerPreference>| -> Option<Vec<String>> {
+            let start = if rel_pkg.is_empty() {
+                base.to_path_buf()
+            } else {
+                base.join(rel_pkg)
+            };
+            let mut cur: Option<&Path> = Some(start.as_path());
+            while let Some(dir) = cur {
+                let try_vitest = || -> Option<Vec<String>> {
+                    let vitest = dir.join("node_modules/.bin/vitest");
+                    vitest
+                        .is_file()
+                        .then(|| vec![vitest.to_string_lossy().into_owned(), "run".to_string()])
+                };
+                let try_jest = || -> Option<Vec<String>> {
+                    let jest = dir.join("node_modules/.bin/jest");
+                    jest.is_file()
+                        .then(|| vec![jest.to_string_lossy().into_owned()])
+                };
+                match wanted {
+                    Some(FrontendRunnerPreference::Vitest) => {
+                        if let Some(c) = try_vitest() {
+                            return Some(c);
+                        }
+                    }
+                    Some(FrontendRunnerPreference::Jest) => {
+                        if let Some(c) = try_jest() {
+                            return Some(c);
+                        }
+                    }
+                    Some(FrontendRunnerPreference::NodeTest) => return None,
+                    None => {
+                        if let Some(c) = try_vitest().or_else(try_jest) {
+                            return Some(c);
+                        }
+                    }
+                }
+                if dir == base {
+                    break;
+                }
+                cur = dir.parent();
+            }
+            None
+        };
+
+    let pkg_pref = dir_preferred_frontend_runner(&workdir);
+    if pkg_pref == Some(FrontendRunnerPreference::NodeTest) {
+        return (vec![detect_node_bin(), "--test".to_string()], workdir);
+    }
+    if let Some(wanted) = pkg_pref {
+        if let Some(cmd) = find_specific_in_ancestors(root, pkg_dir, Some(wanted)) {
+            return (cmd, workdir);
+        }
+        if let Some(parent) = managed_parent
+            && let Some(cmd) = find_specific_in_ancestors(parent, pkg_dir, Some(wanted))
+        {
+            return (cmd, workdir);
+        }
+        // The package explicitly declared Vitest or Jest in its config/package.json, but its
+        // binary was not installed in node_modules; NEVER silently switch to a different runner
+        // (e.g. hoisted sibling Vitest or `node --test`). Return the declared runner command so
+        // it either resolves from PATH or fails explicitly as missing.
+        return match wanted {
+            FrontendRunnerPreference::Vitest => {
+                (vec!["vitest".to_string(), "run".to_string()], workdir)
+            }
+            FrontendRunnerPreference::Jest => (vec!["jest".to_string()], workdir),
+            FrontendRunnerPreference::NodeTest => {
+                (vec![detect_node_bin(), "--test".to_string()], workdir)
+            }
+        };
+    }
+    // Check package-local `node_modules/.bin` before considering any hoisted ancestor runner.
     if !pkg_dir.is_empty() {
-        let sub_root = root.join(pkg_dir);
-        let vitest = sub_root.join("node_modules/.bin/vitest");
+        let vitest = workdir.join("node_modules/.bin/vitest");
         if vitest.is_file() {
             return (
                 vec![vitest.to_string_lossy().into_owned(), "run".to_string()],
-                sub_root,
+                workdir,
             );
         }
-        let jest = sub_root.join("node_modules/.bin/jest");
+        let jest = workdir.join("node_modules/.bin/jest");
         if jest.is_file() {
-            return (vec![jest.to_string_lossy().into_owned()], sub_root);
+            return (vec![jest.to_string_lossy().into_owned()], workdir);
+        }
+        // In a hoisted monorepo, a subpackage with its own `package.json` that declares neither
+        // Vitest nor Jest (e.g. a pure `node --test` package) must NOT silently inherit a sibling
+        // package's hoisted `root/node_modules/.bin/vitest` unless the workspace root itself
+        // explicitly configures Vitest/Jest at the root level!
+        if workdir.join("package.json").is_file() {
+            let root_pref = dir_preferred_frontend_runner(root);
+            if matches!(
+                root_pref,
+                Some(FrontendRunnerPreference::Vitest | FrontendRunnerPreference::Jest)
+            ) {
+                if let Some(cmd) = find_specific_in_ancestors(root, pkg_dir, root_pref) {
+                    return (cmd, workdir);
+                }
+                if let Some(parent) = managed_parent
+                    && let Some(cmd) = find_specific_in_ancestors(parent, pkg_dir, root_pref)
+                {
+                    return (cmd, workdir);
+                }
+                return match root_pref {
+                    Some(FrontendRunnerPreference::Vitest) => {
+                        (vec!["vitest".to_string(), "run".to_string()], workdir)
+                    }
+                    Some(FrontendRunnerPreference::Jest) => (vec!["jest".to_string()], workdir),
+                    _ => (vec![detect_node_bin(), "--test".to_string()], workdir),
+                };
+            }
+            return (vec![detect_node_bin(), "--test".to_string()], workdir);
         }
     }
-    (fallback_cmd.to_vec(), root.to_path_buf())
+    if let Some(cmd) = find_specific_in_ancestors(root, pkg_dir, None) {
+        return (cmd, workdir);
+    }
+    if let Some(parent) = managed_parent
+        && let Some(cmd) = find_specific_in_ancestors(parent, pkg_dir, None)
+    {
+        return (cmd, workdir);
+    }
+    (vec![detect_node_bin(), "--test".to_string()], workdir)
 }
 
 pub fn detect_eslint_cmd_for_dir(root: &Path, pkg_dir: &str) -> Option<(PathBuf, PathBuf)> {
@@ -523,8 +784,8 @@ pub fn socket_path() -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn load() -> Result<Vec<Spec>> {
-    type RegistryCacheEntry = (PathBuf, (u64, i64, i64), Vec<Spec>);
+pub fn load_arc() -> Result<std::sync::Arc<Vec<Spec>>> {
+    type RegistryCacheEntry = (PathBuf, (u64, i64, i64), std::sync::Arc<Vec<Spec>>);
     static REGISTRY_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<RegistryCacheEntry>>> =
         std::sync::OnceLock::new();
     let path = state_dir()?.join("workspaces.json");
@@ -540,7 +801,7 @@ pub fn load() -> Result<Vec<Spec>> {
         && cached_path == &path
         && *cached_stamp == current_stamp
     {
-        return Ok(cached_specs.clone());
+        return Ok(std::sync::Arc::clone(cached_specs));
     }
     match std::fs::File::open(&path) {
         Ok(file) => {
@@ -562,17 +823,24 @@ pub fn load() -> Result<Vec<Spec>> {
                 ))
                 .into());
             }
+            let arc = std::sync::Arc::new(specs);
             if let Some(current_stamp) = stamp {
                 *cache_mutex
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) =
-                    Some((path, current_stamp, specs.clone()));
+                    Some((path, current_stamp, std::sync::Arc::clone(&arc)));
             }
-            Ok(specs)
+            Ok(arc)
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(std::sync::Arc::new(Vec::new()))
+        }
         Err(error) => Err(error.into()),
     }
+}
+
+pub fn load() -> Result<Vec<Spec>> {
+    Ok(load_arc()?.as_ref().clone())
 }
 
 pub fn mutate<F>(f: F) -> Result<()>
@@ -703,18 +971,24 @@ pub fn unregister(root: &Path) -> Result<()> {
     })
 }
 
-pub fn resolve_spec(path: &Path) -> Result<Spec> {
-    let path = path.canonicalize()?;
-    load()?
-        .into_iter()
-        .filter(|s| path.starts_with(&s.root))
+pub fn resolve_spec_canonical(canonical_path: &Path) -> Result<Spec> {
+    let specs = load_arc()?;
+    specs
+        .iter()
+        .filter(|s| canonical_path.starts_with(&s.root))
         .max_by_key(|s| s.root.components().count())
+        .cloned()
         .ok_or_else(|| {
             invalid(format!(
                 "workspace is not registered with test-context: {} (run `tctx --root {} register`)",
-                path.display(),
-                path.display()
+                canonical_path.display(),
+                canonical_path.display()
             ))
             .into()
         })
+}
+
+pub fn resolve_spec(path: &Path) -> Result<Spec> {
+    let path = path.canonicalize()?;
+    resolve_spec_canonical(&path)
 }
