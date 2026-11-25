@@ -126,41 +126,24 @@ pub struct DependencyGraph {
     pub non_python_environment_hash: String,
     /// Frontend-only environment digest (Node runtime + Vite `.env*` files, including gitignored
     /// `.env.test.local`), hashed ONLY into frontend tests so adding/editing `.env` or frontend
-    /// files NEVER invalidates cached Rust/Python/Go tests!
+    /// files NEVER invalidates cached Rust/Python tests!
     pub frontend_environment_hash: String,
-    /// Go-only environment digest (`go version` per module dir + `GOFLAGS`/`GOOS`/`GOARCH`/
-    /// `CGO_*`/`GOENV`/`go.work`), hashed ONLY into Go tests so Go edits never invalidate Python/Rust/FE.
-    pub go_environment_hash: String,
-    /// Directories explicitly referenced as build inputs (e.g. `cargo::rerun-if-changed=assets`),
-    /// kept separate from Go embed package watch dirs so unrelated ignored files in Go dirs never
-    /// false-trigger fail-closed.
+    /// Directories explicitly referenced as build inputs (e.g. `cargo::rerun-if-changed=assets`).
     pub referenced_data_dirs: BTreeSet<String>,
     pub runtime_deps_for_test: BTreeMap<String, BTreeSet<String>>,
-    /// Files referenced by raw-byte embedding directives (e.g. Go `//go:embed`) that must be
-    /// hashed by raw `sha256` bytes rather than comment-stripped `semantic_sha256`.
+    /// Files referenced by raw-byte reads/embeds (e.g. Rust `include_str!`, frontend `?raw`, Python
+    /// raw file reads) that must be hashed by raw `sha256` bytes rather than `semantic_sha256`.
     pub raw_embedded_files: BTreeSet<String>,
-    /// All directories (including currently-empty subdirectories) reachable by Go `//go:embed`
-    /// directives or discovered cgo headers so the file watcher watches them before caching.
-    pub go_embed_watch_dirs: BTreeSet<String>,
-    /// Workspace-relative resolved `#cgo CFLAGS: -I...` search dirs per Go package (including
-    /// absolute `-I/abs/workspace/...` paths normalized relative to workspace root).
-    pub resolved_cgo_inc_by_pkg: BTreeMap<String, BTreeSet<String>>,
-    /// Maps absolute workspace-contained `#include "/abs/repo/..."` strings to their normalized
-    /// workspace-relative paths so edge resolution links them cleanly.
-    pub resolved_abs_c_includes: BTreeMap<String, String>,
+    /// Required directories that must be watched before caching results (e.g. referenced data
+    /// dirs or hidden pytest `testpaths` directories).
+    pub required_watch_dirs: BTreeSet<String>,
     /// Live workspace root path (not persisted in snapshot) used to detect unindexed/gitignored
     /// runtime files (e.g. `foo.js` existing on disk beside an indexed `foo.ts`!).
     pub workspace_root: Option<std::path::PathBuf>,
-    /// Workspace-relative paths of referenced-but-currently-missing C/cgo header candidates
-    /// (e.g. `__has_include("build/feature.h")`) so creating them later triggers watcher admission.
-    pub missing_c_include_candidates: BTreeSet<String>,
     /// Workspace-relative paths of explicitly referenced data/fixture files (e.g.
     /// `existsSync("fixtures/ready.bin")`) that do not yet exist on disk, so later creation
     /// emits a watcher event, admits the file, and invalidates tests.
     pub missing_data_ref_candidates: BTreeSet<String>,
-    /// Verified, non-symlinked, in-workspace `go.mod` / `go.work` `replace` targets keyed by the
-    /// owning module/workspace directory (`mod_dir -> Vec<(old_mod, target_dir)>`).
-    pub resolved_go_replaces_by_mod: BTreeMap<String, Vec<(String, String)>>,
     pub tsconfig_extends_rev: BTreeMap<String, BTreeSet<String>>,
     /// Per-importer pure barrel references `(barrel_path, imported_sym)` for O(1) exact hashing.
     pub barrel_imports_by_importer: BTreeMap<u32, Vec<(String, String)>>,

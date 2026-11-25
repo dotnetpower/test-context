@@ -172,7 +172,9 @@ impl DependencyGraph {
                 || RUST_CONFIG_FILES.contains(&file_name)
                 || crate::workspace::is_cargo_dot_config_rel(Path::new(&norm))
                 || crate::workspace::is_frontend_config_filename(file_name)
-                || matches!(file_name, "go.mod" | "go.sum")
+                || POLYGLOT_CONFIG_FILES.contains(&file_name)
+                || file_name.ends_with(".csproj")
+                || file_name.ends_with(".sln")
                 || self.config_hashes.contains_key(&norm)
                 || self.tsconfig_extends_rev.contains_key(&norm)
             {
@@ -330,7 +332,9 @@ impl DependencyGraph {
                 || RUST_CONFIG_FILES.contains(&file_name)
                 || crate::workspace::is_cargo_dot_config_rel(Path::new(&norm))
                 || crate::workspace::is_frontend_config_filename(file_name)
-                || matches!(file_name, "go.mod" | "go.sum")
+                || POLYGLOT_CONFIG_FILES.contains(&file_name)
+                || file_name.ends_with(".csproj")
+                || file_name.ends_with(".sln")
                 || self.config_hashes.contains_key(&norm)
                 || self.tsconfig_extends_rev.contains_key(&norm)
             {
@@ -907,8 +911,10 @@ impl DependencyGraph {
                     frameworks.insert("cypress");
                 } else if is_frontend_source_path(path) {
                     frameworks.insert("vitest_or_jest");
-                } else if path.ends_with("_test.go") {
-                    frameworks.insert("go_test");
+                } else if path.ends_with(".cs") {
+                    frameworks.insert("dotnet_csharp");
+                } else if is_c_cpp_source_path(path) {
+                    frameworks.insert("cpp_gtest");
                 }
             }
             for fx in &node.parsed.fixtures_defined {

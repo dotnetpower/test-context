@@ -21,17 +21,12 @@ impl DependencyGraph {
             environment_hash: String::new(),
             non_python_environment_hash: String::new(),
             frontend_environment_hash: String::new(),
-            go_environment_hash: String::new(),
             referenced_data_dirs: BTreeSet::new(),
             runtime_deps_for_test: BTreeMap::new(),
             raw_embedded_files: BTreeSet::new(),
-            go_embed_watch_dirs: BTreeSet::new(),
-            resolved_cgo_inc_by_pkg: BTreeMap::new(),
-            resolved_abs_c_includes: BTreeMap::new(),
+            required_watch_dirs: BTreeSet::new(),
             workspace_root: None,
-            missing_c_include_candidates: BTreeSet::new(),
             missing_data_ref_candidates: BTreeSet::new(),
-            resolved_go_replaces_by_mod: BTreeMap::new(),
             tsconfig_extends_rev: BTreeMap::new(),
             barrel_imports_by_importer: BTreeMap::new(),
             barrel_to_importers: BTreeMap::new(),
@@ -167,35 +162,24 @@ impl DependencyGraph {
         }
     }
 
-    pub fn has_go_embed_directives(&self) -> bool {
-        !self.go_embed_watch_dirs.is_empty()
+    pub fn has_raw_or_data_watch_directives(&self) -> bool {
+        !self.required_watch_dirs.is_empty()
             || !self.referenced_data_dirs.is_empty()
             || !self.raw_embedded_files.is_empty()
-            || !self.resolved_cgo_inc_by_pkg.is_empty()
-            || self.files.keys().any(|p| p.ends_with(".go"))
             || self
                 .testpaths
                 .iter()
                 .any(|tp| tp.split('/').any(|seg| seg.starts_with('.')))
-            || self.files.iter().any(|(path, node)| {
-                (path.ends_with(".go")
-                    && node
-                        .parsed
-                        .defined_symbols
-                        .iter()
-                        .any(|s| s.starts_with("go_embed:") || s.starts_with("cgo_inc:")))
-                    || node.parsed.defined_symbols.iter().any(|s| {
-                        s.starts_with("c_include:")
-                            || s.starts_with("c_include_sys:")
-                            || s.starts_with("c_include_opt:")
-                            || s.starts_with("rust_raw_embed:")
-                            || s.starts_with("rust_raw_embed_crate:")
-                            || s.starts_with("rust_raw_fs:")
-                            || s.starts_with("py_raw_fs:")
-                            || s.starts_with("fe_raw_fs:")
-                            || s.starts_with("fe_raw_url_fs:")
-                            || s.starts_with("fe_raw_import:")
-                    })
+            || self.files.iter().any(|(_, node)| {
+                node.parsed.defined_symbols.iter().any(|s| {
+                    s.starts_with("rust_raw_embed:")
+                        || s.starts_with("rust_raw_embed_crate:")
+                        || s.starts_with("rust_raw_fs:")
+                        || s.starts_with("py_raw_fs:")
+                        || s.starts_with("fe_raw_fs:")
+                        || s.starts_with("fe_raw_url_fs:")
+                        || s.starts_with("fe_raw_import:")
+                })
             })
     }
 
@@ -226,104 +210,6 @@ impl DependencyGraph {
         false
     }
 
-    pub fn matches_any_cgo_include_dir(&self, rel_str: &str) -> bool {
-        if self.missing_c_include_candidates.contains(rel_str) {
-            return true;
-        }
-        // Also match any ancestor directory of a missing include candidate (e.g. `build/out` for
-        // `__has_include("build/out/config.h")`) so atomic creation of `build/out/config.h` is
-        // admitted during new-directory catch-up scans.
-        if !rel_str.is_empty() && !self.missing_c_include_candidates.is_empty() {
-            let dir_pfx = format!("{rel_str}/");
-            if self
-                .missing_c_include_candidates
-                .range(dir_pfx.clone()..)
-                .next()
-                .is_some_and(|cand| cand.starts_with(&dir_pfx))
-            {
-                return true;
-            }
-        }
-        for dirs in self.resolved_cgo_inc_by_pkg.values() {
-            for inc_dir in dirs {
-                if inc_dir.is_empty()
-                    || rel_str == inc_dir
-                    || (rel_str.starts_with(inc_dir.as_str())
-                        && rel_str.as_bytes().get(inc_dir.len()) == Some(&b'/'))
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    pub fn dir_matches_any_go_embed(&self, dir_rel_str: &str) -> bool {
-        for (path, node) in &self.files {
-            if !path.ends_with(".go") {
-                continue;
-            }
-            let parent_str = Path::new(path)
-                .parent()
-                .map(normalize_rel_str)
-                .unwrap_or_default();
-            let prefix = if parent_str.is_empty() {
-                String::new()
-            } else {
-                format!("{parent_str}/")
-            };
-            let rel_under = if prefix.is_empty() {
-                dir_rel_str
-            } else if let Some(rest) = dir_rel_str.strip_prefix(&prefix) {
-                rest
-            } else {
-                continue;
-            };
-            for sym in &node.parsed.defined_symbols {
-                if let Some(embed_pat) = sym.strip_prefix("go_embed:")
-                    && go_embed_dir_could_match(embed_pat, rel_under)
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
-    pub fn matches_any_go_embed(&self, rel_str: &str) -> bool {
-        // Check explicit Go `//go:embed` patterns FIRST (Go embeds may match gitignored build
-        // artifacts like `dist/app.js`).
-        for (path, node) in &self.files {
-            if !path.ends_with(".go") {
-                continue;
-            }
-            let parent_str = Path::new(path)
-                .parent()
-                .map(normalize_rel_str)
-                .unwrap_or_default();
-            let prefix = if parent_str.is_empty() {
-                String::new()
-            } else {
-                format!("{parent_str}/")
-            };
-            let rel_under = if prefix.is_empty() {
-                rel_str
-            } else if let Some(rest) = rel_str.strip_prefix(&prefix) {
-                rest
-            } else {
-                continue;
-            };
-            for sym in &node.parsed.defined_symbols {
-                if let Some(embed_pat) = sym.strip_prefix("go_embed:")
-                    && go_embed_pattern_matches_rel(embed_pat, rel_under)
-                {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     pub fn matches_any_watched_data_dir(&self, rel_str: &str) -> bool {
         !self.referenced_data_dirs.is_empty()
             && self.referenced_data_dirs.iter().any(|dir| {
@@ -339,9 +225,7 @@ impl DependencyGraph {
         default_base: &Sha256,
         non_py_base: &Sha256,
     ) -> Sha256 {
-        let mut hasher = if (test_path.ends_with(".rs")
-            || test_path.ends_with("_test.go")
-            || is_frontend_source_path(test_path))
+        let mut hasher = if (test_path.ends_with(".rs") || is_frontend_source_path(test_path))
             && !self.non_python_environment_hash.is_empty()
             && !reachable_ids.iter().any(|&id| {
                 self.file_index_to_path
@@ -356,11 +240,6 @@ impl DependencyGraph {
         if is_frontend_source_path(test_path) && !self.frontend_environment_hash.is_empty() {
             hasher.update(b"fe_env:");
             hasher.update(self.frontend_environment_hash.as_bytes());
-            hasher.update(b"\n");
-        }
-        if test_path.ends_with("_test.go") && !self.go_environment_hash.is_empty() {
-            hasher.update(b"go_env:");
-            hasher.update(self.go_environment_hash.as_bytes());
             hasher.update(b"\n");
         }
         hasher
@@ -417,17 +296,23 @@ impl DependencyGraph {
             || self.tsconfig_extends_rev.contains_key(cfg_path);
         let is_py_only_cfg =
             PYTEST_CONFIG_FILES.contains(&file_name) && file_name != "pyproject.toml";
-        let is_go_only_cfg = matches!(file_name, "go.mod" | "go.sum");
+        let is_csharp_only_cfg = matches!(
+            file_name,
+            "Directory.Build.props" | "Directory.Build.targets" | "global.json"
+        ) || file_name.ends_with(".csproj")
+            || file_name.ends_with(".sln");
+        let is_cpp_only_cfg = file_name == "CMakeLists.txt";
 
         let is_rs_test = test_path.ends_with(".rs");
         let is_fe_test = is_frontend_source_path(test_path);
-        let is_go_test = test_path.ends_with("_test.go");
+        let is_cs_test = test_path.ends_with(".cs");
+        let is_cpp_test = is_c_cpp_source_path(test_path);
 
-        if is_py_only_cfg && (is_rs_test || is_fe_test || is_go_test) {
+        if is_py_only_cfg && (is_rs_test || is_fe_test || is_cs_test || is_cpp_test) {
             return false;
         }
         if file_name == "pyproject.toml"
-            && (is_rs_test || is_fe_test || is_go_test)
+            && (is_rs_test || is_fe_test || is_cs_test || is_cpp_test)
             && !self.is_pyproject_relevant_to_non_py(cfg_path, is_rs_test, reachable_ids)
         {
             return false;
@@ -435,8 +320,25 @@ impl DependencyGraph {
         if is_fe_only_cfg && !is_fe_test {
             return false;
         }
-        if is_go_only_cfg && !is_go_test {
-            return false;
+        if is_csharp_only_cfg && !is_cs_test {
+            let depends_on_cs = reachable_ids.iter().any(|&id| {
+                self.file_index_to_path
+                    .get(id as usize)
+                    .is_some_and(|p| p.ends_with(".cs"))
+            });
+            if !depends_on_cs {
+                return false;
+            }
+        }
+        if is_cpp_only_cfg && !is_cpp_test {
+            let depends_on_cpp = reachable_ids.iter().any(|&id| {
+                self.file_index_to_path
+                    .get(id as usize)
+                    .is_some_and(|p| is_c_cpp_source_path(p))
+            });
+            if !depends_on_cpp {
+                return false;
+            }
         }
         if is_rust_only_cfg && !is_rs_test {
             let depends_on_rs = reachable_ids.iter().any(|&id| {
@@ -537,36 +439,6 @@ impl DependencyGraph {
                 }
             }
         }
-        // When a Go test (or any Go helper it calls) inspects call-stack line numbers via
-        // `runtime.Caller` / `Callers` / `Stack`, raw-hash EVERY reachable `.go` file so
-        // blank/comment line shifts in caller files invalidate the test cache.
-        if test_path.ends_with("_test.go") {
-            let any_caller_sensitive = reachable_ids.iter().any(|&id| {
-                self.file_index_to_path
-                    .get(id as usize)
-                    .and_then(|p| self.files.get(p))
-                    .is_some_and(|n| {
-                        n.parsed
-                            .defined_symbols
-                            .iter()
-                            .any(|s| s == "go_caller_sensitive")
-                    })
-            });
-            if any_caller_sensitive {
-                for &id in reachable_ids {
-                    if let Some(p) = self.file_index_to_path.get(id as usize)
-                        && p.ends_with(".go")
-                        && let Some(n) = self.files.get(p)
-                    {
-                        hasher.update(b"go_raw_caller:");
-                        hasher.update(p.as_bytes());
-                        hasher.update(b":");
-                        hasher.update(n.sha256.as_bytes());
-                        hasher.update(b"\n");
-                    }
-                }
-            }
-        }
         // When a Python test (or any Python helper it calls) inspects call-stack line numbers or
         // source text via `inspect.currentframe()`/`stack()`/`getsource()`/`sys._getframe()`,
         // raw-hash EVERY reachable `.py` file so blank/comment line shifts invalidate the cache.
@@ -655,7 +527,20 @@ impl DependencyGraph {
         }
         let is_rs_test = test_path.ends_with(".rs");
         let is_fe_test = is_frontend_source_path(test_path);
-        let is_go_test = test_path.ends_with("_test.go");
+        let is_cs_test = test_path.ends_with(".cs");
+        let is_cpp_test = is_c_cpp_source_path(test_path);
+        let depends_on_cs = !is_cs_test
+            && reachable_ids.iter().any(|&id| {
+                self.file_index_to_path
+                    .get(id as usize)
+                    .is_some_and(|p| p.ends_with(".cs"))
+            });
+        let depends_on_cpp = !is_cpp_test
+            && reachable_ids.iter().any(|&id| {
+                self.file_index_to_path
+                    .get(id as usize)
+                    .is_some_and(|p| is_c_cpp_source_path(p))
+            });
 
         for (cfg_path, cfg_sha) in &self.config_hashes {
             let file_name = Path::new(cfg_path)
@@ -670,13 +555,18 @@ impl DependencyGraph {
             let is_fe_only_cfg = crate::workspace::is_frontend_config_filename(file_name);
             let is_py_only_cfg =
                 PYTEST_CONFIG_FILES.contains(&file_name) && file_name != "pyproject.toml";
-            let is_go_only_cfg = matches!(file_name, "go.mod" | "go.sum");
+            let is_csharp_only_cfg = matches!(
+                file_name,
+                "Directory.Build.props" | "Directory.Build.targets" | "global.json"
+            ) || file_name.ends_with(".csproj")
+                || file_name.ends_with(".sln");
+            let is_cpp_only_cfg = file_name == "CMakeLists.txt";
 
-            if is_py_only_cfg && (is_rs_test || is_fe_test || is_go_test) {
+            if is_py_only_cfg && (is_rs_test || is_fe_test || is_cs_test || is_cpp_test) {
                 continue;
             }
             if file_name == "pyproject.toml"
-                && (is_rs_test || is_fe_test || is_go_test)
+                && (is_rs_test || is_fe_test || is_cs_test || is_cpp_test)
                 && !self.is_pyproject_relevant_to_non_py(cfg_path, is_rs_test, reachable_ids)
             {
                 continue;
@@ -684,7 +574,10 @@ impl DependencyGraph {
             if is_fe_only_cfg && !is_fe_test {
                 continue;
             }
-            if is_go_only_cfg && !is_go_test {
+            if is_csharp_only_cfg && !is_cs_test && !depends_on_cs {
+                continue;
+            }
+            if is_cpp_only_cfg && !is_cpp_test && !depends_on_cpp {
                 continue;
             }
             if is_rust_only_cfg && !is_rs_test && !depends_on_rs {
@@ -822,12 +715,10 @@ impl DependencyGraph {
         non_python_environment_hash: String,
     ) {
         let fe_hash = self.frontend_environment_hash.clone();
-        let go_hash = self.go_environment_hash.clone();
         self.apply_all_environment_hashes(
             environment_hash,
             non_python_environment_hash,
             fe_hash,
-            go_hash,
         );
     }
 
@@ -836,19 +727,16 @@ impl DependencyGraph {
         environment_hash: String,
         non_python_environment_hash: String,
         frontend_environment_hash: String,
-        go_environment_hash: String,
     ) {
         if self.environment_hash == environment_hash
             && self.non_python_environment_hash == non_python_environment_hash
             && self.frontend_environment_hash == frontend_environment_hash
-            && self.go_environment_hash == go_environment_hash
         {
             return;
         }
         self.environment_hash = environment_hash;
         self.non_python_environment_hash = non_python_environment_hash;
         self.frontend_environment_hash = frontend_environment_hash;
-        self.go_environment_hash = go_environment_hash;
         if self.file_index_to_path.len() != self.files.len() {
             self.recompute_edges();
         } else {
@@ -879,8 +767,6 @@ impl DependencyGraph {
     /// `fe_dynamic_env`). Called at the end of EVERY full, incremental, and hash-only update.
     pub fn refresh_untrackable_tests(&mut self) {
         self.untrackable_tests.clear();
-        let has_cgo_env_header_flags = cgo_env_flags_have_untracked_headers();
-        let has_go_overlay_flag = go_flags_have_overlay();
         // Build `FrontendModuleIndex` lazily when ANY frontend config, frontend source, OR
         // stylesheet file has imports so we can fail closed on unresolved relative imports,
         // unresolved configured aliases (e.g. `@gen/*` -> gitignored file or `../shared`),
@@ -1153,11 +1039,6 @@ impl DependencyGraph {
             })
             .collect();
         for (test_path, reachable_ids) in &self.transitive_dep_ids_for_test {
-            if (has_cgo_env_header_flags || has_go_overlay_flag) && test_path.ends_with("_test.go")
-            {
-                self.untrackable_tests.insert(test_path.clone());
-                continue;
-            }
             let has_untrackable_dep = reachable_ids.iter().any(|&dep_id| {
                 self.file_index_to_path
                     .get(dep_id as usize)
@@ -1172,10 +1053,6 @@ impl DependencyGraph {
                                 || s == "rust_dynamic_io"
                                 || s == "rust_dynamic_env"
                                 || s == "rust_dynamic_include"
-                                || s == "go_dynamic_io"
-                                || s == "go_dynamic_env"
-                                || s == "cgo_dynamic_io"
-                                || s == "fortran_dynamic_mod"
                         }) || ((is_frontend_source_path(p) || is_stylesheet_path(p))
                             && is_unresolved_code_rel_import(p, n))
                     })

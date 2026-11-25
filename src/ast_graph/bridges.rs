@@ -36,7 +36,6 @@ pub(super) fn compute_direct_dependencies(
     frontend_index: &FrontendModuleIndex,
     fixture_providers: &BTreeMap<String, Vec<String>>,
     bridge_index: &BridgeProviderIndex,
-    polyglot_index: &PolyglotIndex,
     runtime_deps_for_test: &BTreeMap<String, BTreeSet<String>>,
 ) -> BTreeSet<String> {
     let mut deps = BTreeSet::new();
@@ -48,13 +47,9 @@ pub(super) fn compute_direct_dependencies(
     {
         deps.extend(frontend_index.resolve_file_dependencies(path, node, files));
     } else if is_polyglot_source_path(path)
-        || node.parsed.defined_symbols.iter().any(|s| {
-            s.starts_with("c_include:")
-                || s.starts_with("c_include_sys:")
-                || s.starts_with("c_include_opt:")
-        })
+        || (!path.ends_with(".py") && !node.is_config && !node.parsed.imports.is_empty())
     {
-        deps.extend(resolve_polyglot_dependencies(path, node, files, polyglot_index));
+        deps.extend(resolve_polyglot_dependencies(path, node, files));
     } else {
         for spec in &node.parsed.imports {
             for resolved in module_index.resolve_import(path, spec, files) {

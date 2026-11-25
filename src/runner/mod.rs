@@ -35,14 +35,13 @@ mod cargo_targets;
 mod cargo_selectors;
 mod exec_cargo;
 mod exec_frontend;
-mod exec_go_re2;
-mod exec_go;
 mod reporting;
 
 #[cfg(test)]
 mod tests;
 
 use types::*;
+use watcher::*;
 use linters::*;
 use exec_pytest_probe::*;
 use env_toolchains::*;
@@ -56,8 +55,6 @@ use cargo_targets::*;
 use cargo_selectors::*;
 use exec_cargo::*;
 use exec_frontend::*;
-use exec_go_re2::*;
-use exec_go::*;
 use reporting::*;
 
 pub use types::{TestRunRequest, RuffDiagnostic, StructuredFailure, FileRunSummary, TestRunResponse, AffectedTestStatus, RootLease, ManagedRoot};

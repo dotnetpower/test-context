@@ -595,16 +595,6 @@ pub fn detect_nextest_cmd(root: &Path) -> Option<Vec<String>> {
     None
 }
 
-pub fn detect_go_cmd(_root: &Path) -> Vec<String> {
-    if let Some(env_bin) = std::env::var_os("TCTX_GO_BIN") {
-        let p = PathBuf::from(env_bin);
-        if p.is_file() {
-            return vec![p.to_string_lossy().into_owned()];
-        }
-    }
-    vec!["go".to_string()]
-}
-
 pub fn detect_cargo_cmd(_root: &Path) -> Vec<String> {
     if let Some(env_bin) = std::env::var_os("TCTX_CARGO_BIN") {
         let p = PathBuf::from(env_bin);

@@ -64,7 +64,6 @@ impl ManagedRoot {
             non_python_environment_fingerprint_for_graph(&spec, Some(&graph));
         graph.frontend_environment_hash =
             frontend_environment_fingerprint_for_graph(&spec, Some(&graph));
-        graph.go_environment_hash = go_environment_fingerprint_for_graph(&spec, Some(&graph));
         let save_snapshot = !graph.has_persisted_edges();
         graph.recompute_edges_or_reuse_persisted();
         let ast_save_handle = if save_snapshot {
@@ -125,7 +124,7 @@ impl ManagedRoot {
         // `required_watches_incomplete` if any required embed/cgo directory cannot be watched.
         let mut watch_set: BTreeSet<PathBuf> = watch_dirs.iter().cloned().collect();
         let mut unwatched_dirs: BTreeSet<PathBuf> = BTreeSet::new();
-        for rel_dir in &graph.go_embed_watch_dirs {
+        for rel_dir in &graph.required_watch_dirs {
             let full_dir = workspace.root.join(rel_dir);
             if full_dir.is_dir() && !watch_set.contains(&full_dir) {
                 if watch_set.len() >= spec.policy.max_watch_dirs {
@@ -161,8 +160,9 @@ impl ManagedRoot {
         let watched_dirs_set: BTreeSet<PathBuf> = watch_set;
         let watcher_filter_dirs = Arc::new(Mutex::new(watched_dirs_set.clone()));
         let watcher_filter_for_callback = Arc::clone(&watcher_filter_dirs);
-        let has_go_embeds = Arc::new(AtomicBool::new(graph.has_go_embed_directives()));
-        let has_go_embeds_for_cb = Arc::clone(&has_go_embeds);
+        let has_raw_or_data_watches =
+            Arc::new(AtomicBool::new(graph.has_raw_or_data_watch_directives()));
+        let has_raw_or_data_watches_for_cb = Arc::clone(&has_raw_or_data_watches);
         let watcher_workspace = Arc::new(Mutex::new(workspace.clone()));
         let watcher_workspace_for_cb = Arc::clone(&watcher_workspace);
         let watcher_testpaths = Arc::new(Mutex::new(graph.testpaths.clone()));
@@ -233,7 +233,7 @@ impl ManagedRoot {
                 active_requests: std::sync::atomic::AtomicUsize::new(0),
                 fs_events_rx: Mutex::new(fs_rx),
                 fs_overflow,
-                has_go_embeds,
+                has_raw_or_data_watches,
                 watcher: Mutex::new(None),
                 watcher_filter_dirs,
                 watcher_workspace,
@@ -313,10 +313,10 @@ impl ManagedRoot {
                             {
                                 return false;
                             }
-                            // When the workspace has Go `//go:embed`, cgo `-I` dirs, or tracked
-                            // C/cgo `#include` headers, admit non-VCS file events so
+                            // When the workspace has tracked raw reads, referenced data dirs, or
+                            // hidden pytest testpaths, admit non-VCS file events so
                             // `drain_fs_events_locked` can match them accurately.
-                            if has_go_embeds_for_cb.load(Ordering::Acquire) {
+                            if has_raw_or_data_watches_for_cb.load(Ordering::Acquire) {
                                 return relative.components().any(|c| {
                                     matches!(
                                         c.as_os_str().to_str(),

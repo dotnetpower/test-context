@@ -24,19 +24,7 @@ impl DependencyGraph {
             let frontend_index = FrontendModuleIndex::build(&self.files);
             self.rebuild_barrel_import_maps(&frontend_index);
             self.last_side_effectful_barrels = frontend_index.side_effectful_barrels.clone();
-            if self.files.keys().any(|p| p.ends_with(".go") || p.ends_with(".rs")) {
-                let polyglot_index = PolyglotIndex::build(
-                    &self.files,
-                    &self.resolved_cgo_inc_by_pkg,
-                    &self.resolved_abs_c_includes,
-                    &self.resolved_go_replaces_by_mod,
-                );
-                self.raw_embedded_files = polyglot_index.collect_all_go_embed_files(&self.files);
-            } else {
-                self.raw_embedded_files.clear();
-            }
-            self.raw_embedded_files
-                .extend(collect_python_raw_fs_files(&self.files));
+            self.raw_embedded_files = collect_raw_embedded_files(&self.files);
             self.raw_embedded_files
                 .extend(frontend_index.collect_raw_imported_files(&self.files));
             self.raw_embedded_files
@@ -675,15 +663,7 @@ impl DependencyGraph {
             FrontendModuleIndex::default()
         };
         let bridge_index = BridgeProviderIndex::build(&self.files);
-        let polyglot_index = PolyglotIndex::build(
-            &self.files,
-            &self.resolved_cgo_inc_by_pkg,
-            &self.resolved_abs_c_includes,
-            &self.resolved_go_replaces_by_mod,
-        );
-        self.raw_embedded_files = polyglot_index.collect_all_go_embed_files(&self.files);
-        self.raw_embedded_files
-            .extend(collect_python_raw_fs_files(&self.files));
+        self.raw_embedded_files = collect_raw_embedded_files(&self.files);
         self.raw_embedded_files
             .extend(frontend_index.collect_raw_imported_files(&self.files));
         self.raw_embedded_files
@@ -716,7 +696,6 @@ impl DependencyGraph {
             let fe_ref = &frontend_index;
             let fix_ref = &fixture_providers;
             let br_ref = &bridge_index;
-            let pg_ref = &polyglot_index;
             let rt_ref = &self.runtime_deps_for_test;
             let p2id_ref = &self.path_to_id;
             std::thread::scope(|scope| {
@@ -728,7 +707,7 @@ impl DependencyGraph {
                             for &(src_id, path, node) in chunk {
                                 let deps = compute_direct_dependencies(
                                     path, node, files_ref, mod_ref, rs_ref, fe_ref, fix_ref,
-                                    br_ref, pg_ref, rt_ref,
+                                    br_ref, rt_ref,
                                 );
                                 let mut row = Vec::with_capacity(deps.len());
                                 for dep in deps {
@@ -772,7 +751,6 @@ impl DependencyGraph {
                     &frontend_index,
                     &fixture_providers,
                     &bridge_index,
-                    &polyglot_index,
                     &self.runtime_deps_for_test,
                 );
                 let mut row = Vec::with_capacity(deps.len());
@@ -1157,27 +1135,10 @@ impl DependencyGraph {
         } else {
             BridgeProviderIndex::default()
         };
-        let need_polyglot = changed_files.iter().any(|p| {
-            is_polyglot_source_path(p)
-                || self.files.get(p).is_some_and(|n| {
-                    n.parsed.defined_symbols.iter().any(|s| {
-                        s.starts_with("c_include:")
-                            || s.starts_with("c_include_sys:")
-                            || s.starts_with("c_include_opt:")
-                    })
-                })
-        });
-        let polyglot_index = if need_polyglot {
-            let pi = PolyglotIndex::build(
-                &self.files,
-                &self.resolved_cgo_inc_by_pkg,
-                &self.resolved_abs_c_includes,
-                &self.resolved_go_replaces_by_mod,
-            );
-            // Rebuild combined raw-embedded set cleanly from BOTH polyglot/Rust embeds AND
-            // frontend `?raw` / `new URL` inputs AND Rust `#[path = "..."] mod` targets so an
-            // incremental Go edit never drops frontend raw-input tracking (and vice versa).
-            self.raw_embedded_files = pi.collect_all_go_embed_files(&self.files);
+        if need_py || need_fe || need_rs {
+            // Rebuild `raw_embedded_files` cleanly so removed Python/Frontend/Rust raw reads
+            // do not remain stuck in the raw-hashed set after incremental edits.
+            self.raw_embedded_files = collect_raw_embedded_files(&self.files);
             if need_fe {
                 self.raw_embedded_files
                     .extend(frontend_index.collect_raw_imported_files(&self.files));
@@ -1193,55 +1154,8 @@ impl DependencyGraph {
                     .extend(fe_idx.collect_raw_imported_files(&self.files));
             }
             self.raw_embedded_files
-                .extend(collect_python_raw_fs_files(&self.files));
-            self.raw_embedded_files
                 .extend(collect_rust_custom_path_mod_files(&self.files));
-            pi
-        } else {
-            if need_py || need_fe || need_rs {
-                // Rebuild `raw_embedded_files` cleanly so removed Python/Frontend/Rust raw reads
-                // do not remain stuck in the raw-hashed set after incremental edits.
-                let has_polyglot_raw = self.files.iter().any(|(p, n)| {
-                    (p.ends_with(".go") || p.ends_with(".rs"))
-                        && n.parsed.defined_symbols.iter().any(|s| {
-                            s.starts_with("go_embed:")
-                                || s.starts_with("rust_raw_embed:")
-                                || s.starts_with("rust_raw_embed_crate:")
-                                || s.starts_with("rust_raw_fs:")
-                        })
-                });
-                if has_polyglot_raw {
-                    let pi = PolyglotIndex::build(
-                        &self.files,
-                        &self.resolved_cgo_inc_by_pkg,
-                        &self.resolved_abs_c_includes,
-                        &self.resolved_go_replaces_by_mod,
-                    );
-                    self.raw_embedded_files = pi.collect_all_go_embed_files(&self.files);
-                } else {
-                    self.raw_embedded_files.clear();
-                }
-                self.raw_embedded_files
-                    .extend(collect_python_raw_fs_files(&self.files));
-                if need_fe {
-                    self.raw_embedded_files
-                        .extend(frontend_index.collect_raw_imported_files(&self.files));
-                } else if self.files.values().any(|n| {
-                    n.parsed.defined_symbols.iter().any(|s| {
-                        s.starts_with("fe_raw_import:")
-                            || s.starts_with("fe_raw_fs:")
-                            || s.starts_with("fe_raw_url_fs:")
-                    })
-                }) {
-                    let fe_idx = FrontendModuleIndex::build(&self.files);
-                    self.raw_embedded_files
-                        .extend(fe_idx.collect_raw_imported_files(&self.files));
-                }
-                self.raw_embedded_files
-                    .extend(collect_rust_custom_path_mod_files(&self.files));
-            }
-            PolyglotIndex::default()
-        };
+        }
         self.cached_conventions = None;
         if need_py {
             self.local_python_roots = self.compute_local_python_roots();
@@ -1263,7 +1177,6 @@ impl DependencyGraph {
                     &frontend_index,
                     &fixture_providers,
                     &bridge_index,
-                    &polyglot_index,
                     &self.runtime_deps_for_test,
                 ),
             );

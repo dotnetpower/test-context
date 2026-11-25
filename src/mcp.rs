@@ -7,7 +7,7 @@ pub fn tools() -> Value {
         "tools": [
             {
                 "name": "test_run",
-                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Run incremental tests (pytest, cargo test, vitest, jest, node --test, go test) via AST graph & dep_hash cache; unchanged passes return in <5ms, only uncached deltas run.",
+                "description": "MCP fallback for sessions where the matching Native tool is unavailable. Run incremental tests (pytest, cargo test, vitest, jest, node --test) via AST graph & dep_hash cache; unchanged passes return in <5ms, only uncached deltas run.",
                 "inputSchema": {
                     "type": "object",
                     "additionalProperties": false,

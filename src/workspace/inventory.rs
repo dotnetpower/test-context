@@ -65,18 +65,14 @@ pub const FRONTEND_CONFIG_FILES: &[&str] = &[
 ];
 
 pub const POLYGLOT_CONFIG_FILES: &[&str] = &[
-    "go.mod",
-    "go.sum",
-    "go.work",
     "CMakeLists.txt",
-    "pom.xml",
-    "build.gradle",
-    "build.gradle.kts",
+    "Directory.Build.props",
+    "Directory.Build.targets",
+    "global.json",
 ];
 
 pub const POLYGLOT_SOURCE_EXTENSIONS: &[&str] = &[
-    ".go", ".cs", ".java", ".kt", ".c", ".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".s",
-    ".S", ".sx", ".m", ".mm", ".f", ".F", ".for", ".f90", ".f95", ".syso", ".proto",
+    ".c", ".cpp", ".cc", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".cs", ".proto",
 ];
 
 pub const FRONTEND_SOURCE_EXTENSIONS: &[&str] = &[
@@ -406,10 +402,7 @@ impl Workspace {
                 "*.less".to_string(),
                 "*.styl".to_string(),
                 "*.stylus".to_string(),
-                "*.go".to_string(),
                 "*.cs".to_string(),
-                "*.java".to_string(),
-                "*.kt".to_string(),
                 "*.c".to_string(),
                 "*.cpp".to_string(),
                 "*.cc".to_string(),
@@ -418,29 +411,21 @@ impl Workspace {
                 "*.hh".to_string(),
                 "*.hpp".to_string(),
                 "*.hxx".to_string(),
-                "*.s".to_string(),
-                "*.S".to_string(),
-                "*.sx".to_string(),
-                "*.m".to_string(),
-                "*.mm".to_string(),
-                "*.f".to_string(),
-                "*.F".to_string(),
-                "*.for".to_string(),
-                "*.f90".to_string(),
-                "*.f95".to_string(),
-                "*.syso".to_string(),
                 "*.proto".to_string(),
                 "*.graphql".to_string(),
                 "*.gql".to_string(),
                 "*.csproj".to_string(),
+                "*.sln".to_string(),
+                "CMakeLists.txt".to_string(),
+                "Directory.Build.props".to_string(),
+                "Directory.Build.targets".to_string(),
+                "global.json".to_string(),
                 "pyproject.toml".to_string(),
                 "pytest.ini".to_string(),
                 "setup.cfg".to_string(),
                 "tox.ini".to_string(),
                 "Cargo.toml".to_string(),
                 "rust-toolchain.toml".to_string(),
-                "go.mod".to_string(),
-                "go.sum".to_string(),
                 "package.json".to_string(),
                 "package-lock.json".to_string(),
                 "pnpm-lock.yaml".to_string(),
@@ -625,6 +610,7 @@ impl Workspace {
             || is_frontend_config_filename(file_name)
             || POLYGLOT_CONFIG_FILES.contains(&file_name)
             || file_name.ends_with(".csproj")
+            || file_name.ends_with(".sln")
     }
 
     pub fn is_permitted_data_rel(&self, rel: &Path) -> bool {

@@ -864,7 +864,7 @@ fn semantic_hash_ignores_comments_and_granulizes_conftest_and_rust_pub_use_barre
 }
 
 #[test]
-fn resolves_nextjs_app_router_wasm_api_contracts_and_polyglot_go_cpp_proto() {
+fn resolves_nextjs_app_router_wasm_api_contracts_and_polyglot_cpp_csharp_proto() {
     let mut graph = DependencyGraph::new();
     // 1. Next.js App Router (`app/layout.tsx` -> `app/dashboard/page.tsx`)
     graph.insert_file_bytes(
@@ -896,20 +896,38 @@ fn resolves_nextjs_app_router_wasm_api_contracts_and_polyglot_go_cpp_proto() {
         "src/frontend/Orders.test.tsx",
         b"import { fast_hash } from '../wasm/pkg';\nimport { ThemeContext } from '../context/Theme';\ntest('fetches orders', async () => {\n  const theme = useContext(ThemeContext);\n  const res = await fetch('/api/v1/orders');\n  return fast_hash(theme);\n});\n",
     );
-    // 3. Go (`go.mod`, `pkg/calc/math.go`, `pkg/calc/math_test.go`) & Protobuf (`proto/order.proto`)
-    graph.insert_file_bytes("go.mod", b"module github.com/acme/demo\n\ngo 1.22\n");
+    // 3. C/C++ (relative, root-resolved, and `include/` -> `src/` headers) + C# (namespace `using`) + Protobuf
     graph.insert_file_bytes(
         "proto/order.proto",
         b"syntax = \"proto3\";\nmessage OrderRequest { string id = 1; }\n",
     );
+    graph.insert_file_bytes("native/math.h", b"int add_vals(int a, int b);\n");
     graph.insert_file_bytes(
-        "pkg/calc/math.go",
-        b"package calc\nfunc Add(a, b int) int { return a + b }\n",
+        "native/math.c",
+        b"#include \"math.h\"\nint add_vals(int a, int b) { return a + b; }\n",
+    );
+    graph.insert_file_bytes("include/core.h", b"int core_mul(int a, int b);\n");
+    graph.insert_file_bytes(
+        "src/core.c",
+        b"#include \"core.h\"\nint core_mul(int a, int b) { return a * b; }\n",
     );
     graph.insert_file_bytes(
-        "pkg/calc/math_test.go",
-        b"package calc\nimport \"testing\"\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal() } }\n",
+        "native/math_test.cpp",
+        b"#include \"native/math.h\"\n#include \"core.h\"\nTEST(MathTest, Adds) { add_vals(1, 2); core_mul(2, 3); }\n",
     );
+    graph.insert_file_bytes(
+        "dotnet/Pricing.cs",
+        b"namespace Acme.Billing;\npublic class Pricing { public int Total() => 42; }\n",
+    );
+    graph.insert_file_bytes(
+        "dotnet/PricingTests.cs",
+        b"using Acme.Billing;\nnamespace Acme.Billing.Tests;\npublic class PricingTests {\n  [Fact]\n  public void ComputesTotal() {}\n}\n",
+    );
+    graph.insert_file_bytes(
+        "Directory.Build.props",
+        b"<Project><PropertyGroup><Nullable>enable</Nullable></PropertyGroup></Project>\n",
+    );
+    graph.insert_file_bytes("CMakeLists.txt", b"project(native)\n");
     graph.insert_file_bytes(
         "src/backend/test_proto_client.py",
         b"import order_pb2\ndef test_proto(): assert order_pb2 is not None\n",
@@ -948,13 +966,48 @@ fn resolves_nextjs_app_router_wasm_api_contracts_and_polyglot_go_cpp_proto() {
         vec!["src/frontend/Orders.test.tsx".to_string()]
     );
 
-    // Go `pkg/calc/math.go` propagates to `pkg/calc/math_test.go`!
-    let affected_go: Vec<String> = graph
-        .affected_tests(&["pkg/calc/math.go".to_string()])
+    // C root-resolved `native/math.h` -> `native/math.c` AND `include/core.h` -> `src/core.c` propagate to `native/math_test.cpp`!
+    let affected_c: Vec<String> = graph
+        .affected_tests(&["native/math.c".to_string()])
         .into_iter()
         .map(|a| a.test_file)
         .collect();
-    assert_eq!(affected_go, vec!["pkg/calc/math_test.go".to_string()]);
+    assert_eq!(affected_c, vec!["native/math_test.cpp".to_string()]);
+    let affected_c_mirrored: Vec<String> = graph
+        .affected_tests(&["src/core.c".to_string()])
+        .into_iter()
+        .map(|a| a.test_file)
+        .collect();
+    assert_eq!(affected_c_mirrored, vec!["native/math_test.cpp".to_string()]);
+
+    // C# namespace `using Acme.Billing;` links `dotnet/Pricing.cs` -> `dotnet/PricingTests.cs`!
+    let affected_cs: Vec<String> = graph
+        .affected_tests(&["dotnet/Pricing.cs".to_string()])
+        .into_iter()
+        .map(|a| a.test_file)
+        .collect();
+    assert_eq!(affected_cs, vec!["dotnet/PricingTests.cs".to_string()]);
+
+    // .NET / CMake / Go config isolation: editing `Directory.Build.props`, `CMakeLists.txt`, or `go.mod`
+    // must NOT invalidate unrelated Python/Rust/Frontend tests!
+    let affected_dotnet_cfg: Vec<String> = graph
+        .affected_tests(&["Directory.Build.props".to_string()])
+        .into_iter()
+        .map(|a| a.test_file)
+        .collect();
+    assert_eq!(affected_dotnet_cfg, vec!["dotnet/PricingTests.cs".to_string()]);
+    let affected_cmake_cfg: Vec<String> = graph
+        .affected_tests(&["CMakeLists.txt".to_string()])
+        .into_iter()
+        .map(|a| a.test_file)
+        .collect();
+    assert_eq!(affected_cmake_cfg, vec!["native/math_test.cpp".to_string()]);
+    let affected_go_mod: Vec<String> = graph
+        .affected_tests(&["go.mod".to_string()])
+        .into_iter()
+        .map(|a| a.test_file)
+        .collect();
+    assert!(affected_go_mod.is_empty(), "go.mod must not affect non-Go tests: {affected_go_mod:?}");
 
     // Protobuf `proto/order.proto` propagates to `src/backend/test_proto_client.py`!
     let affected_proto: Vec<String> = graph
@@ -970,9 +1023,104 @@ fn resolves_nextjs_app_router_wasm_api_contracts_and_polyglot_go_cpp_proto() {
     // Untested modified file detection
     let untested = graph.untested_modified_files(&[
         "src/backend/untested_orphan.py".to_string(),
-        "pkg/calc/math.go".to_string(),
+        "native/math.c".to_string(),
     ]);
     assert_eq!(untested, vec!["src/backend/untested_orphan.py".to_string()]);
+}
+
+#[test]
+fn discovers_nonstandard_c_inc_headers_under_include_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(".gitignore"), "generated/\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("native/include")).unwrap();
+    std::fs::create_dir_all(dir.path().join("native/tests")).unwrap();
+    std::fs::create_dir_all(dir.path().join("generated")).unwrap();
+    std::fs::create_dir_all(dir.path().join("dotnet/tests")).unwrap();
+    std::fs::write(dir.path().join("generated/gen.h"), "#define GEN 1\n").unwrap();
+    std::fs::write(
+        dir.path().join("native/include/defs.inc"),
+        "#define MAGIC_VAL 7\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("native/tests/calc_test.cpp"),
+        "#include <stdio.h>\n#include <defs.inc>\n#include \"generated/gen.h\"\nTEST(CalcTest, Magic) { int x = MAGIC_VAL; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("App.sln"),
+        "Microsoft Visual Studio Solution File, Format Version 12.00\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("dotnet/GlobalUsings.cs"),
+        "global using Acme.Core;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("dotnet/Engine.cs"),
+        "namespace Acme.Old;\npublic class Engine {}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("dotnet/tests/EngineTests.cs"),
+        "namespace Acme.Tests;\npublic class EngineTests {\n  [Fact]\n  public void Runs() {}\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("test_py_ok.py"),
+        "def test_ok():\n    assert True\n",
+    )
+    .unwrap();
+
+    let ws = Workspace::new(dir.path(), vec![], vec![]).unwrap();
+    let mut graph = DependencyGraph::build(&ws, &MemoryPolicy::default()).unwrap();
+    assert!(
+        !graph.discovery_budget_exceeded,
+        "C/C++ system/ignored includes must not disable caching globally for Python/Rust/Frontend"
+    );
+    assert!(
+        graph.files.contains_key("native/include/defs.inc"),
+        "expected angle-bracket nonstandard .inc header to be discovered via data_refs"
+    );
+    assert!(
+        graph.files.get("App.sln").is_some_and(|n| n.is_config),
+        "expected .sln solution file to be indexed as config"
+    );
+    let affected_c: Vec<String> = graph
+        .affected_tests(&["native/include/defs.inc".to_string()])
+        .into_iter()
+        .map(|a| a.test_file)
+        .collect();
+    assert_eq!(affected_c, vec!["native/tests/calc_test.cpp".to_string()]);
+
+    let affected_sln: Vec<String> = graph
+        .affected_tests(&["App.sln".to_string()])
+        .into_iter()
+        .map(|a| a.test_file)
+        .collect();
+    assert_eq!(
+        affected_sln,
+        vec!["dotnet/tests/EngineTests.cs".to_string()],
+        ".sln config must affect only C# tests, not Python/C++ tests"
+    );
+
+    // Live incremental C# namespace update: moving `Engine.cs` into `Acme.Core` must rebuild
+    // consumer edges through `GlobalUsings.cs` (`global using Acme.Core;`)!
+    graph.insert_file_bytes(
+        "dotnet/Engine.cs",
+        b"namespace Acme.Core;\npublic class Engine {}\n",
+    );
+    graph.recompute_structure_incremental(&["dotnet/Engine.cs".to_string()]);
+    let affected_cs_live: Vec<String> = graph
+        .affected_tests(&["dotnet/Engine.cs".to_string()])
+        .into_iter()
+        .map(|a| a.test_file)
+        .collect();
+    assert_eq!(
+        affected_cs_live,
+        vec!["dotnet/tests/EngineTests.cs".to_string()]
+    );
 }
 
 #[test]

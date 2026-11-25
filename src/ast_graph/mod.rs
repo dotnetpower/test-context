@@ -33,9 +33,8 @@ mod parser_rust;
 mod parser_frontend_lex;
 mod parser_frontend;
 mod parser_css;
-mod parser_go;
-mod parser_c_fortran;
-mod polyglot_go;
+mod parser_polyglot;
+mod polyglot;
 
 #[cfg(test)]
 mod tests;
@@ -52,12 +51,11 @@ use resolver_python::*;
 use parser_python_lex::*;
 use parser_rust::*;
 use parser_frontend_lex::*;
-use parser_go::*;
-use parser_c_fortran::*;
-use polyglot_go::*;
+use parser_polyglot::*;
+use polyglot::*;
 
 pub use types::{FileStamp, file_stamp, ImportSpec, RustModDecl, ParsedPythonFile, FileNode, AffectedTest, FileGraphInfo, DependencyGraph};
-pub use snapshot::{effective_gowork_value, save_persisted_ast_snapshot};
+pub use snapshot::save_persisted_ast_snapshot;
 pub use classify::{split_target_file_and_node_in_files, path_matches_testpaths, dir_could_match_testpaths, normalize_lexical_rel, is_frontend_source_path, is_frontend_setup_file, is_frontend_test_path, is_cypress_test_path, is_polyglot_source_path, is_polyglot_test_path, is_frontend_barrel_file, is_stylesheet_path, is_storybook_story_path, is_playwright_e2e_path, file_language_family, frontend_pkg_dir, is_rust_common_test_helper, rust_integration_test_target_name, is_rust_integration_test_path, conftest_scope_dir, is_test_filename, matches_test_filename, testpaths_allow_dir_prefix, normalize_rel_str};
 pub use semantic_hash::{sha256_hex, rust_api_semantic_sha256, semantic_sha256_for_source};
 pub use resolver_rust::{rust_crate_dir};
@@ -66,6 +64,4 @@ pub use parser_python::{parse_python_source, parse_python_source_with_patterns};
 pub use parser_rust::{owning_rust_crate_dirs, is_valid_env_var_name, parse_rust_source, parse_rust_source_for_path};
 pub use parser_frontend::{parse_frontend_source};
 pub use parser_css::{parse_css_source, parse_css_source_for_path};
-pub use parser_go::{parse_polyglot_source};
-pub use polyglot_go::{effective_goenv_path, read_effective_goenv_var};
-pub(crate) use polyglot_go::{is_cgo_native_source_path};
+pub use parser_polyglot::parse_polyglot_source;

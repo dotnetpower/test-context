@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 
-const INSTRUCTIONS: &str = "Use test_run before shell pytest/cargo/vitest/jest/go test in registered workspaces (cached passes return in <5ms; only uncached deltas run). Use test_affected to inspect affected tests, cache state, and cached lint issues. Pass explicit absolute `root` when known.";
+const INSTRUCTIONS: &str = "Use test_run before shell pytest/cargo/vitest/jest/node --test in registered workspaces (cached passes return in <5ms; only uncached deltas run). Use test_affected to inspect affected tests, cache state, and cached lint issues. Pass explicit absolute `root` when known.";
 const MCP_WORKERS: usize = 4;
 const MCP_MAX_TEXT_BYTES: usize = 12 * 1024;
 const MCP_TRIM_THRESHOLD_BYTES: usize = 256 * 1024;

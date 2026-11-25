@@ -115,27 +115,16 @@ pub(super) fn execute_pytest_batch(
         .cloned()
         .collect();
     let extra_args_for_non_rs = sanitized_extra_args.as_slice();
-    let go_targets: Vec<String> = invocation_targets
-        .iter()
-        .filter(|t| split_target_file_and_node_on_disk(&spec.root, t).0.ends_with("_test.go"))
-        .cloned()
-        .collect();
     let py_targets: Vec<String> = invocation_targets
         .iter()
         .filter(|t| {
             let f = split_target_file_and_node_on_disk(&spec.root, t).0;
-            !f.ends_with(".rs")
-                && !f.ends_with("_test.go")
-                && !crate::ast_graph::is_frontend_source_path(f)
+            !f.ends_with(".rs") && !crate::ast_graph::is_frontend_source_path(f)
         })
         .cloned()
         .collect();
 
-    if !rs_targets.is_empty()
-        && fe_targets.is_empty()
-        && go_targets.is_empty()
-        && py_targets.is_empty()
-    {
+    if !rs_targets.is_empty() && fe_targets.is_empty() && py_targets.is_empty() {
         return execute_cargo_test_batch(
             spec,
             &rs_targets,
@@ -149,11 +138,7 @@ pub(super) fn execute_pytest_batch(
             environment_hash,
         );
     }
-    if !fe_targets.is_empty()
-        && rs_targets.is_empty()
-        && go_targets.is_empty()
-        && py_targets.is_empty()
-    {
+    if !fe_targets.is_empty() && rs_targets.is_empty() && py_targets.is_empty() {
         return execute_frontend_test_batch(
             spec,
             &fe_targets,
@@ -167,34 +152,17 @@ pub(super) fn execute_pytest_batch(
             environment_hash,
         );
     }
-    if !go_targets.is_empty()
-        && rs_targets.is_empty()
-        && fe_targets.is_empty()
-        && py_targets.is_empty()
-    {
-        return execute_go_test_batch(
-            spec,
-            &go_targets,
-            dep_hashes,
-            k_expr,
-            extra_args_for_non_rs,
-            source_label,
-            active_pgid,
-            active_pgids,
-            environment_hash,
-        );
-    }
-    if !rs_targets.is_empty() || !fe_targets.is_empty() || !go_targets.is_empty() {
+    if !rs_targets.is_empty() || !fe_targets.is_empty() {
         let mut combined_records = Vec::new();
         let mut combined_outputs = Vec::new();
-        let (rs_res, fe_res, go_res, py_res) = std::thread::scope(|scope| {
+        let (rs_res, fe_res, py_res) = std::thread::scope(|scope| {
             let rs_handle = if !rs_targets.is_empty() {
                 let rs_hashes: BTreeMap<String, String> = dep_hashes
                     .iter()
                     .filter(|(k, _)| k.ends_with(".rs"))
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
-                let rs_extra_args = if !py_targets.is_empty() || !fe_targets.is_empty() || !go_targets.is_empty() {
+                let rs_extra_args = if !py_targets.is_empty() || !fe_targets.is_empty() {
                     filter_cargo_args_from_mixed(extra_args)
                 } else {
                     extra_args.to_vec()
@@ -239,35 +207,11 @@ pub(super) fn execute_pytest_batch(
             } else {
                 None
             };
-            let go_handle = if !go_targets.is_empty() {
-                let go_hashes: BTreeMap<String, String> = dep_hashes
-                    .iter()
-                    .filter(|(k, _)| k.ends_with("_test.go"))
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-                Some(scope.spawn(move || {
-                    execute_go_test_batch(
-                        spec,
-                        &go_targets,
-                        &go_hashes,
-                        k_expr,
-                        extra_args_for_non_rs,
-                        source_label,
-                        active_pgid,
-                        active_pgids,
-                        environment_hash,
-                    )
-                }))
-            } else {
-                None
-            };
             let py_res = if !py_targets.is_empty() {
                 let py_hashes: BTreeMap<String, String> = dep_hashes
                     .iter()
                     .filter(|(k, _)| {
-                        !k.ends_with(".rs")
-                            && !k.ends_with("_test.go")
-                            && !crate::ast_graph::is_frontend_source_path(k)
+                        !k.ends_with(".rs") && !crate::ast_graph::is_frontend_source_path(k)
                     })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
@@ -293,11 +237,10 @@ pub(super) fn execute_pytest_batch(
             (
                 rs_handle.map(|h| h.join().unwrap_or_else(|_| Err(invalid("rs panic").into()))),
                 fe_handle.map(|h| h.join().unwrap_or_else(|_| Err(invalid("fe panic").into()))),
-                go_handle.map(|h| h.join().unwrap_or_else(|_| Err(invalid("go panic").into()))),
                 py_res,
             )
         });
-        for res in [rs_res, fe_res, go_res, py_res].into_iter().flatten() {
+        for res in [rs_res, fe_res, py_res].into_iter().flatten() {
             let (mut recs, out) = res?;
             combined_records.append(&mut recs);
             if !out.trim().is_empty() {

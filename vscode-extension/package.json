@@ -154,7 +154,7 @@
         "name": "test-context-native_testRun",
         "toolReferenceName": "tctxNativeRun",
         "displayName": "Test Context: Incremental Test Run",
-        "modelDescription": "Run incremental tests (pytest, cargo test, vitest, jest, node --test, go test) via AST graph & dep_hash cache. Unchanged passes return in <5ms; only uncached deltas run.",
+        "modelDescription": "Run incremental tests (pytest, cargo test, vitest, jest, node --test) via AST graph & dep_hash cache. Unchanged passes return in <5ms; only uncached deltas run.",
         "userDescription": "Run pytest, cargo test, vitest, jest, and node --test incrementally using the AST dependency graph and background test cache.",
         "tags": [
           "test",

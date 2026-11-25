@@ -28,15 +28,11 @@ impl ManagedRoot {
                 &frontend_environment_fingerprint_for_graph(&spec, Some(&new_graph)),
                 part,
             );
-            let go_hash = partition_env_hash(
-                &go_environment_fingerprint_for_graph(&spec, Some(&new_graph)),
-                part,
-            );
-            new_graph.apply_all_environment_hashes(environment_hash, non_py_hash, fe_hash, go_hash);
+            new_graph.apply_all_environment_hashes(environment_hash, non_py_hash, fe_hash);
             let mut watch_dirs = workspace
                 .watch_directories_for(new_graph.files.keys().map(Path::new), &spec.policy)?;
             let mut sync_watch_set: BTreeSet<PathBuf> = watch_dirs.iter().cloned().collect();
-            for rel_dir in &new_graph.go_embed_watch_dirs {
+            for rel_dir in &new_graph.required_watch_dirs {
                 let full_dir = workspace.root.join(rel_dir);
                 if full_dir.is_dir()
                     && !sync_watch_set.contains(&full_dir)
@@ -146,8 +142,8 @@ impl ManagedRoot {
                 .watcher_testpaths
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = guard.graph.testpaths.clone();
-            self.has_go_embeds
-                .store(guard.graph.has_go_embed_directives(), Ordering::Release);
+            self.has_raw_or_data_watches
+                .store(guard.graph.has_raw_or_data_watch_directives(), Ordering::Release);
             if need_reconcile {
                 Self::reconcile_live_files_locked(&mut guard, None);
             }

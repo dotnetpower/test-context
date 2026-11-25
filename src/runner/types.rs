@@ -401,7 +401,7 @@ pub struct ManagedRoot {
     pub(super) active_requests: std::sync::atomic::AtomicUsize,
     pub(super) fs_events_rx: Mutex<Receiver<Event>>,
     pub(super) fs_overflow: Arc<AtomicBool>,
-    pub(super) has_go_embeds: Arc<AtomicBool>,
+    pub(super) has_raw_or_data_watches: Arc<AtomicBool>,
     pub(super) watcher: Mutex<Option<notify::RecommendedWatcher>>,
     pub(super) watcher_filter_dirs: Arc<Mutex<BTreeSet<PathBuf>>>,
     pub(super) watcher_workspace: Arc<Mutex<Workspace>>,

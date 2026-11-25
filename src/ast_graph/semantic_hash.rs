@@ -143,121 +143,6 @@ pub(super) fn rust_source_has_location_macro(source: &str) -> bool {
     false
 }
 
-/// Token-level detector for Go call-stack / PC-to-line inspection (`runtime.Caller`,
-/// `runtime.Callers`, `runtime.CallersFrames`, `runtime.FuncForPC`, `FileLine`, `runtime.Stack`,
-/// `debug.Stack`, `debug.PrintStack`, aliased or dot-imported, calls or function values).
-pub(super) fn go_source_has_caller_inspection(source: &str) -> bool {
-    if !source.contains("Caller")
-        && !source.contains("Stack")
-        && !source.contains("FileLine")
-        && !source.contains("FuncForPC")
-    {
-        return false;
-    }
-    let bytes = source.as_bytes();
-    let len = bytes.len();
-    let skip_go_ws_comments = |pos: &mut usize| {
-        while *pos < len {
-            if bytes[*pos].is_ascii_whitespace() {
-                *pos += 1;
-            } else if bytes[*pos] == b'/' && *pos + 1 < len && bytes[*pos + 1] == b'/' {
-                *pos += 2;
-                while *pos < len && bytes[*pos] != b'\n' {
-                    *pos += 1;
-                }
-            } else if bytes[*pos] == b'/' && *pos + 1 < len && bytes[*pos + 1] == b'*' {
-                *pos += 2;
-                while *pos + 1 < len && !(bytes[*pos] == b'*' && bytes[*pos + 1] == b'/') {
-                    *pos += 1;
-                }
-                if *pos + 1 < len {
-                    *pos += 2;
-                } else {
-                    *pos = len;
-                }
-            } else {
-                break;
-            }
-        }
-    };
-    // Detect `runtime` or `runtime/debug` imports using decoded Go string literals so escaped
-    // imports like `import . "runtime\x2fdebug"` are recognized accurately.
-    let mut go_imps = BTreeSet::new();
-    let mut go_envs = BTreeSet::new();
-    let mut go_refs = BTreeSet::new();
-    let mut go_syms = BTreeSet::new();
-    let mut go_test_syms = BTreeSet::new();
-    let _ = extract_go_imports_and_env_lexically(
-        source,
-        false,
-        &mut go_imps,
-        &mut go_envs,
-        &mut go_refs,
-        &mut go_syms,
-        &mut go_test_syms,
-    );
-    let imports_runtime_or_debug = go_imps
-        .iter()
-        .any(|imp| imp.module == "runtime" || imp.module == "runtime/debug");
-    let mut i = 0usize;
-    let mut prev_was_dot = false;
-    while i < len {
-        skip_go_ws_comments(&mut i);
-        if i >= len {
-            break;
-        }
-        let b = bytes[i];
-        let after_dot = prev_was_dot;
-        prev_was_dot = false;
-        if b == b'"' || b == b'`' || b == b'\'' {
-            let q = b;
-            i += 1;
-            while i < len && bytes[i] != q {
-                if q != b'`' && bytes[i] == b'\\' && i + 1 < len {
-                    i += 1;
-                    let esc_ch = source[i..].chars().next().unwrap_or(' ');
-                    i += esc_ch.len_utf8();
-                    continue;
-                }
-                let ch = source[i..].chars().next().unwrap_or(' ');
-                i += ch.len_utf8();
-            }
-            if i < len {
-                i += 1;
-            }
-            continue;
-        }
-        if b.is_ascii_alphabetic() || b == b'_' {
-            let start = i;
-            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                i += 1;
-            }
-            let ident = &source[start..i];
-            if matches!(
-                ident,
-                "Caller" | "Callers" | "CallersFrames" | "FuncForPC" | "FileLine"
-            ) {
-                let mut probe = i;
-                skip_go_ws_comments(&mut probe);
-                if (probe < len && bytes[probe] == b'(') || after_dot || imports_runtime_or_debug {
-                    return true;
-                }
-            } else if matches!(ident, "Stack" | "PrintStack") && imports_runtime_or_debug {
-                // Match both direct calls (`debug.Stack()`) AND function-value references
-                // (`import . "runtime/debug"; f := Stack; f()`).
-                return true;
-            }
-            continue;
-        }
-        if b == b'.' {
-            prev_was_dot = true;
-        }
-        let ch = source[i..].chars().next().unwrap_or(' ');
-        i += ch.len_utf8();
-    }
-    false
-}
-
 pub fn rust_api_semantic_sha256(source: &str, fallback_semantic_sha: &str) -> String {
     // Preserve exact line/column numbers in the API hash too when location macros are present.
     if rust_source_has_location_macro(source) {
@@ -714,10 +599,11 @@ pub(super) fn build_file_node_from_bytes(
         || crate::workspace::is_frontend_config_filename(file_name)
         || POLYGLOT_CONFIG_FILES.contains(&file_name)
         || file_name.ends_with(".csproj")
+        || file_name.ends_with(".sln")
     {
         let mut parsed = if matches!(
             file_name,
-            "Cargo.toml" | "pyproject.toml" | "package.json" | "go.mod" | "go.work"
+            "Cargo.toml" | "pyproject.toml" | "package.json"
         ) || ((file_name.starts_with("tsconfig") || file_name.starts_with("jsconfig"))
             && (file_name.ends_with(".json") || file_name.ends_with(".jsonc")))
             || file_name.starts_with("vite.config.")
@@ -897,8 +783,8 @@ pub(super) fn build_file_node_from_bytes(
     if !file_name.ends_with(".py") {
         // Arbitrarily named base tsconfig files (e.g. `configs/base.json` or `configs/base.jsonc`)
         // may be referenced via `extends`; structurally parse JSON/JSONC files with `compilerOptions` or `extends`.
-        // Also parse C `#include` / `__has_include` AND Fortran `INCLUDE '...'` directives in
-        // nonstandard/extensionless header files (e.g. `config.inc`, `myhdr`) on every update.
+        // Also parse C `#include` / `__has_include` directives in nonstandard header files
+        // (e.g. `config.inc`) as well as JSON/JSONC tsconfig extensions on every update.
         let parsed = if file_name.ends_with(".json") || file_name.ends_with(".jsonc") {
             let text = String::from_utf8_lossy(bytes);
             if text.contains("\"compilerOptions\"") || text.contains("\"extends\"") {
@@ -906,38 +792,24 @@ pub(super) fn build_file_node_from_bytes(
             } else {
                 ParsedPythonFile::default()
             }
-        } else if let Ok(text) = std::str::from_utf8(bytes) {
+        } else if let Ok(text) = std::str::from_utf8(bytes)
+            && (text.contains('#') || text.contains("__has_include"))
+        {
             let mut imps = BTreeSet::new();
-            let mut syms = BTreeSet::new();
-            if text.contains('#') || text.contains("__has_include") {
-                for (hdr, is_opt) in extract_c_includes_from_source(text) {
-                    syms.insert(if is_opt {
-                        format!("c_include_opt:{hdr}")
-                    } else {
-                        format!("c_include:{hdr}")
-                    });
-                    imps.insert(ImportSpec {
-                        level: 0,
-                        module: hdr,
-                        symbols: Vec::new(),
-                    });
+            let mut data_refs = BTreeSet::new();
+            for (hdr, _is_quoted) in extract_c_includes_from_source(text) {
+                if !Path::new(&hdr).is_absolute() {
+                    data_refs.insert(hdr.clone());
                 }
-            }
-            if c_source_has_runtime_io(text) {
-                syms.insert("cgo_dynamic_io".to_string());
-            }
-            // Included Fortran/header fragments (`.inc`, `.fh`, `.finc`, `.h`, etc.) may contain
-            // continued `INCLUDE`, `USE`, or runtime I/O/env/subprocess calls in either free-form
-            // or fixed-form Fortran syntax: reconstruct continuations and scan both forms!
-            let free_joined = join_fortran_continuations(text, false);
-            scan_fortran_logical_source(&free_joined, &mut imps, &mut syms);
-            let fixed_joined = join_fortran_continuations(text, true);
-            if fixed_joined != free_joined {
-                scan_fortran_logical_source(&fixed_joined, &mut imps, &mut syms);
+                imps.insert(ImportSpec {
+                    level: 0,
+                    module: hdr,
+                    symbols: Vec::new(),
+                });
             }
             ParsedPythonFile {
                 imports: imps.into_iter().collect(),
-                defined_symbols: syms.into_iter().collect(),
+                data_refs: data_refs.into_iter().collect(),
                 ..ParsedPythonFile::default()
             }
         } else {
@@ -995,33 +867,23 @@ pub fn semantic_sha256_for_source(rel_path: &str, bytes: &[u8]) -> String {
         || rel_path.ends_with(".sass")
         || rel_path.ends_with(".styl")
         || rel_path.ends_with(".stylus");
-    // C/C++/ObjC files support preprocessor line splicing (`// comment \`) that alters whether
+    // C/C++ files support preprocessor line splicing (`// comment \`) that alters whether
     // the following line is active code; hash them verbatim by raw SHA-256.
     let is_c_style = !is_raw_hashed_frontend
         && (rel_path.ends_with(".rs")
             || is_frontend_source_path(rel_path)
             || is_stylesheet_path(rel_path)
-            || rel_path.ends_with(".go")
-            || rel_path.ends_with(".cs")
-            || rel_path.ends_with(".java")
-            || rel_path.ends_with(".kt"));
+            || rel_path.ends_with(".cs"));
     if !is_py && !is_c_style {
         return sha256_hex(bytes);
     }
     let Ok(source) = std::str::from_utf8(bytes) else {
         return sha256_hex(bytes);
     };
-    // Go files using cgo (`import "C"` or raw-string ``import `C` ``) compile preceding `/* ... */`
-    // or `// ...` comments as C preambles; hash them verbatim by raw SHA-256 so preamble edits
-    // always invalidate cache.
-    if rel_path.ends_with(".go") && (source.contains("\"C\"") || source.contains("`C`")) {
-        return sha256_hex(bytes);
-    }
     // Preserve exact line/column numbers for source files that inspect their own source location
-    // at compile/runtime (Rust `line!()`/`column!()`/`file!()`, Go `Caller`/`Callers`, or
-    // Python `inspect.currentframe`/`stack`/`getsource`/`sys._getframe`).
+    // at compile/runtime (Rust `line!()`/`column!()`/`file!()`, Python `inspect.currentframe`/
+    // `stack`/`getsource`/`sys._getframe`, or JS `Error.stack`).
     if (rel_path.ends_with(".rs") && rust_source_has_location_macro(source))
-        || (rel_path.ends_with(".go") && go_source_has_caller_inspection(source))
         || (is_py && python_source_has_location_inspection(source))
         || (is_frontend_source_path(rel_path) && js_source_has_stack_inspection(source))
     {
@@ -1037,7 +899,7 @@ pub fn semantic_sha256_for_source(rel_path: &str, bytes: &[u8]) -> String {
             is_stylesheet_path(rel_path),
             is_frontend_source_path(rel_path),
             rel_path.ends_with(".rs"),
-            rel_path.ends_with(".go"),
+            false,
             &mut hasher,
         );
     }

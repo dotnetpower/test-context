@@ -11,6 +11,10 @@ pub(super) fn node_has_provider_or_fixture(node: &FileNode) -> bool {
                 || s.starts_with("pyo3:")
                 || s.starts_with("wasm:")
                 || s.starts_with("ctx_def:")
+                || s.starts_with("cs_ns:")
+                || s.starts_with("cs_global_using:")
+                || s.starts_with("cs_global_using_static:")
+                || s.starts_with("cs_global_using_alias:")
                 || s.starts_with("css_class:")
                 || s.starts_with("fe_extends:")
                 || s.starts_with("fe_alias:")
@@ -21,8 +25,6 @@ pub(super) fn node_has_provider_or_fixture(node: &FileNode) -> bool {
                 || s.starts_with("reexport:")
                 || s == "fe_has_side_effects"
                 || s == "fe_mod_side_effects"
-                || s.starts_with("cgo_inc:")
-                || s.starts_with("go_embed:")
                 || s.starts_with("fe_raw_import:")
                 || s.starts_with("fe_raw_fs:")
                 || s.starts_with("fe_raw_url_fs:")
@@ -41,11 +43,6 @@ pub(super) fn node_has_provider_or_fixture(node: &FileNode) -> bool {
                 || s == "rust_dynamic_io"
                 || s == "rust_dynamic_env"
                 || s == "rust_dynamic_include"
-                || s == "go_dynamic_io"
-                || s == "go_dynamic_env"
-                || s == "cgo_dynamic_io"
-                || s == "fortran_dynamic_mod"
-                || s == "go_caller_sensitive"
                 || s == "css_has_global"
         })
 }
@@ -136,6 +133,27 @@ pub fn path_matches_testpaths(rel_path: &str, testpaths: &[String]) -> bool {
     })
 }
 
+fn testpath_dir_could_match(pattern: &str, dir_rel: &str) -> bool {
+    let norm_dir = dir_rel.trim_matches('/');
+    if norm_dir.is_empty() {
+        return true;
+    }
+    let dir_parts: Vec<&str> = norm_dir.split('/').collect();
+    let pat_parts: Vec<&str> = pattern.trim_matches('/').split('/').collect();
+    for (idx, dseg) in dir_parts.iter().enumerate() {
+        let Some(pseg) = pat_parts.get(idx) else {
+            return true;
+        };
+        if *pseg == "**" {
+            return true;
+        }
+        if !python_glob_seg_matches(dseg, pseg) {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn dir_could_match_testpaths(dir_rel: &str, testpaths: &[String]) -> bool {
     if testpaths.is_empty() || dir_rel.is_empty() {
         return false;
@@ -145,150 +163,9 @@ pub fn dir_could_match_testpaths(dir_rel: &str, testpaths: &[String]) -> bool {
         if trimmed.is_empty() {
             return false;
         }
-        go_embed_dir_could_match(trimmed, dir_rel)
+        testpath_dir_could_match(trimmed, dir_rel)
     })
 }
-
-pub(super) fn is_standard_c_system_header(hdr: &str) -> bool {
-    let norm = hdr.trim().replace('\\', "/");
-    // Explicit curated whitelist of standard C, POSIX, Linux kernel ABI, macOS/BSD, and Win32
-    // headers. Blanket prefixes like `sys/*` or `linux/*` are intentionally avoided so custom
-    // external headers such as `sys/custom.h` fail closed.
-    matches!(
-        norm.as_str(),
-        // C standard & POSIX root headers
-        "assert.h"
-            | "complex.h"
-            | "ctype.h"
-            | "dirent.h"
-            | "dlfcn.h"
-            | "errno.h"
-            | "fcntl.h"
-            | "fenv.h"
-            | "float.h"
-            | "fnmatch.h"
-            | "glob.h"
-            | "grp.h"
-            | "iconv.h"
-            | "inttypes.h"
-            | "iso646.h"
-            | "langinfo.h"
-            | "libgen.h"
-            | "limits.h"
-            | "locale.h"
-            | "math.h"
-            | "netdb.h"
-            | "nl_types.h"
-            | "poll.h"
-            | "pthread.h"
-            | "pwd.h"
-            | "regex.h"
-            | "sched.h"
-            | "semaphore.h"
-            | "setjmp.h"
-            | "signal.h"
-            | "spawn.h"
-            | "stdalign.h"
-            | "stdarg.h"
-            | "stdatomic.h"
-            | "stdbool.h"
-            | "stddef.h"
-            | "stdint.h"
-            | "stdio.h"
-            | "stdlib.h"
-            | "stdnoreturn.h"
-            | "string.h"
-            | "strings.h"
-            | "syslog.h"
-            | "termios.h"
-            | "tgmath.h"
-            | "time.h"
-            | "uchar.h"
-            | "unistd.h"
-            | "utime.h"
-            | "wchar.h"
-            | "wctype.h"
-            // Standard POSIX/BSD/Linux `sys/*`, `netinet/*`, `arpa/*`, `net/*`
-            | "sys/auxv.h"
-            | "sys/cdefs.h"
-            | "sys/epoll.h"
-            | "sys/errno.h"
-            | "sys/event.h"
-            | "sys/fcntl.h"
-            | "sys/file.h"
-            | "sys/inotify.h"
-            | "sys/ioctl.h"
-            | "sys/ipc.h"
-            | "sys/mman.h"
-            | "sys/mount.h"
-            | "sys/msg.h"
-            | "sys/param.h"
-            | "sys/prctl.h"
-            | "sys/ptrace.h"
-            | "sys/random.h"
-            | "sys/resource.h"
-            | "sys/select.h"
-            | "sys/sem.h"
-            | "sys/sendfile.h"
-            | "sys/shm.h"
-            | "sys/signal.h"
-            | "sys/socket.h"
-            | "sys/stat.h"
-            | "sys/statvfs.h"
-            | "sys/syscall.h"
-            | "sys/sysctl.h"
-            | "sys/sysinfo.h"
-            | "sys/sysmacros.h"
-            | "sys/time.h"
-            | "sys/times.h"
-            | "sys/types.h"
-            | "sys/uio.h"
-            | "sys/un.h"
-            | "sys/utsname.h"
-            | "sys/wait.h"
-            | "sys/xattr.h"
-            | "arpa/inet.h"
-            | "net/if.h"
-            | "netinet/in.h"
-            | "netinet/ip.h"
-            | "netinet/tcp.h"
-            | "netinet/udp.h"
-            // Standard Linux UAPI headers
-            | "linux/audit.h"
-            | "linux/errno.h"
-            | "linux/filter.h"
-            | "linux/fs.h"
-            | "linux/futex.h"
-            | "linux/if.h"
-            | "linux/if_ether.h"
-            | "linux/if_tun.h"
-            | "linux/ioctl.h"
-            | "linux/limits.h"
-            | "linux/magic.h"
-            | "linux/netlink.h"
-            | "linux/random.h"
-            | "linux/rtnetlink.h"
-            | "linux/sched.h"
-            | "linux/seccomp.h"
-            | "linux/sockios.h"
-            | "linux/types.h"
-            | "linux/unistd.h"
-            | "linux/version.h"
-            // Standard macOS / Darwin / Win32 headers
-            | "mach/clock.h"
-            | "mach/mach.h"
-            | "mach/mach_time.h"
-            | "mach/task.h"
-            | "mach/vm_map.h"
-            | "CoreFoundation/CoreFoundation.h"
-            | "Security/Security.h"
-            | "TargetConditionals.h"
-            | "windows.h"
-            | "winsock2.h"
-            | "ws2tcpip.h"
-    )
-}
-
 
 pub fn normalize_lexical_rel(path: &Path) -> Option<String> {
     if let Some(s) = path.to_str()
@@ -422,20 +299,12 @@ pub fn is_polyglot_source_path(rel_path: &str) -> bool {
 }
 
 pub fn is_polyglot_test_path(rel_path: &str, parsed: &ParsedPythonFile) -> bool {
-    if rel_path.ends_with("_test.go") {
-        return true;
-    }
-    if (rel_path.ends_with(".cs")
-        || rel_path.ends_with(".java")
-        || rel_path.ends_with(".kt")
+    (rel_path.ends_with(".cs")
         || rel_path.ends_with(".cpp")
         || rel_path.ends_with(".cc")
+        || rel_path.ends_with(".cxx")
         || rel_path.ends_with(".c"))
         && !parsed.test_symbols.is_empty()
-    {
-        return true;
-    }
-    false
 }
 
 pub fn is_frontend_barrel_file(rel_path: &str) -> bool {
@@ -499,17 +368,16 @@ pub fn file_language_family(rel_path: &str) -> &'static str {
         "rust"
     } else if is_frontend_source_path(rel_path) || is_stylesheet_path(rel_path) {
         "frontend"
-    } else if rel_path.ends_with(".go") {
-        "go"
     } else if rel_path.ends_with(".cs") {
         "csharp"
-    } else if rel_path.ends_with(".java") || rel_path.ends_with(".kt") {
-        "jvm"
     } else if rel_path.ends_with(".c")
         || rel_path.ends_with(".cpp")
         || rel_path.ends_with(".cc")
+        || rel_path.ends_with(".cxx")
         || rel_path.ends_with(".h")
+        || rel_path.ends_with(".hh")
         || rel_path.ends_with(".hpp")
+        || rel_path.ends_with(".hxx")
     {
         "cpp"
     } else {

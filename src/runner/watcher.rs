@@ -162,7 +162,7 @@ impl ManagedRoot {
         guard
             .unwatched_dirs
             .retain(|d| d.is_dir() && !guard.watched_dirs.contains(d));
-        let missing_required = guard.graph.go_embed_watch_dirs.iter().any(|rel| {
+        let missing_required = guard.graph.required_watch_dirs.iter().any(|rel| {
             let full = guard.workspace.root.join(rel);
             full.is_dir() && !guard.watched_dirs.contains(&full)
         });
@@ -321,41 +321,21 @@ impl ManagedRoot {
             }
             let is_under_explicit_testpath = rel_str.ends_with(".py")
                 && crate::ast_graph::path_matches_testpaths(&rel_str, &guard.graph.testpaths);
-            let matches_go_embed = guard.graph.matches_any_go_embed(&rel_str);
             let matches_watched_dir = guard.graph.matches_any_watched_data_dir(&rel_str);
             let matches_missing_ref = guard.graph.matches_any_missing_data_ref(&rel_str);
             let is_excluded_rel = guard.workspace.is_excluded_or_ignored_rel(rel);
-            let is_go_native_sibling = is_excluded_rel
-                && guard.graph.files.keys().any(|p| p.ends_with(".go"))
-                && (rel_str.ends_with(".go")
-                    || rel_str == "go.mod"
-                    || rel_str.ends_with("/go.mod")
-                    || rel_str == "go.work"
-                    || rel_str.ends_with("/go.work")
-                    || crate::ast_graph::is_cgo_native_source_path(&rel_str)
-                    || rel_str.ends_with(".syso")
-                    || rel_str.ends_with(".swig")
-                    || rel_str.ends_with(".swigcxx"));
-            if (matches_go_embed
-                || matches_watched_dir
-                || matches_missing_ref
-                || is_go_native_sibling)
-                && is_excluded_rel
-            {
-                // An excluded/gitignored file inside a Go embed, Go package sibling, referenced
-                // build-input directory, or previously absent referenced fixture changed (or was
-                // deleted): preserve exclusions and re-run discovery so `discovery_budget_exceeded`
-                // stays accurate!
+            if (matches_watched_dir || matches_missing_ref) && is_excluded_rel {
+                // An excluded/gitignored file inside a referenced build-input directory or
+                // previously absent referenced fixture changed (or was deleted): preserve
+                // exclusions and re-run discovery so `discovery_budget_exceeded` stays accurate!
                 guard
                     .graph
                     .discover_referenced_data_files(&guard.workspace, &guard.spec.policy);
                 continue;
             }
             let is_known_data = guard.graph.files.contains_key(&rel_str)
-                || matches_go_embed
                 || matches_watched_dir
                 || matches_missing_ref
-                || guard.graph.matches_any_cgo_include_dir(&rel_str)
                 || is_under_explicit_testpath;
             if !guard.workspace.is_permitted_rel(rel) && !is_known_data {
                 let is_fe_shadow_candidate = matches!(
@@ -508,17 +488,13 @@ impl ManagedRoot {
                 guard.generation = guard.generation.saturating_add(1);
             }
         }
-        // Register any newly created root embed/cgo directory as required BEFORE attempting
+        // Register any newly created required data directory BEFORE attempting
         // `add_watch_dirs_locked` so hitting `max_watch_dirs` immediately flips the fail-closed flag.
         for dir in &new_watch_dirs {
             if let Ok(rel) = dir.strip_prefix(&guard.workspace.root) {
                 let rel_s = normalize_rel_str(rel);
-                if !rel_s.is_empty()
-                    && (guard.graph.dir_matches_any_go_embed(&rel_s)
-                        || guard.graph.matches_any_cgo_include_dir(&rel_s)
-                        || guard.graph.matches_any_missing_data_ref(&rel_s))
-                {
-                    guard.graph.go_embed_watch_dirs.insert(rel_s);
+                if !rel_s.is_empty() && guard.graph.matches_any_missing_data_ref(&rel_s) {
+                    guard.graph.required_watch_dirs.insert(rel_s);
                 }
             }
         }
@@ -561,16 +537,13 @@ impl ManagedRoot {
                             continue;
                         }
                         let dir_rel_str = normalize_rel_str(rel);
-                        let is_required_embed_or_cgo_dir = guard
-                            .graph
-                            .dir_matches_any_go_embed(&dir_rel_str)
-                            || guard.graph.matches_any_watched_data_dir(&dir_rel_str)
-                            || guard.graph.matches_any_cgo_include_dir(&dir_rel_str)
-                            || guard.graph.matches_any_missing_data_ref(&dir_rel_str)
-                            || crate::ast_graph::dir_could_match_testpaths(
-                                &dir_rel_str,
-                                &guard.graph.testpaths,
-                            );
+                        let is_required_data_dir =
+                            guard.graph.matches_any_watched_data_dir(&dir_rel_str)
+                                || guard.graph.matches_any_missing_data_ref(&dir_rel_str)
+                                || crate::ast_graph::dir_could_match_testpaths(
+                                    &dir_rel_str,
+                                    &guard.graph.testpaths,
+                                );
                         if guard.graph.matches_any_watched_data_dir(&dir_rel_str)
                             && guard.workspace.is_excluded_or_ignored_rel(rel)
                         {
@@ -581,14 +554,14 @@ impl ManagedRoot {
                             && guard.workspace.default_excludes
                             && crate::exclusion_policy::is_excluded_dir_name(name)
                             && name != ".cargo"
-                            && !is_required_embed_or_cgo_dir
+                            && !is_required_data_dir
                         {
                             continue;
                         }
-                        if is_required_embed_or_cgo_dir && !dir_rel_str.is_empty() {
+                        if is_required_data_dir && !dir_rel_str.is_empty() {
                             // Register as required BEFORE attempting watch so exceeding
                             // `max_watch_dirs` immediately flips `required_watches_incomplete`.
-                            guard.graph.go_embed_watch_dirs.insert(dir_rel_str);
+                            guard.graph.required_watch_dirs.insert(dir_rel_str);
                         }
                         if !guard.watched_dirs.contains(&ep) {
                             // Install watch on each nested directory BEFORE scanning its entries
@@ -605,10 +578,9 @@ impl ManagedRoot {
                                 &rel_str,
                                 &guard.graph.testpaths,
                             );
-                        let matches_go_embed = guard.graph.matches_any_go_embed(&rel_str);
                         let matches_watched_dir = guard.graph.matches_any_watched_data_dir(&rel_str);
                         let matches_missing_ref = guard.graph.matches_any_missing_data_ref(&rel_str);
-                        if (matches_go_embed || matches_watched_dir || matches_missing_ref)
+                        if (matches_watched_dir || matches_missing_ref)
                             && guard.workspace.is_excluded_or_ignored_rel(rel)
                         {
                             // Preserve exclusions during catch-up scans AND fail closed.
@@ -617,10 +589,8 @@ impl ManagedRoot {
                         }
                         if !guard.workspace.is_permitted_rel(rel)
                             && !guard.graph.files.contains_key(&rel_str)
-                            && !matches_go_embed
                             && !matches_watched_dir
                             && !matches_missing_ref
-                            && !guard.graph.matches_any_cgo_include_dir(&rel_str)
                             && !is_explicit_tp_py
                         {
                             continue;
@@ -685,8 +655,8 @@ impl ManagedRoot {
             return;
         }
         if !changed_rels.is_empty() {
-            self.has_go_embeds
-                .store(guard.graph.has_go_embed_directives(), Ordering::Release);
+            self.has_raw_or_data_watches
+                .store(guard.graph.has_raw_or_data_watch_directives(), Ordering::Release);
             invalidate_git_dirty_cache(&guard.workspace.root);
             let pytest_cfg_touched = changed_rels.iter().any(|rel| {
                 matches!(
@@ -712,8 +682,8 @@ impl ManagedRoot {
                     .watcher_testpaths
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = guard.graph.testpaths.clone();
-                self.has_go_embeds
-                    .store(guard.graph.has_go_embed_directives(), Ordering::Release);
+                self.has_raw_or_data_watches
+                    .store(guard.graph.has_raw_or_data_watch_directives(), Ordering::Release);
                 let tp_watch_dirs: BTreeSet<PathBuf> = collect_testpath_watch_dirs(
                     &guard.workspace.root,
                     &guard.graph.testpaths,
@@ -750,14 +720,14 @@ impl ManagedRoot {
                 guard
                     .graph
                     .discover_referenced_data_files(&guard.workspace, &guard.spec.policy);
-                self.has_go_embeds
-                    .store(guard.graph.has_go_embed_directives(), Ordering::Release);
+                self.has_raw_or_data_watches
+                    .store(guard.graph.has_raw_or_data_watch_directives(), Ordering::Release);
                 // Install watches for any newly discovered Go embed or cgo header directories
                 // BEFORE finalizing edges, then rescan once if new watches were added so files
                 // created in the watch-installation race window cannot be missed.
                 let new_embed_dirs: BTreeSet<PathBuf> = guard
                     .graph
-                    .go_embed_watch_dirs
+                    .required_watch_dirs
                     .iter()
                     .map(|d| guard.workspace.root.join(d))
                     .filter(|d| d.is_dir() && !guard.watched_dirs.contains(d))
@@ -915,8 +885,6 @@ impl ManagedRoot {
                         && !guard.workspace.is_permitted_data_rel(rel_p)
                         && !rt_deps.contains(p.as_str())
                         && !guard.graph.raw_embedded_files.contains(p.as_str())
-                        && !guard.graph.matches_any_go_embed(p)
-                        && !guard.graph.matches_any_cgo_include_dir(p)
                         && !guard.graph.matches_any_missing_data_ref(p)
                 })
                 .cloned()
@@ -1042,14 +1010,14 @@ impl ManagedRoot {
                 guard.last_watcher_error = Some(format!("overflow inventory failed: {err}"));
             }
         }
-        if !discovered_rels.is_empty() || guard.graph.has_go_embed_directives() {
+        if !discovered_rels.is_empty() || guard.graph.has_raw_or_data_watch_directives() {
             if !discovered_rels.is_empty() && guard.graph.refresh_pytest_config(&guard.workspace) {
                 *self
                     .watcher_testpaths
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = guard.graph.testpaths.clone();
-                self.has_go_embeds
-                    .store(guard.graph.has_go_embed_directives(), Ordering::Release);
+                self.has_raw_or_data_watches
+                    .store(guard.graph.has_raw_or_data_watch_directives(), Ordering::Release);
                 let new_tp_dirs: BTreeSet<PathBuf> = collect_testpath_watch_dirs(
                     &guard.workspace.root,
                     &guard.graph.testpaths,
@@ -1105,11 +1073,11 @@ impl ManagedRoot {
             guard
                 .graph
                 .discover_referenced_data_files(&guard.workspace, &guard.spec.policy);
-            self.has_go_embeds
-                .store(guard.graph.has_go_embed_directives(), Ordering::Release);
+            self.has_raw_or_data_watches
+                .store(guard.graph.has_raw_or_data_watch_directives(), Ordering::Release);
             let embed_watch_dirs: BTreeSet<PathBuf> = guard
                 .graph
-                .go_embed_watch_dirs
+                .required_watch_dirs
                 .iter()
                 .map(|d| guard.workspace.root.join(d))
                 .filter(|d| d.is_dir() && !guard.watched_dirs.contains(d))
@@ -1152,11 +1120,11 @@ impl ManagedRoot {
             guard
                 .graph
                 .discover_referenced_data_files(&guard.workspace, &guard.spec.policy);
-            self.has_go_embeds
-                .store(guard.graph.has_go_embed_directives(), Ordering::Release);
+            self.has_raw_or_data_watches
+                .store(guard.graph.has_raw_or_data_watch_directives(), Ordering::Release);
             let mut late_dirs: BTreeSet<PathBuf> = guard
                 .graph
-                .go_embed_watch_dirs
+                .required_watch_dirs
                 .iter()
                 .map(|d| guard.workspace.root.join(d))
                 .filter(|d| d.is_dir() && !guard.watched_dirs.contains(d))
@@ -1278,10 +1246,8 @@ impl ManagedRoot {
             workspace,
             has_rs,
             has_fe,
-            has_go,
             has_py,
             fe_dirs,
-            go_dirs,
             rs_tc_dirs,
             cargo_cfg_cands,
         ) = {
@@ -1294,18 +1260,10 @@ impl ManagedRoot {
                 .files
                 .keys()
                 .any(|p| crate::ast_graph::is_frontend_source_path(p));
-            let has_go = guard.graph.files.keys().any(|p| {
-                p.ends_with(".go") || p == "go.mod" || p.ends_with("/go.mod")
-            });
             let has_py = !guard.spec.pytest_cmd.is_empty()
                 || guard.graph.files.keys().any(|p| p.ends_with(".py"));
             let fe_dirs = if has_fe {
                 collect_frontend_env_dirs(&guard.spec, Some(&guard.graph))
-            } else {
-                BTreeSet::new()
-            };
-            let go_dirs = if has_go {
-                collect_go_module_dirs(&guard.spec, Some(&guard.graph))
             } else {
                 BTreeSet::new()
             };
@@ -1320,10 +1278,8 @@ impl ManagedRoot {
                 guard.workspace.clone(),
                 has_rs,
                 has_fe,
-                has_go,
                 has_py,
                 fe_dirs,
-                go_dirs,
                 rs_tc_dirs,
                 cargo_cfg_cands,
             )
@@ -1362,11 +1318,6 @@ impl ManagedRoot {
         } else {
             false
         };
-        let go_hash = if has_go {
-            go_environment_fingerprint_for_dirs(&spec, &go_dirs)
-        } else {
-            String::new()
-        };
 
         let mut guard = self.lock_state();
         let state = &mut *guard;
@@ -1377,22 +1328,13 @@ impl ManagedRoot {
         let env_hash = partition_env_hash(&env_hash, part);
         let non_py_hash = partition_env_hash(&non_py_hash, part);
         let fe_hash = partition_env_hash(&fe_hash, part);
-        let go_hash = partition_env_hash(&go_hash, part);
         if non_py_hash != state.graph.non_python_environment_hash
             || env_hash != state.graph.environment_hash
             || fe_hash != state.graph.frontend_environment_hash
-            || go_hash != state.graph.go_environment_hash
         {
-            let go_changed = go_hash != state.graph.go_environment_hash;
             state
                 .graph
-                .apply_all_environment_hashes(env_hash, non_py_hash, fe_hash, go_hash);
-            if has_go && go_changed {
-                state
-                    .graph
-                    .discover_referenced_data_files(&state.workspace, &state.spec.policy);
-                state.graph.recompute_edges();
-            }
+                .apply_all_environment_hashes(env_hash, non_py_hash, fe_hash);
             state.last_environment_check = Instant::now();
         }
     }
@@ -1896,3 +1838,49 @@ impl ManagedRoot {
 
 }
 
+
+/// Collects directories (including existing ancestors) reachable by configured pytest `testpaths`.
+pub(super) fn collect_testpath_watch_dirs(
+    root: &Path,
+    testpaths: &[String],
+    policy: &crate::policy::MemoryPolicy,
+) -> Vec<PathBuf> {
+    if testpaths.is_empty() {
+        return Vec::new();
+    }
+    let mut dirs = BTreeSet::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() || !ft.is_dir() {
+                continue;
+            }
+            let p = entry.path();
+            let dname = entry.file_name();
+            if matches!(dname.to_str(), Some(".git" | ".hg" | ".svn" | "node_modules" | "target")) {
+                continue;
+            }
+            let Ok(rel) = p.strip_prefix(root) else {
+                continue;
+            };
+            let rel_s = normalize_rel_str(rel);
+            if crate::ast_graph::dir_could_match_testpaths(&rel_s, testpaths) {
+                visited += 1;
+                if visited > policy.max_watch_dirs {
+                    break;
+                }
+                if dirs.insert(p.clone()) {
+                    stack.push(p);
+                }
+            }
+        }
+    }
+    dirs.into_iter().collect()
+}

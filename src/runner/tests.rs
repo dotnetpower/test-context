@@ -651,7 +651,7 @@ fn parses_eslint_json_and_node_jsonl_batch_outputs() {
 }
 
 #[test]
-fn parses_clippy_go_test_structured_failures_and_junit_sarif_reports() {
+fn parses_clippy_structured_failures_and_junit_sarif_reports() {
     let clippy_ndjson = br#"{"reason":"compiler-message","message":{"code":{"code":"clippy::needless_return"},"level":"warning","message":"unneeded `return` statement","spans":[{"file_name":"src/lib.rs","is_primary":true,"line_start":12,"column_start":5}],"children":[{"spans":[{"suggested_replacement":"x + 1"}]}]}}
 "#;
     let known_rs = vec!["src/lib.rs".to_string()];
@@ -661,20 +661,6 @@ fn parses_clippy_go_test_structured_failures_and_junit_sarif_reports() {
     assert_eq!(rs_diags[0].code, "clippy::needless_return");
     assert_eq!(rs_diags[0].row, 12);
     assert!(rs_diags[0].fixable);
-
-    let go_ndjson = r#"{"Action":"run","Package":"github.com/acme/demo/pkg/calc","Test":"TestAdd"}
-{"Action":"pass","Package":"github.com/acme/demo/pkg/calc","Test":"TestAdd","Elapsed":0.012}
-{"Action":"fail","Package":"github.com/acme/demo/pkg/calc","Test":"TestDivZero","Elapsed":0.004}
-"#;
-    let mut go_known = BTreeMap::new();
-    go_known.insert("pkg/calc/math_test.go".to_string(), "gh1".to_string());
-    let go_stats = parse_go_test_json_output(go_ndjson, &go_known, Path::new("."));
-    assert_eq!(go_stats["pkg/calc/math_test.go"].passed, 1);
-    assert_eq!(go_stats["pkg/calc/math_test.go"].failed, 1);
-    assert_eq!(
-        go_stats["pkg/calc/math_test.go"].failed_nodeids,
-        vec!["pkg/calc/math_test.go::TestDivZero".to_string()]
-    );
 
     let raw_tb = "node_modules/vitest/dist/index.js:100:1\nsrc/components/Card.tsx:27:5\nE   AssertionError: expected 41 to equal 42\n";
     let structured = extract_structured_failures(
@@ -832,93 +818,4 @@ fn rust_unit_tests_are_background_eligible_and_main_bin_is_resolved() {
     graph.recompute_edges();
     assert!(background_eligible(&spec, &graph, "src/calc.rs"));
     assert!(!background_eligible(&spec, &graph, "tests/int_test.rs"));
-}
-
-#[test]
-fn go_run_split_and_re2_escapes_handle_posix_classes_and_control_chars() {
-    assert_eq!(
-        split_go_run_alternations("TestFoo/[[:alpha:]|0]"),
-        vec![vec!["TestFoo", "[[:alpha:]|0]"]]
-    );
-    assert_eq!(
-        split_go_run_alternations("TestFoo/[^]|0]|TestBar/ok"),
-        vec![vec!["TestFoo", "[^]|0]"], vec!["TestBar", "ok"]]
-    );
-    assert_eq!(go_re2_segment_matches(r"\f", "f"), Ok(false));
-    assert_eq!(go_re2_segment_matches(r"\f", "\x0c"), Ok(true));
-    assert_eq!(go_re2_segment_matches(r"\a", "a"), Ok(false));
-    assert_eq!(go_re2_segment_matches(r"\a", "\x07"), Ok(true));
-    assert_eq!(go_re2_segment_matches(r"\v", "v"), Ok(false));
-    assert_eq!(go_re2_segment_matches(r"\v", "\x0b"), Ok(true));
-    assert!(go_re2_segment_matches(r"\q", "q").is_err());
-    assert_eq!(go_re2_segment_matches("[[:alpha:]]+", "hello"), Ok(true));
-    assert_eq!(go_re2_segment_matches("^[[:alpha:]]+$", "123"), Ok(false));
-    assert_eq!(go_re2_segment_matches("^[[:^digit:]]+$", "abc"), Ok(true));
-    assert_eq!(go_re2_segment_matches("(?i)hello", "HeLLo"), Ok(true));
-    assert_eq!(go_re2_segment_matches("(?i:foo)bar", "FOObar"), Ok(true));
-    assert_eq!(go_re2_segment_matches("(?i:foo)bar", "FOOBAR"), Ok(false));
-    assert_eq!(go_re2_segment_matches("(?:(?i)foo|bar)", "BAR"), Ok(true));
-    assert_eq!(go_re2_segment_matches("(?:(?i)foo|bar)baz", "barBAZ"), Ok(false));
-    assert_eq!(go_re2_segment_matches("(?i)Σ", "ς"), Ok(true));
-    assert_eq!(go_re2_segment_matches("(?i)k", "\u{212A}"), Ok(true));
-    assert_eq!(go_re2_segment_matches("(?i)\u{1E9E}", "\u{00DF}"), Ok(true));
-    assert_eq!(go_re2_segment_matches("(?i)I", "\u{0131}"), Ok(false));
-    assert_eq!(go_testing_rewrite("hello world"), "hello_world");
-    assert_eq!(go_testing_rewrite("hello\u{2003}world"), "hello_world");
-    assert_eq!(go_testing_rewrite("bell\x07zw\u{200B}"), r"bell\azw\u200b");
-    assert_eq!(go_testing_rewrite("\u{2764}\u{FE0F}"), "\u{2764}\u{FE0F}");
-    assert_eq!(go_testing_rewrite("x\u{0378}y"), r"x\u0378y");
-    assert_eq!(
-        normalize_toml_table_header("[ features ]").as_deref(),
-        Some("[features]")
-    );
-    assert_eq!(
-        normalize_toml_table_header("[[ \"test\" ]]").as_deref(),
-        Some("[[test]]")
-    );
-    assert_eq!(
-        normalize_toml_table_header("[ workspace . dependencies ]").as_deref(),
-        Some("[workspace.dependencies]")
-    );
-    let expanded = expand_cargo_toml_root_syntaxes(
-        r#"
-package.name = "demo"
-lib.path = "custom.rs"
-features = { default = ["integration"], integration = [] }
-dependencies = { b = { path = "../b", features = ["x"] } }
-workspace = { members = ["a", "b"] }
-[package]
-description = """
-has unmatched [ bracket
-"""
-[lib]
-path = "custom2.rs"
-"#,
-    );
-    assert!(expanded.contains("[package]\nname = \"demo\""));
-    assert!(expanded.contains("[lib]\npath = \"custom.rs\""));
-    assert!(expanded.contains("[features]\ndefault = [\"integration\"]"));
-    assert!(expanded.contains("[dependencies]\nb = { path = \"../b\", features = [\"x\"] }"));
-    assert!(expanded.contains("[workspace]\nmembers = [\"a\", \"b\"]"));
-    assert!(expanded.contains("[lib]\npath = \"custom2.rs\""));
-    assert_eq!(unquote_toml_scalar("\"\"\"demo\"\"\"").as_deref(), Some("demo"));
-    assert_eq!(
-        split_toml_dotted_key(r#"features."f\u006f\u006f""#),
-        vec!["features".to_string(), "foo".to_string()]
-    );
-    assert_eq!(
-        split_toml_dotted_key(r#""target" . 'cfg(unix)' . dependencies . b"#),
-        vec![
-            "target".to_string(),
-            "cfg(unix)".to_string(),
-            "dependencies".to_string(),
-            "b".to_string()
-        ]
-    );
-    let ml_expanded = expand_cargo_toml_root_syntaxes(
-        "[[test]]\nrequired-features = [\"\"\"f\\\n  oo\"\"\"]\n",
-    );
-    let mut ml_feats = Vec::new();
-    parse_toml_string_array_items(&ml_expanded, &mut ml_feats);
-    assert_eq!(ml_feats, vec!["foo".to_string()]);
 }

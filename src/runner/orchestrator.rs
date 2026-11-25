@@ -341,7 +341,6 @@ impl ManagedRoot {
                 match lang.as_str() {
                     "python" => resolved_targets.retain(|tf| tf.ends_with(".py")),
                     "rust" => resolved_targets.retain(|tf| tf.ends_with(".rs")),
-                    "go" => resolved_targets.retain(|tf| tf.ends_with("_test.go")),
                     "frontend" | "vitest" | "jest" | "node" => resolved_targets
                         .retain(|tf| crate::ast_graph::is_frontend_source_path(tf)),
                     _ => {}
@@ -384,10 +383,9 @@ impl ManagedRoot {
                 let env_h = partition_env_hash(&guard.graph.environment_hash, p);
                 let non_py_h = partition_env_hash(&guard.graph.non_python_environment_hash, p);
                 let fe_h = partition_env_hash(&guard.graph.frontend_environment_hash, p);
-                let go_h = partition_env_hash(&guard.graph.go_environment_hash, p);
                 guard
                     .graph
-                    .apply_all_environment_hashes(env_h, non_py_h, fe_h, go_h);
+                    .apply_all_environment_hashes(env_h, non_py_h, fe_h);
             }
             environment_hash = guard.graph.environment_hash.clone();
             parallel_delta = guard.spec.policy.parallel_delta_enabled

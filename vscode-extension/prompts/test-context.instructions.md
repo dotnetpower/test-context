@@ -1,6 +1,6 @@
 ---
-description: "Use when running tests/linters (pytest, cargo test, vitest, jest, node --test, go test, ruff, eslint) or checking affected tests in a registered workspace"
-applyTo: "**/*.{py,rs,ts,tsx,mts,cts,js,jsx,mjs,cjs,vue,svelte,css,scss,sass,less,go,proto,graphql,gql,c,cc,cpp,h,hpp,cs,java,kt,toml,json,yaml,yml,ini,cfg,sh,mk}"
+description: "Use when running tests/linters (pytest, cargo test, vitest, jest, node --test, ruff, eslint) or checking affected tests in a registered workspace"
+applyTo: "**/*.{py,rs,ts,tsx,mts,cts,js,jsx,mjs,cjs,vue,svelte,css,scss,sass,less,proto,graphql,gql,c,cc,cpp,h,hpp,cs,toml,json,yaml,yml,ini,cfg,sh,mk}"
 ---
 
 # Test Context (`tctx`) — Incremental Test & Lint Routing
