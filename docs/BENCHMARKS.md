@@ -7,29 +7,29 @@ Across **8 independent daemon sessions** (320 paired observations) targeting the
 Measured with the `v0.1.5` release build. Exact source-tree and binary hashes are
 recorded in [results.json](../benchmarks/results/aks-store-demo/results.json).
 
-- **Warm suite re-execution (`warm_suite`)**: **951.63 ms without TCTX** vs **0.74 ms with TCTX** (**1,290.06× speedup**, 95% CI **1,242.85–1,336.89×**; median **950.48 ms → 0.74 ms**).
-- **Post-edit speculative background run (`bg_speculative`)**: When a router (`src/ai-service/routers/description_generator.py`) is edited and the background worker verifies affected tests and Ruff rules while the developer or AI coding agent is reasoning, the subsequent `test_run` call takes **0.77 ms** (median **0.73 ms**) vs **945.82 ms** for direct `pytest` (**1,230.27× speedup**, 95% CI **1,208.76–1,253.39×**).
-- **Reverted edit Merkle cache hit (`merkle_revert`)**: Reverting a source edit back to a previously verified state hits the content-addressed SHA-256 Merkle `dep_hash` history in **0.80 ms** (median **0.76 ms**) vs **951.10 ms** (**1,185.17× speedup**, 95% CI **1,123.35–1,245.98×**).
-- **Immediate 0ms-delay leaf edit (`leaf_delta`)**: Calling `test_run` immediately (0 ms delay) after editing an isolated leaf helper skips 3 cached test files and runs only the 1 affected test file via the **Warm Pytest Fork Zygote (`os.fork()` with safe preloads, explicit plugin manifest, bounded output pipes, process-group cancellation, full runtime `sys.addaudithook` dynamic dependency capture, and source-stability verification)** in **107.29 ms** (median **104.93 ms**) vs **958.55 ms** (**8.93× speedup**, 95% CI **8.78–9.07×**).
-- **Impact analysis + Ruff pre-check (`affected_graph`)**: Querying affected tests and cached Ruff diagnostics via the in-memory Rust AST reverse dependency graph takes **0.58 ms** (median **0.57 ms**) vs **916.08 ms** for `pytest --collect-only` (**1,591.31× speedup**, 95% CI **1,544.12–1,643.99×**).
-- **Fixed mixed suite (`all`, 320 pairs)**: **944.64 ms off → 22.04 ms on** (**42.87× mean speedup**, 95% CI **42.22–43.48×**, and **1,255.06× median speedup** from **940.33 ms to 0.75 ms**).
+- **Warm suite re-execution (`warm_suite`)**: **1,004.86 ms without TCTX** vs **0.75 ms with TCTX** (**1,338.93× speedup**, 95% CI **1,285.17–1,402.21×**; median **990.83 ms → 0.75 ms**).
+- **Post-edit speculative background run (`bg_speculative`)**: When a router (`src/ai-service/routers/description_generator.py`) is edited and the background worker verifies affected tests and Ruff rules while the developer or AI coding agent is reasoning, the subsequent `test_run` call takes **0.77 ms** (median **0.73 ms**) vs **1,005.01 ms** for direct `pytest` (**1,309.89× speedup**, 95% CI **1,262.39–1,358.09×**).
+- **Reverted edit Merkle cache hit (`merkle_revert`)**: Reverting a source edit back to a previously verified state hits the content-addressed SHA-256 Merkle `dep_hash` history in **0.80 ms** (median **0.78 ms**) vs **1,003.15 ms** (**1,251.59× speedup**, 95% CI **1,210.68–1,300.65×**).
+- **Immediate 0ms-delay leaf edit (`leaf_delta`)**: Calling `test_run` immediately (0 ms delay) after editing an isolated leaf helper skips 3 cached test files and runs only the 1 affected test file via the **Warm Pytest Fork Zygote (`os.fork()` with safe preloads, explicit plugin manifest, bounded output pipes, process-group cancellation, full runtime `sys.addaudithook` dynamic dependency capture, and source-stability verification)** in **110.41 ms** (median **108.38 ms**) vs **1,003.93 ms** (**9.09× speedup**, 95% CI **8.92–9.24×**).
+- **Impact analysis + Ruff pre-check (`affected_graph`)**: Querying affected tests and cached Ruff diagnostics via the in-memory Rust AST reverse dependency graph takes **0.62 ms** (median **0.59 ms**) vs **966.03 ms** for `pytest --collect-only` (**1,569.66× speedup**, 95% CI **1,505.63–1,655.55×**).
+- **Fixed mixed suite (`all`, 320 pairs)**: **996.60 ms off → 22.67 ms on** (**43.96× mean speedup**, 95% CI **43.12–44.66×**, and **1,306.26× median speedup** from **987.51 ms to 0.76 ms**).
 
 ![Test execution and query latency and paired-session speedup](../benchmarks/results/aks-store-demo/latency-speedup.png)
 
 | Task | Pairs | TCTX off mean | TCTX on mean | Off median | On median | Speedup [95% CI] |
 |---|---:|---:|---:|---:|---:|---:|
-| Warm suite (`warm_suite`) | 64 | 951.63 ms | 0.74 ms | 950.48 ms | 0.74 ms | 1290.06× [1242.85, 1336.89] |
-| Post-edit bg pre-run (`bg_speculative`) | 64 | 945.82 ms | 0.77 ms | 943.81 ms | 0.73 ms | 1230.27× [1208.76, 1253.39] |
-| Reverted edit (`merkle_revert`) | 64 | 951.10 ms | 0.80 ms | 941.54 ms | 0.76 ms | 1185.17× [1123.35, 1245.98] |
-| Immediate leaf delta (`leaf_delta`) | 64 | 958.55 ms | 107.29 ms | 955.26 ms | 104.93 ms | 8.93× [8.78, 9.07] |
-| Impact query (`affected_graph`) | 64 | 916.08 ms | 0.58 ms | 909.11 ms | 0.57 ms | 1591.31× [1544.12, 1643.99] |
-| Fixed mixed suite (`all`) | 320 | 944.64 ms | 22.04 ms | 940.33 ms | 0.75 ms | 42.87× [42.22, 43.48] |
+| Warm suite (`warm_suite`) | 64 | 1004.86 ms | 0.75 ms | 990.83 ms | 0.75 ms | 1338.93× [1285.17, 1402.21] |
+| Post-edit bg pre-run (`bg_speculative`) | 64 | 1005.01 ms | 0.77 ms | 994.68 ms | 0.73 ms | 1309.89× [1262.39, 1358.09] |
+| Reverted edit (`merkle_revert`) | 64 | 1003.15 ms | 0.80 ms | 998.74 ms | 0.78 ms | 1251.59× [1210.68, 1300.65] |
+| Immediate leaf delta (`leaf_delta`) | 64 | 1003.93 ms | 110.41 ms | 994.03 ms | 108.38 ms | 9.09× [8.92, 9.24] |
+| Impact query (`affected_graph`) | 64 | 966.03 ms | 0.62 ms | 960.28 ms | 0.59 ms | 1569.66× [1505.63, 1655.55] |
+| Fixed mixed suite (`all`) | 320 | 996.60 ms | 22.67 ms | 987.51 ms | 0.76 ms | 43.96× [43.12, 44.66] |
 
 ## Cold Start Behavior
 
 ![Cold initial suite run](../benchmarks/results/aks-store-demo/cold-start.png)
 
-On a cold cache (first run in a brand-new daemon session with no cached `dep_hash` entries), TCTX performs Python/pytest/plugin environment fingerprinting, builds the AST graph, preloads the Warm Pytest Zygote parent, captures initial runtime data dependencies, and executes all 4 test files. In this run, the full safety setup averaged **1,120.45 ms** (median **1,116.80 ms**) vs **1,008.38 ms** (median **1,015.86 ms**) for direct `pytest` (+112 ms one-time startup overhead, amortized on the very next call). Cold-start results remain environment-sensitive; the sustained claim is the content-addressed reuse demonstrated by the paired warm and edit scenarios.
+On a cold cache (first run in a brand-new daemon session with no cached `dep_hash` entries), TCTX performs Python/pytest/plugin environment fingerprinting, builds the AST graph, preloads the Warm Pytest Zygote parent, captures initial runtime data dependencies, and executes all 4 test files. In this run, the full safety setup averaged **1,178.05 ms** (median **1,124.04 ms**) vs **1,093.83 ms** (median **1,060.14 ms**) for direct `pytest` (+84 ms one-time startup overhead, amortized on the very next call). Cold-start results remain environment-sensitive; the sustained claim is the content-addressed reuse demonstrated by the paired warm and edit scenarios.
 
 ## Cache-Disabled Execution Review
 

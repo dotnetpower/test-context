@@ -15,6 +15,7 @@ sys.path = [
 
 import gc
 import ctypes
+import functools
 import importlib
 import io
 import json
@@ -35,7 +36,7 @@ import time
 # (e.g. `resource.py`, `json.py`, `select.py`), fail closed so subprocess pytest runs with normal
 # `sys.path` precedence instead of reusing a parent that already imported stdlib `resource`.
 _bootstrap_mods = (
-    "gc", "ctypes", "importlib", "io", "json", "math", "os", "select",
+    "gc", "ctypes", "functools", "importlib", "io", "json", "math", "os", "select",
     "signal", "struct", "resource", "sysconfig", "tempfile", "threading", "time",
 )
 _bootstrap_shadowed = False
@@ -381,10 +382,13 @@ def _startup_wrapped_readlink(path, *a, **kw):
         _parent_observe_startup_path(path, is_open=False, is_metadata_or_dir=True)
     return _startup_orig_readlink(path, *a, **kw)
 
-os.stat = _startup_wrapped_stat
-os.lstat = _startup_wrapped_lstat
-os.access = _startup_wrapped_access
-os.readlink = _startup_wrapped_readlink
+# Wrap with C-level `functools.partial` (no `__get__` descriptor AND zero extra Python stack
+# frames) so patching `os.stat`/`os.lstat`/`os.open`/etc. behaves identically to C builtin
+# functions when assigned as class attributes (e.g. Python 3.10 `pathlib._NormalAccessor.stat = os.stat`).
+os.stat = functools.partial(_startup_wrapped_stat)
+os.lstat = functools.partial(_startup_wrapped_lstat)
+os.access = functools.partial(_startup_wrapped_access)
+os.readlink = functools.partial(_startup_wrapped_readlink)
 sys.addaudithook(_parent_startup_audit)
 
 # Only fail closed for genuinely suspicious custom `.pth` code (`sitecustomize`/`usercustomize`
@@ -1911,12 +1915,12 @@ while True:
                         finally:
                             _stat_tls.active = False
                     return _orig_fstat(fd, *a, **kw)
-                os.stat = _wrapped_stat
-                os.lstat = _wrapped_lstat
-                os.fstat = _wrapped_fstat
-                os.access = _wrapped_access
-                os.open = _wrapped_open
-                os.readlink = _wrapped_readlink
+                os.stat = functools.partial(_wrapped_stat)
+                os.lstat = functools.partial(_wrapped_lstat)
+                os.fstat = functools.partial(_wrapped_fstat)
+                os.access = functools.partial(_wrapped_access)
+                os.open = functools.partial(_wrapped_open)
+                os.readlink = functools.partial(_wrapped_readlink)
                 try:
                     import ssl as _tctx_ssl
                     def _wrap_ssl_cert_loader(_orig_fn):
