@@ -1124,6 +1124,44 @@ fn discovers_nonstandard_c_inc_headers_under_include_dir() {
 }
 
 #[test]
+fn parses_multiline_python_env_lookups_and_scopes_dotenv_to_python() {
+    let src = concat!(
+        "import os\n",
+        "k1 = os.environ.get(\n",
+        "    \"AZURE_OPENAI_API_KEY\"\n",
+        ")\n",
+        "k2 = os.getenv(\n",
+        "    \"LOCAL_LLM_MODEL\",\n",
+        "    \"default\",\n",
+        ")\n",
+        "k3 = os.environ[\n",
+        "    \"APP_MODE\"\n",
+        "]\n",
+    );
+    let parsed = parse_python_source(src);
+    assert!(parsed.env_vars_referenced.contains(&"AZURE_OPENAI_API_KEY".to_string()));
+    assert!(parsed.env_vars_referenced.contains(&"LOCAL_LLM_MODEL".to_string()));
+    assert!(parsed.env_vars_referenced.contains(&"APP_MODE".to_string()));
+    assert!(
+        !parsed.defined_symbols.iter().any(|s| s == "py_dynamic_env"),
+        "multiline literal env lookups must not emit py_dynamic_env: {:?}",
+        parsed.defined_symbols
+    );
+
+    let mut graph = DependencyGraph::new();
+    graph.insert_file_bytes("svc/.env", b"APP_MODE=test\n");
+    graph.insert_file_bytes("svc/test_env.py", b"def test_ok():\n    assert True\n");
+    graph.insert_file_bytes("svc/lib.rs", b"#[test]\nfn ok() {}\n");
+    graph.recompute_edges();
+    let affected: Vec<String> = graph
+        .affected_tests(&["svc/.env".to_string()])
+        .into_iter()
+        .map(|a| a.test_file)
+        .collect();
+    assert_eq!(affected, vec!["svc/test_env.py".to_string()]);
+}
+
+#[test]
 fn normalizes_and_parses_escaped_multibyte_utf8_without_panicking() {
     let py_src = concat!(
         "import re\n",

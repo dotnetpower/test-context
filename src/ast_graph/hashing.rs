@@ -292,7 +292,9 @@ impl DependencyGraph {
         let is_cargo_dot_cfg =
             cfg_path == ".cargo/config.toml" || cfg_path == ".cargo/config" || cfg_path.ends_with("/.cargo/config.toml") || cfg_path.ends_with("/.cargo/config");
         let is_rust_only_cfg = RUST_CONFIG_FILES.contains(&file_name) || is_cargo_dot_cfg;
-        let is_fe_only_cfg = crate::workspace::is_frontend_config_filename(file_name)
+        let is_dotenv_cfg = crate::workspace::is_dotenv_filename(file_name);
+        let is_fe_only_cfg = (crate::workspace::is_frontend_config_filename(file_name)
+            && !is_dotenv_cfg)
             || self.tsconfig_extends_rev.contains_key(cfg_path);
         let is_py_only_cfg =
             PYTEST_CONFIG_FILES.contains(&file_name) && file_name != "pyproject.toml";
@@ -305,8 +307,13 @@ impl DependencyGraph {
 
         let is_rs_test = test_path.ends_with(".rs");
         let is_fe_test = is_frontend_source_path(test_path);
+        let is_py_test = test_path.ends_with(".py");
         let is_cs_test = test_path.ends_with(".cs");
         let is_cpp_test = is_c_cpp_source_path(test_path);
+
+        if is_dotenv_cfg && !is_fe_test && !is_py_test {
+            return false;
+        }
 
         if is_py_only_cfg && (is_rs_test || is_fe_test || is_cs_test || is_cpp_test) {
             return false;
@@ -527,6 +534,7 @@ impl DependencyGraph {
         }
         let is_rs_test = test_path.ends_with(".rs");
         let is_fe_test = is_frontend_source_path(test_path);
+        let is_py_test = test_path.ends_with(".py");
         let is_cs_test = test_path.ends_with(".cs");
         let is_cpp_test = is_c_cpp_source_path(test_path);
         let depends_on_cs = !is_cs_test
@@ -552,7 +560,9 @@ impl DependencyGraph {
                 || cfg_path.ends_with("/.cargo/config.toml")
                 || cfg_path.ends_with("/.cargo/config");
             let is_rust_only_cfg = RUST_CONFIG_FILES.contains(&file_name) || is_cargo_dot_cfg;
-            let is_fe_only_cfg = crate::workspace::is_frontend_config_filename(file_name);
+            let is_dotenv_cfg = crate::workspace::is_dotenv_filename(file_name);
+            let is_fe_only_cfg =
+                crate::workspace::is_frontend_config_filename(file_name) && !is_dotenv_cfg;
             let is_py_only_cfg =
                 PYTEST_CONFIG_FILES.contains(&file_name) && file_name != "pyproject.toml";
             let is_csharp_only_cfg = matches!(
@@ -561,6 +571,10 @@ impl DependencyGraph {
             ) || file_name.ends_with(".csproj")
                 || file_name.ends_with(".sln");
             let is_cpp_only_cfg = file_name == "CMakeLists.txt";
+
+            if is_dotenv_cfg && !is_fe_test && !is_py_test {
+                continue;
+            }
 
             if is_py_only_cfg && (is_rs_test || is_fe_test || is_cs_test || is_cpp_test) {
                 continue;
@@ -1049,7 +1063,6 @@ impl DependencyGraph {
                                 || s == "fe_dynamic_env"
                                 || s == "py_dynamic_env"
                                 || s == "py_dynamic_import"
-                                || s == "py_dynamic_io"
                                 || s == "rust_dynamic_io"
                                 || s == "rust_dynamic_env"
                                 || s == "rust_dynamic_include"

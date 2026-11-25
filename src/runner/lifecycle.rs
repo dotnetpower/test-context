@@ -170,8 +170,12 @@ impl ManagedRoot {
         let initial_inventory_incomplete = graph.skipped_oversized_inventory;
         let initial_unreadable_files = graph.unreadable_inventory_files.clone();
 
-        let had_external_cargo_cfg = has_symlinked_cargo_config(&spec, Some(&graph))
-            || !effective_external_cargo_configs(&spec).is_empty();
+        let has_rs_initial = graph.files.keys().any(|p| {
+            p.ends_with(".rs") || p == "Cargo.toml" || p.ends_with("/Cargo.toml")
+        });
+        let had_external_cargo_cfg = has_rs_initial
+            && (has_symlinked_cargo_config(&spec, Some(&graph))
+                || !effective_external_cargo_configs(&spec).is_empty());
         let initial_fe_uncacheable =
             frontend_env_is_uncacheable(&spec, Some(&graph), Some(&workspace));
         let initial_py_uncacheable = python_env_is_uncacheable(&spec, &graph);

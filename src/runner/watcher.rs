@@ -1234,6 +1234,16 @@ impl ManagedRoot {
     /// lock to compare directly against `guard.graph`'s stored hashes and apply any updates.
     /// This avoids BOTH stale fingerprints from pre-warmed caches AND holding the root mutex
     /// across slow subprocess probes or dotenv/site-packages filesystem scans.
+    pub(super) fn warm_environment_probes_if_stale(&self, max_age: Duration) {
+        {
+            let guard = self.lock_state();
+            if guard.last_environment_check.elapsed() < max_age {
+                return;
+            }
+        }
+        self.warm_environment_probes_unlocked();
+    }
+
     pub(super) fn warm_environment_probes_unlocked(&self) {
         // Serialize concurrent env probes outside `RootState` mutex so an older probe finishing
         // last can never overwrite a newer probe's freshly observed external config/toolchain hash.
@@ -1284,10 +1294,11 @@ impl ManagedRoot {
                 cargo_cfg_cands,
             )
         };
-        let has_ext_now = cargo_cfg_cands
-            .iter()
-            .any(|cand| cargo_config_traverses_symlink(&spec.root, cand))
-            || !effective_external_cargo_configs(&spec).is_empty();
+        let has_ext_now = has_rs
+            && (cargo_cfg_cands
+                .iter()
+                .any(|cand| cargo_config_traverses_symlink(&spec.root, cand))
+                || !effective_external_cargo_configs(&spec).is_empty());
         let non_py_hash = environment_fingerprint_from_parts(
             &spec,
             false,
@@ -1295,28 +1306,25 @@ impl ManagedRoot {
             &rs_tc_dirs,
             &cargo_cfg_cands,
         );
-        let env_hash = if has_py {
-            environment_fingerprint_from_parts(
+        let (env_hash, py_uncacheable) = if has_py {
+            let (ident, plugs) = python_runtime_identity(&spec);
+            let py_unc = ident.contains(PY_ENV_UNCACHEABLE_SENTINEL)
+                || plugs.iter().any(|p| p.contains(PY_ENV_UNCACHEABLE_SENTINEL));
+            let h = environment_fingerprint_from_parts(
                 &spec,
                 true,
                 has_rs,
                 &rs_tc_dirs,
                 &cargo_cfg_cands,
-            )
+            );
+            (h, py_unc)
         } else {
-            non_py_hash.clone()
+            (non_py_hash.clone(), false)
         };
         let (fe_hash, fe_uncacheable) = if has_fe {
             frontend_environment_fingerprint_and_cacheability(&spec, &fe_dirs, Some(&workspace))
         } else {
             (String::new(), false)
-        };
-        let py_uncacheable = if has_py {
-            let (ident, plugs) = python_runtime_identity(&spec);
-            ident.contains(PY_ENV_UNCACHEABLE_SENTINEL)
-                || plugs.iter().any(|p| p.contains(PY_ENV_UNCACHEABLE_SENTINEL))
-        } else {
-            false
         };
 
         let mut guard = self.lock_state();
@@ -1335,8 +1343,8 @@ impl ManagedRoot {
             state
                 .graph
                 .apply_all_environment_hashes(env_hash, non_py_hash, fe_hash);
-            state.last_environment_check = Instant::now();
         }
+        state.last_environment_check = Instant::now();
     }
 
     /// Foreground callers skip 300s full-workspace scans while the background worker handles them,

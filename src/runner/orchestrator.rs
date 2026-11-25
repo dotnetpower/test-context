@@ -162,7 +162,11 @@ impl ManagedRoot {
         let rust_unified_workspace_mode: bool;
 
         let norm_targets: Vec<String>;
-        self.warm_environment_probes_unlocked();
+        if req.no_cache {
+            self.warm_environment_probes_unlocked();
+        } else {
+            self.warm_environment_probes_if_stale(Duration::from_secs(60));
+        }
         {
             let mut guard = self.lock_state();
             guard.last_activity = Instant::now();
@@ -2070,7 +2074,7 @@ impl ManagedRoot {
                 }
             };
 
-            self.warm_environment_probes_unlocked();
+            self.warm_environment_probes_if_stale(Duration::from_secs(60));
             let mut guard = self.lock_state();
             for (tf, dh) in &dep_hashes_for_exec {
                 guard.in_flight.remove(&flight_key(tf, dh));

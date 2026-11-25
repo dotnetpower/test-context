@@ -409,7 +409,7 @@ impl ManagedRoot {
 
     pub fn affected(&self, files: &[String], use_git_diff: bool) -> Result<serde_json::Value> {
         self.refresh_cache_from_disk_if_changed();
-        self.warm_environment_probes_unlocked();
+        self.warm_environment_probes_if_stale(Duration::from_secs(60));
         let workspace_root = {
             let mut guard = self.lock_state();
             guard.last_activity = Instant::now();

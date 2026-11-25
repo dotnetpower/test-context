@@ -110,6 +110,20 @@ def _startup_has_symlink_component(raw_p):
         pass
     return False
 
+_FRAME_REALPATH_CACHE = {}
+
+def _cached_frame_realpath(fn):
+    cached = _FRAME_REALPATH_CACHE.get(fn)
+    if cached is not None:
+        return cached
+    try:
+        res = os.path.realpath(fn)
+    except Exception:
+        res = fn
+    if len(_FRAME_REALPATH_CACHE) < 8192:
+        _FRAME_REALPATH_CACHE[fn] = res
+    return res
+
 def _startup_is_internal_caller():
     try:
         f = sys._getframe(2)
@@ -128,21 +142,18 @@ def _startup_is_internal_caller():
                 f = f.f_back
                 continue
             if fn and not fn.startswith("<"):
-                try:
-                    real_fn = os.path.realpath(fn)
-                except Exception:
-                    real_fn = fn
+                real_fn = _cached_frame_realpath(fn)
                 # Workspace files (even under `packaging/` or `pytest/`) are NEVER internal machinery.
                 if real_fn == _parent_startup_root or real_fn.startswith(_parent_startup_root + os.sep):
                     return False
                 bn = os.path.basename(fn)
-                if bn in ("posixpath.py", "genericpath.py", "ntpath.py", "pathlib.py", "stat.py"):
+                if bn in ("posixpath.py", "genericpath.py", "ntpath.py", "pathlib.py", "stat.py", "subprocess.py"):
                     f = f.f_back
                     continue
-                if bn in ("site.py", "sysconfig.py"):
+                if bn in ("site.py", "sysconfig.py", "inspect.py", "linecache.py", "tokenize.py", "platform.py"):
                     return True
                 norm_fn = real_fn.replace("\\", "/")
-                if any(tok in norm_fn for tok in ("/_pytest/", "/pytest/", "/pluggy/", "/importlib/", "/pkg_resources/", "/packaging/")):
+                if any(tok in norm_fn for tok in ("/_pytest/", "/pytest/", "/pluggy/", "/importlib/", "/pkg_resources/", "/packaging/", "/zipfile/")):
                     return True
                 return False
             f = f.f_back
@@ -154,15 +165,14 @@ _STARTUP_MUTABLE_ETC = frozenset({
     "/etc/hosts", "/etc/resolv.conf", "/etc/nsswitch.conf",
     "/etc/passwd", "/etc/group", "/etc/fstab", "/etc/localtime", "/etc/timezone",
     "/etc/mime.types", "/etc/services", "/etc/protocols", "/etc/gai.conf",
-    "/etc/os-release", "/etc/magic",
+    "/etc/magic",
 })
 
 def _startup_is_exempt_external(real_p, is_open, internal_caller=False, lex_p=None):
     # Do NOT exempt non-internal user/sitecustomize opens of `.py`/`.dist-info` files under
     # site-packages OR mutable kernel/host state (`/proc/`, `/sys/`, `/etc/hosts`, `/etc/resolv.conf`,
-    # `/etc/localtime`, `/etc/os-release` even when symlinked to `/usr/lib/os-release`!);
-    # only interpreter/pytest internals may read those without tainting preload.
-    if real_p in ("/dev/null", "/dev/zero", "/dev/urandom", "/dev/random"):
+    # `/etc/localtime`); only interpreter/pytest/stdlib internals may read those without tainting preload.
+    if real_p in ("/dev/null", "/dev/zero", "/dev/urandom", "/dev/random", "/etc/os-release", "/usr/lib/os-release"):
         return True
     if not internal_caller and (
         real_p in _STARTUP_MUTABLE_ETC
@@ -170,6 +180,8 @@ def _startup_is_exempt_external(real_p, is_open, internal_caller=False, lex_p=No
     ):
         return False
     if internal_caller and real_p in ("/etc/localtime", "/etc/hosts", "/etc/resolv.conf"):
+        return True
+    if internal_caller and any(real_p == ep or real_p.startswith(ep + os.sep) for ep in _parent_py_code_dirs):
         return True
     if not is_open and any(real_p == ep or real_p.startswith(ep + os.sep) for ep in _parent_py_code_dirs):
         return False
@@ -304,15 +316,30 @@ def _parent_startup_audit(event, args):
         _parent_observe_startup_path(args[0] if args else None, is_open=True, is_metadata_or_dir=False)
     elif event in ("os.listdir", "os.scandir"):
         _parent_observe_startup_path(args[0] if args else None, is_open=False, is_metadata_or_dir=True)
+    elif event == "subprocess.Popen":
+        # Allow stdlib `platform.py` probing `uname` during third-party package import (e.g. `azure.identity` / `msal`).
+        _prog = args[0] if args else None
+        if not (_prog == "uname" and _startup_is_internal_caller()):
+            with _startup_lock:
+                _parent_startup_untrackable = True
+    elif event == "socket.bind":
+        # Allow ephemeral loopback IPv6/IPv4 capability probes (`urllib3` `_has_ipv6("::1")`).
+        _addr = args[1] if len(args) >= 2 else None
+        if not (
+            isinstance(_addr, tuple)
+            and len(_addr) >= 2
+            and _addr[0] in ("::1", "127.0.0.1")
+            and _addr[1] == 0
+        ):
+            with _startup_lock:
+                _parent_startup_untrackable = True
     elif event in (
         "sqlite3.connect",
-        "subprocess.Popen",
         "os.system",
         "os.posix_spawn",
         "os.fork",
         "os.forkpty",
         "os.exec",
-        "socket.bind",
         "socket.connect",
         "socket.sendmsg",
         "socket.sendto",
@@ -501,13 +528,29 @@ safe_preload = {
     "numpy", "scipy", "pandas", "sqlalchemy", "aiohttp",
     "attrs", "cryptography", "orjson", "ujson",
 }
-for mod_name in [m.strip() for m in os.environ.get("TCTX_PRELOAD_MODULES", "").split(",") if m.strip()]:
+_requested_preloads = [m.strip() for m in os.environ.get("TCTX_PRELOAD_MODULES", "").split(",") if m.strip()]
+_requested_tops = {m.split(".", 1)[0] for m in _requested_preloads}
+for mod_name in _requested_preloads:
     if mod_name.split(".", 1)[0] not in safe_preload:
         continue
     try:
         importlib.import_module(mod_name)
     except Exception:
         pass
+if "fastapi" in _requested_tops or "pydantic" in _requested_tops:
+    for _extra_mod in (
+        "pydantic.v1",
+        "anyio._core._fileio",
+        "anyio._core._sockets",
+        "anyio._core._subprocesses",
+        "anyio._core._streams",
+        "anyio.streams.memory",
+        "anyio.streams.tls",
+    ):
+        try:
+            importlib.import_module(_extra_mod)
+        except Exception:
+            pass
 
 _parent_startup_active = False
 os.stat = _startup_orig_stat
@@ -588,6 +631,78 @@ _STAMPED_DIST_ROOTS = frozenset(
     and os.path.realpath(p) != workspace_root
     and not os.path.realpath(p).startswith(workspace_root + os.sep)
 )
+
+# Installed non-editable wheel distributions inside `site-packages`/`dist-packages` are already
+# hashed via `_dist_sig()` (`METADATA`/`RECORD`/`WHEEL`/`INSTALLER`/`direct_url.json`) in
+# `environment_hash`; exclude their immutable package trees from per-file `_ext_mod_entries` so
+# large stacks (FastAPI/Pydantic/OpenAI/Azure) keep sub-millisecond cache hits while editable
+# installs, symlinks, and loose hand-dropped files remain stamped file-by-file.
+_frozen_wheel_dirs = set()
+_frozen_wheel_files = set()
+_precomputed_dist_by_ep = {}
+try:
+    import importlib.metadata as _imeta_fw
+    for _dist in _imeta_fw.distributions():
+        try:
+            for _ep in _dist.entry_points:
+                if _ep.group == "pytest11":
+                    _ek = (_ep.name, _ep.value.split("[", 1)[0].strip())
+                    _precomputed_dist_by_ep.setdefault(_ek, []).append(_dist)
+        except Exception:
+            pass
+        _is_editable = False
+        try:
+            _du_raw = _dist.read_text("direct_url.json")
+            if _du_raw and (json.loads(_du_raw).get("dir_info") or {}).get("editable"):
+                _is_editable = True
+        except Exception:
+            pass
+        if _is_editable:
+            continue
+        if _dist.read_text("WHEEL") is None and _dist.read_text("INSTALLER") is None:
+            continue
+        _dist_base = os.path.realpath(str(_dist.locate_file("")))
+        _dist_base_sl = _dist_base.replace("\\", "/")
+        if "/site-packages" not in _dist_base_sl and "/dist-packages" not in _dist_base_sl:
+            continue
+        if _dist_base == workspace_root or _dist_base.startswith(workspace_root + os.sep):
+            continue
+        _tops = set()
+        _tl_raw = _dist.read_text("top_level.txt")
+        if _tl_raw:
+            for _line in _tl_raw.splitlines():
+                _t = _line.strip()
+                if _t:
+                    _tops.add(_t)
+        elif _dist.files:
+            for _pf in _dist.files:
+                _parts = _pf.parts
+                if _parts and not _parts[0].endswith((".dist-info", ".egg-info", ".data")) and _parts[0] != "..":
+                    _tops.add(_parts[0])
+        for _top in _tops:
+            _cand = os.path.join(_dist_base, _top)
+            if os.path.isdir(_cand) and not os.path.islink(_cand):
+                _frozen_wheel_dirs.add(os.path.realpath(_cand))
+            else:
+                for _cand_f in (_cand, _cand + ".py"):
+                    if os.path.isfile(_cand_f) and not os.path.islink(_cand_f):
+                        _frozen_wheel_files.add(os.path.realpath(_cand_f))
+except Exception:
+    pass
+_frozen_wheel_dirs = tuple(sorted(_frozen_wheel_dirs))
+_frozen_wheel_files = frozenset(_frozen_wheel_files)
+
+def _in_frozen_wheel(real_norm):
+    if real_norm in _frozen_wheel_files:
+        return True
+    for d in _frozen_wheel_dirs:
+        if real_norm == d or real_norm.startswith(d + os.sep):
+            return True
+    if real_norm.endswith((".pyc", ".pyo")):
+        _mapped_fw = _map_pyc_to_source(real_norm)
+        if _mapped_fw and _mapped_fw in _frozen_wheel_files:
+            return True
+    return False
 
 def _in_fingerprinted_plugin_tree(real_norm, traversed_symlink):
     if traversed_symlink:
@@ -734,7 +849,7 @@ def _is_direct_workspace_open(skip_frames=2):
                 continue
             if fname.startswith("<"):
                 return False
-            real_f = os.path.realpath(fname)
+            real_f = _cached_frame_realpath(fname)
             if os.path.basename(real_f) in _PATH_WRAPPER_BASENAMES:
                 frame = frame.f_back
                 continue
@@ -856,7 +971,7 @@ def _caller_below_pytest(skip_frames=2):
             if any(fname.startswith(pfx) for pfx in _RUNNER_BOUNDARY_PREFIXES):
                 return (None, saw_plugin)
             if not fname.startswith("<"):
-                real_f = os.path.realpath(fname)
+                real_f = _cached_frame_realpath(fname)
                 if real_f.startswith(workspace_root + os.sep):
                     rel_f = os.path.relpath(real_f, workspace_root).replace("\\", "/")
                     if not any(part in _AUDIT_IGNORED_PARTS for part in rel_f.split("/")):
@@ -902,6 +1017,55 @@ def _is_audit_worker_thread():
     # `pool.submit(open, ...)`) and its call stack may contain only stdlib frames.
     return audit_paths is not None and threading.current_thread() is not threading.main_thread()
 
+def _is_importlib_or_runner_frame(skip_frames=2):
+    try:
+        frame = sys._getframe(skip_frames)
+        for _ in range(24):
+            if frame is None:
+                break
+            fname = frame.f_code.co_filename or ""
+            if not fname or fname in _FROZEN_PATH_WRAPPERS:
+                frame = frame.f_back
+                continue
+            if any(fname.startswith(pfx) for pfx in _RUNNER_BOUNDARY_PREFIXES):
+                return True
+            if not fname.startswith("<"):
+                real_f = _cached_frame_realpath(fname)
+                if real_f.startswith(workspace_root + os.sep):
+                    return False
+                if _is_runner_internal_file(real_f):
+                    return True
+            frame = frame.f_back
+    except Exception:
+        pass
+    return False
+
+def _is_stdlib_inspect_or_linecache(skip_frames=2):
+    try:
+        frame = sys._getframe(skip_frames)
+        for _ in range(16):
+            if frame is None:
+                break
+            fname = frame.f_code.co_filename or ""
+            if not fname or fname in _FROZEN_PATH_WRAPPERS:
+                frame = frame.f_back
+                continue
+            if not fname.startswith("<"):
+                real_f = _cached_frame_realpath(fname)
+                if real_f.startswith(workspace_root + os.sep):
+                    return False
+                bn = os.path.basename(real_f)
+                if bn in _PATH_WRAPPER_BASENAMES:
+                    frame = frame.f_back
+                    continue
+                if bn in ("inspect.py", "linecache.py") and _is_stdlib_file(real_f):
+                    return True
+                return False
+            frame = frame.f_back
+    except Exception:
+        pass
+    return False
+
 def _record_workspace_dep(rel, is_open, caller_rel=None):
     global audit_incomplete
     if any(part in _AUDIT_IGNORED_PARTS for part in rel.split("/")):
@@ -944,7 +1108,7 @@ def _record_workspace_dep(rel, is_open, caller_rel=None):
                     break
                 fname = frame.f_code.co_filename
                 if fname:
-                    real_f = os.path.realpath(fname)
+                    real_f = _cached_frame_realpath(fname)
                     if real_f.startswith(workspace_root + os.sep):
                         mod_rel = os.path.relpath(real_f, workspace_root).replace("\\", "/")
                         if mod_rel.endswith("/conftest.py") or mod_rel == "conftest.py":
@@ -1167,10 +1331,11 @@ def audit_hook(event, args):
                     and not is_std_dist_meta
                     and not real_norm.endswith((".so", ".dylib", ".dll"))
                 )
+                is_worker_non_import = is_worker_thread and not _is_importlib_or_runner_frame(2)
                 if _is_external_user_fixture_path(
                     real_norm,
                     explicit_open=True,
-                    direct_user_open=(direct_ws or is_plugin_data_open or is_worker_thread),
+                    direct_user_open=(direct_ws or is_plugin_data_open or is_worker_non_import),
                     lex_norm=lex_norm,
                 ):
                     audit_incomplete = True
@@ -1231,11 +1396,32 @@ devnull_fd = os.open(os.devnull, os.O_RDWR)
 os.dup2(devnull_fd, 1)
 os.dup2(devnull_fd, 2)
 
-# Warm pytest configuration/parser/plugin registration without importing workspace tests.
+# Warm pytest configuration/parser/plugin registration and core pure-Python modules without importing workspace tests.
 try:
     pytest.main(["--version"], plugins=[obj for _, obj in plugins])
 except BaseException:
     pass
+for _core_mod in (
+    "_pytest.junitxml",
+    "_pytest.unittest",
+    "_pytest.skipping",
+    "_pytest.warnings",
+    "_pytest.setuponly",
+    "_pytest.setupplan",
+    "_pytest.threadexception",
+    "_pytest.unraisableexception",
+    "_pytest.faulthandler",
+    "_pytest.helpconfig",
+    "_pytest.pastebin",
+    "_pytest.tracemalloc",
+    "unittest",
+    "difflib",
+    "pickle",
+):
+    try:
+        importlib.import_module(_core_mod)
+    except Exception:
+        pass
 # Restore original `PYTEST_DISABLE_PLUGIN_AUTOLOAD` right after warmup so forked test children
 # and initial `conftest.py` files observe the exact unmodified environment of ordinary `pytest`.
 if _orig_disable_autoload is None:
@@ -1244,20 +1430,28 @@ else:
     os.environ["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = _orig_disable_autoload
 
 _loaded_tops = sorted({k.split(".", 1)[0] for k in sys.modules.keys() if k})
-_loaded_local_files = set(_parent_startup_data_abs)
+_loaded_local_files = {
+    p for p in _parent_startup_data_abs
+    if not _in_frozen_wheel(p) and not any(p.startswith(d + os.sep) for d in _parent_py_code_dirs)
+}
 _loaded_local_rels = set(_parent_startup_data_rels)
 _loaded_local_untrackable = bool(_parent_startup_untrackable)
 _loaded_py_module_files = []
+_parent_frozen_wheel_mods = {}
 _root_prefix = os.path.realpath(os.getcwd())
 _pp_prefixes = [_root_prefix] + [
     os.path.realpath(p) for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p
 ]
-for _m in list(sys.modules.values()):
+for _mk, _m in list(sys.modules.items()):
     _mf = getattr(_m, "__file__", None)
     if isinstance(_mf, str) and _mf:
-        if _mf.endswith(".py") and not _mf.endswith(os.sep + "__init__.py"):
-            _loaded_py_module_files.append(_mf)
         _rmf = os.path.realpath(_mf)
+        if _mf == _rmf and _in_frozen_wheel(_rmf):
+            _parent_frozen_wheel_mods[_mk] = _m
+            continue
+        if _mf.endswith(".py") and not _mf.endswith(os.sep + "__init__.py"):
+            if not any(_rmf.startswith(ep + os.sep) for ep in _parent_py_code_dirs):
+                _loaded_py_module_files.append(_mf)
         if any(_rmf == _p or _rmf.startswith(_p + os.sep) for _p in _pp_prefixes):
             _loaded_local_files.add(_mf)
             if _rmf.startswith(_root_prefix + os.sep):
@@ -1547,17 +1741,41 @@ while True:
                     if norm_p == workspace_root:
                         audit_incomplete = True
                         return
+                    if (
+                        norm_p.endswith(".py")
+                        and _orig_stat_is_regular_file(norm_p)
+                        and _is_stdlib_inspect_or_linecache(3)
+                    ):
+                        rel = os.path.relpath(norm_p, workspace_root).replace("\\", "/")
+                        _record_workspace_dep(rel, is_open=False)
+                        return
+                    # Scoped `.env` / `.env.*` probes inside watched non-ignored workspace
+                    # directories (e.g. `python-dotenv`'s `load_dotenv(dotenv_path=...)`) are
+                    # already tracked via workspace config watching and `is_config_relevant_to_test_ids`.
+                    _bn = os.path.basename(norm_p)
+                    if _bn == ".env" or _bn.startswith(".env."):
+                        _rel_env = os.path.relpath(norm_p, workspace_root).replace("\\", "/")
+                        if not any(part in _AUDIT_IGNORED_PARTS for part in _rel_env.split("/")):
+                            if _orig_stat_is_regular_file(norm_p):
+                                _record_workspace_dep(_rel_env, is_open=False)
+                            return
                     # `_observe_stat_path` is only invoked for explicit user/library probes from
                     # workspace code (`_has_workspace_caller_below_pytest`), so even ignored-dir
                     # probes (e.g. `Path("node_modules/pkg/data.json").exists()`) mark incomplete.
                     audit_incomplete = True
+                def _orig_stat_is_regular_file(p):
+                    try:
+                        import stat as _st
+                        return _st.S_ISREG(_orig_stat(p).st_mode)
+                    except Exception:
+                        return False
                 def _wrapped_stat(path, *a, **kw):
                     global audit_incomplete
                     if not getattr(_stat_tls, "active", False):
                         _stat_tls.active = True
                         try:
                             caller_rel, is_plugin = _caller_below_pytest(2)
-                            is_worker = _is_audit_worker_thread()
+                            is_worker = _is_audit_worker_thread() and not _is_importlib_or_runner_frame(2)
                             has_dir_fd = kw.get("dir_fd") is not None
                             if caller_rel is not None or is_plugin or is_worker:
                                 if has_dir_fd:
@@ -1765,20 +1983,11 @@ while True:
                     def _tctx_load_ep(pm, group, name=None):
                         if group != "pytest11":
                             return _orig_load_ep(pm, group, name=name)
-                        import importlib.metadata as _im
                         try:
                             from pluggy._manager import DistFacade as _DistFacade
                         except Exception:
                             _DistFacade = None
-                        _dist_by_ep = {}
-                        try:
-                            for _d in list(_im.distributions()):
-                                for _ep in _d.entry_points:
-                                    if _ep.group == "pytest11":
-                                        _k = (_ep.name, _ep.value.split("[", 1)[0].strip())
-                                        _dist_by_ep.setdefault(_k, []).append(_d)
-                        except Exception:
-                            _dist_by_ep = {}
+                        _dist_by_ep = {k: list(v) for k, v in _precomputed_dist_by_ep.items()}
                         count = 0
                         for ep_name, plugin_obj in plugins:
                             if name and ep_name != name:
@@ -1851,6 +2060,13 @@ while True:
             sys.stdout.flush()
             sys.stderr.flush()
             _ext_mod_entries = {}
+            if capture_dynamic_deps:
+                os.stat = _orig_stat
+                os.lstat = _orig_lstat
+                os.fstat = _orig_fstat
+                os.access = _orig_access
+                os.open = _orig_open
+                os.readlink = _orig_readlink
             if capture_dynamic_deps and not audit_incomplete:
                 def _record_ext_entry(lex_p, real_p, is_dir):
                     global audit_incomplete
@@ -1872,11 +2088,13 @@ while True:
                         audit_incomplete = True
                         return
                     _ext_mod_entries[lex_p] = [lex_p, real_p, bool(is_dir), *post_st]
-                    if len(_ext_mod_entries) > 1024:
+                    if len(_ext_mod_entries) > 4096:
                         audit_incomplete = True
 
                 _candidate_ext_pairs = []
-                for _m in list(sys.modules.values()):
+                for _mk, _m in list(sys.modules.items()):
+                    if _parent_frozen_wheel_mods.get(_mk) is _m:
+                        continue
                     _mf = getattr(_m, "__file__", None)
                     if isinstance(_mf, str) and _mf:
                         try:
@@ -1918,6 +2136,8 @@ while True:
                         if not any(part in _AUDIT_IGNORED_PARTS for part in _ws_rel_parts):
                             continue
                     if _in_fingerprinted_plugin_tree(_rmf, _lex_f != _rmf):
+                        continue
+                    if _lex_f == _rmf and _in_frozen_wheel(_rmf):
                         continue
                     if _rmf.endswith((".pyc", ".pyo")):
                         # Retain BOTH the executed bytecode file AND its mapped `.py` source so

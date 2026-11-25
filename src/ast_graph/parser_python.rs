@@ -1809,15 +1809,25 @@ pub fn parse_python_source_with_patterns(
             }
             if !is_def && getenv_names.contains(ident) {
                 if matches!(tokens.get(idx + 1), Some(PyToken::LParen)) {
+                    // Skip newlines inside parenthesized multi-line calls like
+                    // `os.getenv(\n    "APP_MODE"\n)` (standard `black`/`ruff format` wrapping).
+                    let mut arg_i = idx + 2;
+                    while matches!(tokens.get(arg_i), Some(PyToken::Newline)) {
+                        arg_i += 1;
+                    }
+                    let mut after_i = arg_i + 1;
+                    while matches!(tokens.get(after_i), Some(PyToken::Newline)) {
+                        after_i += 1;
+                    }
                     // Require the string literal to be the ENTIRE first argument (followed
                     // immediately by `)` or `,`) so expressions like `os.getenv("APP_" + "MODE")`
                     // never record only the partial prefix `"APP_"`.
-                    if let Some(PyToken::StringLit(var_name)) = tokens.get(idx + 2)
-                        && matches!(tokens.get(idx + 3), Some(PyToken::RParen | PyToken::Comma))
+                    if let Some(PyToken::StringLit(var_name)) = tokens.get(arg_i)
+                        && matches!(tokens.get(after_i), Some(PyToken::RParen | PyToken::Comma))
                         && is_valid_env_var_name(var_name)
                     {
                         env_vars.insert(var_name.trim().to_string());
-                    } else if !matches!(tokens.get(idx + 2), Some(PyToken::RParen)) {
+                    } else if !matches!(tokens.get(arg_i), Some(PyToken::RParen)) {
                         defined_symbols.insert("py_dynamic_env".to_string());
                     }
                 } else {
@@ -1916,17 +1926,33 @@ pub fn parse_python_source_with_patterns(
                     )
                     && matches!(tokens.get(idx + 3), Some(PyToken::LParen))
                 {
-                    if let Some(PyToken::StringLit(var_name)) = tokens.get(idx + 4)
-                        && matches!(tokens.get(idx + 5), Some(PyToken::RParen | PyToken::Comma))
+                    let mut arg_i = idx + 4;
+                    while matches!(tokens.get(arg_i), Some(PyToken::Newline)) {
+                        arg_i += 1;
+                    }
+                    let mut after_i = arg_i + 1;
+                    while matches!(tokens.get(after_i), Some(PyToken::Newline)) {
+                        after_i += 1;
+                    }
+                    if let Some(PyToken::StringLit(var_name)) = tokens.get(arg_i)
+                        && matches!(tokens.get(after_i), Some(PyToken::RParen | PyToken::Comma))
                         && is_valid_env_var_name(var_name)
                     {
                         env_vars.insert(var_name.trim().to_string());
-                    } else if !matches!(tokens.get(idx + 4), Some(PyToken::RParen)) {
+                    } else if !matches!(tokens.get(arg_i), Some(PyToken::RParen)) {
                         defined_symbols.insert("py_dynamic_env".to_string());
                     }
                 } else if matches!(tokens.get(idx + 1), Some(PyToken::LBracket)) {
-                    if let Some(PyToken::StringLit(var_name)) = tokens.get(idx + 2)
-                        && matches!(tokens.get(idx + 3), Some(PyToken::RBracket))
+                    let mut arg_i = idx + 2;
+                    while matches!(tokens.get(arg_i), Some(PyToken::Newline)) {
+                        arg_i += 1;
+                    }
+                    let mut after_i = arg_i + 1;
+                    while matches!(tokens.get(after_i), Some(PyToken::Newline)) {
+                        after_i += 1;
+                    }
+                    if let Some(PyToken::StringLit(var_name)) = tokens.get(arg_i)
+                        && matches!(tokens.get(after_i), Some(PyToken::RBracket))
                         && is_valid_env_var_name(var_name)
                     {
                         env_vars.insert(var_name.trim().to_string());

@@ -17,13 +17,13 @@ When GitHub Copilot (or a developer) invokes tests:
 - **Python (`pytest`)**: Extracts `import x`, `from x import y`, relative imports, multi-line parenthesized imports, in-function lazy imports, `conftest.py` fixture hierarchies (connecting only tests that actually use a defined `@pytest.fixture` or `autouse`/hook), and `pyproject.toml`/`pytest.ini` configs while excluding `if TYPE_CHECKING:`-only imports from false test invalidation.
 - **Rust (`cargo test`)**: Parses `mod foo;`, `#[path = "..."] mod`, nested `use crate::{...}` trees, `#[test]` / `#[tokio::test]` / `#[rstest]` / `#[test_case]` symbols, `#[ignore]` / `#[serial]` attributes, `tests/common/mod.rs` helpers, `build.rs`, and `include_str!` / `include_bytes!` compile-time data dependencies. Decouples non-barrel `lib.rs` / `mod.rs` module mounts (`pub mod <child>;`) and tree-shakes `pub use` re-exports so shared types (`use crate::Result`) never couple unrelated sibling modules.
 - **Frontend (`React` / `Vite` / `TS` / `JS` / `CSS` / `SCSS`)**: Resolves ES/CJS/dynamic `import(...)`, excludes `import type` / `export type`, tree-shakes barrel (`index.ts` / `index.tsx`) named and wildcard re-exports, and supports `tsconfig.json` (`paths` & `extends`), `package.json` (`imports` `#subpath` & `exports`), Vite asset queries (`?raw`, `?url`, `?worker`), `import.meta.glob(...)`, Web Workers, CSS/SCSS `@import`/`@use`/`@forward`/partials (`_tokens.scss`), Next.js App Router (`app/**/layout.tsx -> page.tsx`), and Storybook `*.stories.tsx` play interaction tests.
-- **C/C++ / C# / Protobuf / GraphQL**: Tracks C/C++ `#include "..."` & GoogleTest (`TEST`/`TEST_F`), C# `using` & `[Fact]`/`[Theory]`/`[TestMethod]`, `.proto` definitions, and `.graphql` `#import` edges.
+- **C/C++ / C# / Protobuf / GraphQL**: Tracks C/C++ `#include "..."` / `<...>` across source-relative, workspace-root, and `include/`/`inc/`/`src/` directories (including nonstandard `.inc` headers, header-to-implementation linking, `CMakeLists.txt` scoping, and GoogleTest `TEST`/`TEST_F`), C# `namespace` / `using` / `global using` / `using static` / aliases, `[Fact]`/`[Theory]`/`[Test]`/`[TestMethod]`, and `.sln`/`.csproj`/`Directory.Build.props` config isolation, plus `.proto` definitions and `.graphql` `#import` edges.
 - **Cross-Language & Full-Stack Bridges (`O(1)` `BridgeProviderIndex`)**:
   - **PyO3 / Maturin**: Links Rust `cdylib` / `[tool.maturin]` / `#[pymodule]` crates to Python importers so editing a `.rs` kernel marks dependent Python `pytest` files as affected alongside Rust unit tests.
   - **Full-Stack API Routes**: Links backend route definitions (`@app.get('/api/v1/orders')`) to frontend tests calling `fetch('/api/v1/orders')` or `axios`.
   - **WebAssembly & Protobuf & React Context**: Links Rust `#[wasm_bindgen]` exports to frontend Wasm imports, `.proto` schemas to generated `_pb2.py`/`_pb.ts` consumers, and React `createContext` providers to `useContext` consumers.
-- **Semantic AST Hashing (`semantic_sha256`)**: Strips ordinary comments and non-semantic blank lines via SIMD `memchr` fast paths so comment/formatting edits preserve `dep_hash` and never invalidate cached test passes, while preserving directive comments (`noqa`, `type:`, `pragma`, `eslint`, `@ts-`, `biome-`, `go:embed`, and Rust doctest fences).
-- **Environment Variable & Data File Tracking**: Tracks referenced `os.getenv`, `os.environ`, `env!`, `env::var`, `import.meta.env`, `process.env`, and `os.Getenv` keys plus `.json`, `.yaml`, `.toml`, `.sql`, `.snap`, `.golden`, `.csv`, and `.proto` data files in each test's Merkle `dep_hash`.
+- **Semantic AST Hashing (`semantic_sha256`)**: Strips ordinary comments and non-semantic blank lines via SIMD `memchr` fast paths so comment/formatting edits preserve `dep_hash` and never invalidate cached test passes, while preserving directive comments (`noqa`, `type:`, `pragma`, `eslint`, `@ts-`, `biome-`, and Rust doctest fences).
+- **Environment Variable & Data File Tracking**: Tracks referenced `os.getenv`, `os.environ`, `env!`, `env::var`, `import.meta.env`, and `process.env` keys (including multi-line wrapped calls and scoped `.env` files) plus `.json`, `.yaml`, `.toml`, `.sql`, `.snap`, `.golden`, `.csv`, and `.proto` data files in each test's Merkle `dep_hash`.
 
 ### 2. High-Throughput Speculative Background Daemon (`tctx daemon`)
 - **Multi-Core Parallel Indexing & Compact Integer Graph**: Parallelizes file reading, SHA-256 hashing, AST parsing, direct dependency resolution, and per-test Merkle BFS across worker threads (`std::thread::scope`), maintaining compact `u32` forward/reverse adjacency lists (`forward_adj` / `reverse_adj`) and pre-computed per-file Merkle digest buffers.
@@ -35,7 +35,7 @@ When GitHub Copilot (or a developer) invokes tests:
 
 ### 3. VS Code GitHub Copilot Native Integration (`dotnetpower.test-context-native`)
 - **7 Native VS Code Language Model Tools**: `#tctxNativeRun`, `#tctxNativeAffected`, `#tctxNativeGraph`, `#tctxNativeStatus`, `#tctxNativeSync`, `#tctxNativeInvalidate`, and `#tctxNativeWorkspaces`.
-- **Agent-Friendly Path & Root Resolution**: Automatically strips workspace-root prefixes from absolute target paths (`/path/to/repo/src/daemon.rs::test_fn -> src/daemon.rs::test_fn`) and infers the active workspace root from target path hints, `vscode-remote://` URIs, Windows WSL UNC paths (`\\wsl.localhost\...`), and session history.
+- **Agent-Friendly Path & Root Resolution**: Automatically strips workspace-root prefixes from absolute target paths (`/path/to/repo/src/daemon/tests.rs::test_fn -> src/daemon/tests.rs::test_fn`) and infers the active workspace root from target path hints, `vscode-remote://` URIs, Windows WSL UNC paths (`\\wsl.localhost\...`), and session history.
 - **Smart Git-Dirty Delta Scoping**: In large repositories (`> 64` test files), omitting `targets` in `#tctxNativeRun` automatically scopes execution to tests affected by uncommitted `git status` changes rather than running thousands of unrelated tests.
 - **Context Window Token Optimization (92.7% Reduction)**: Strips passing test boilerplate (`test ... ok`, compiler progress lines) while preserving 100% of warnings, failures, and skips, and bounds large `#tctxNativeAffected` / `#tctxNativeGraph` outputs to the closest dependency hop chains so responses stay inline (`< 8 KB`) without `/tmp` file offloading.
 - **Culprit Attribution & CI Cache Sharing**: Extracts workspace-local stack frames (`structured_failures`), cross-references `git diff` with transitive dependencies to identify `suspected_culprit_files`, exports JUnit XML / SARIF v2.1.0 reports, and supports portable CI cache bundles (`cache-export` / `cache-import`).
@@ -54,12 +54,12 @@ Across 8 independent daemon sessions (**320 paired observations**) on [AKS Store
 
 | Task | TCTX off (`pytest`) | TCTX on | Speedup [95% CI] |
 |---|---:|---:|---:|
-| Warm suite (`warm_suite`) | 763.96 ms | **0.58 ms** (median 0.53 ms) | **1312.68×** [1130.23, 1460.62] |
-| Post-edit background pre-run (`bg_speculative`) | 774.77 ms | **0.56 ms** (median 0.52 ms) | **1380.99×** [1198.13, 1528.39] |
-| Reverted edit Merkle hit (`merkle_revert`) | 768.29 ms | **0.68 ms** (median 0.53 ms) | **1124.04×** [986.07, 1308.67] |
-| Immediate 0ms-delay leaf edit (`leaf_delta`) | 765.98 ms | **69.54 ms** (median 66.66 ms) | **11.02×** [10.67, 11.35] |
-| Impact query + Ruff pre-check (`affected_graph`) | 746.59 ms | **0.47 ms** (median 0.45 ms) | **1582.62×** [1506.33, 1655.94] |
-| Fixed mixed suite (`all`, 320 pairs) | 763.92 ms | **14.37 ms** (median 0.54 ms) | **53.17×** [51.92, 54.34] |
+| Warm suite (`warm_suite`) | 763.03 ms | **0.69 ms** (median 0.66 ms) | **1113.23×** [1062.72, 1168.37] |
+| Post-edit background pre-run (`bg_speculative`) | 754.23 ms | **0.67 ms** (median 0.64 ms) | **1127.44×** [1080.98, 1171.86] |
+| Reverted edit Merkle hit (`merkle_revert`) | 759.33 ms | **0.69 ms** (median 0.68 ms) | **1095.76×** [1071.13, 1121.72] |
+| Immediate 0ms-delay leaf edit (`leaf_delta`) | 764.76 ms | **102.21 ms** (median 100.50 ms) | **7.48×** [7.32, 7.65] |
+| Impact query + Ruff pre-check (`affected_graph`) | 729.86 ms | **0.51 ms** (median 0.50 ms) | **1439.47×** [1392.80, 1486.37] |
+| Fixed mixed suite (`all`, 320 pairs) | 754.24 ms | **20.95 ms** (median 0.67 ms) | **36.00×** [35.46, 36.52] |
 
 ### 2. Rust (`cargo test`) & Enterprise Monorepo (`9,042 files / 3,434 tests`) Benchmarks
 
@@ -93,7 +93,7 @@ tctx --root /path/to/repo affected --file src/my_pkg/core.py
 tctx --root /path/to/repo graph src/my_pkg/core.py
 tctx --root /path/to/repo ruff --fix
 
-# 4. Run tests incrementally across Python, Rust, Frontend, and Go
+# 4. Run tests incrementally across Python, Rust, and Frontend
 tctx --root /path/to/repo run --ruff-fix
 tctx --root /path/to/repo pytest -q
 tctx --root /path/to/repo cargo-test
